@@ -10,6 +10,8 @@ artifacts/
 runtime/node_modules/
 runtime/dist/
 runtime/coverage/
-data/
+# Runtime data directory at the repo root only; src/data/ belongs to the
+# frontend and must stay tracked.
+/data/
 runtime/.smoke*/
 runtime/.ci-data/
