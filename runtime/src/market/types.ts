@@ -129,6 +129,17 @@ export interface MarketDataProvider {
   /** A single pool by its provider-specific identifier. */
   getPool(chain: ChainId, poolId: string): Promise<MarketSnapshot | null>;
 
+  /**
+   * The USD price of one token.
+   *
+   * Deliberately separate from {@link getPoolsForToken}: a pool quotes the
+   * price of *its own base token*, which is not necessarily the token that was
+   * asked about. Reading a pool price as a token price is how a stablecoin ends
+   * up reported at the price of its pair. Returns null when the provider has no
+   * price for it.
+   */
+  getTokenPriceUsd(chain: ChainId, token: string): Promise<string | null>;
+
   /** Search by symbol or address. */
   search(query: string, chain?: ChainId): Promise<MarketSnapshot[]>;
 

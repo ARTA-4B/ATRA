@@ -135,5 +135,27 @@ jobs:
       - name: Audit
         run: pnpm audit --audit-level moderate || true
 
+      # Fails on a real high or critical advisory, but not when the registry
+      # itself is unavailable. npm returning 503 is an outage, not a finding,
+      # and treating the two alike teaches everyone to ignore a red build.
       - name: Fail on high or critical advisories
-        run: pnpm audit --audit-level high
+        run: |
+          set +e
+          output=$(pnpm audit --audit-level high --json 2>&1)
+          status=$?
+          set -e
+
+          if [ $status -eq 0 ]; then
+            echo "no high or critical advisories"
+            exit 0
+          fi
+
+          if echo "$output" | grep -qE 'ERR_PNPM_AUDIT_BAD_RESPONSE|responded with 50[0-9]|ENOTFOUND|ETIMEDOUT'; then
+            echo "::warning::Could not reach the npm advisory endpoint; skipping the audit gate"
+            echo "$output" | tail -5
+            exit 0
+          fi
+
+          echo "$output"
+          echo "::error::High or critical advisories found"
+          exit 1

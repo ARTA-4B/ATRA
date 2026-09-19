@@ -3,12 +3,7 @@ import { CHAIN_IDS } from '../../chains/registry.js';
 import type { ChainId } from '../../chains/registry.js';
 import { AppError, ErrorCode, errorMessage } from '../../util/errors.js';
 import { childLogger } from '../../logging/logger.js';
-import type {
-  MarketDataProvider,
-  MarketSnapshot,
-  ProviderHealth,
-  TokenRef,
-} from '../types.js';
+import type { MarketDataProvider, MarketSnapshot, ProviderHealth, TokenRef } from '../types.js';
 
 /**
  * DexScreener.
@@ -121,29 +116,36 @@ export class DexScreenerProvider implements MarketDataProvider {
     return this.#mapMany(raw, chain).sort(byLiquidityDescending);
   }
 
+  /**
+   * USD price of a token.
+   *
+   * Only pools where the requested token is the base token are considered,
+   * because `priceUsd` describes the base token. The deepest such pool wins:
+   * it is the hardest to move and therefore the least misleading quote.
+   */
+  async getTokenPriceUsd(chain: ChainId, token: string): Promise<string | null> {
+    const pools = await this.getPoolsForToken(chain, token);
+    const wanted = token.toLowerCase();
+
+    const asBase = pools
+      .filter((pool) => pool.base.address.toLowerCase() === wanted && pool.priceUsd !== null)
+      .sort(byLiquidityDescending);
+
+    return asBase[0]?.priceUsd ?? null;
+  }
+
   async getPool(chain: ChainId, poolId: string): Promise<MarketSnapshot | null> {
     const slug = CHAIN_SLUGS[chain];
     const raw = await this.#get<unknown>(`/latest/dex/pairs/${slug}/${encodeURIComponent(poolId)}`);
 
     // This endpoint wraps results in { pairs: [...] } while the token endpoint
     // returns a bare array.
-    const pairs =
-      raw !== null && typeof raw === 'object' && 'pairs' in raw
-        ? (raw as { pairs: unknown }).pairs
-        : raw;
-
-    return this.#mapMany(pairs, chain)[0] ?? null;
+    return this.#mapMany(unwrapPairs(raw), chain)[0] ?? null;
   }
 
   async search(query: string, chain?: ChainId): Promise<MarketSnapshot[]> {
     const raw = await this.#get<unknown>(`/latest/dex/search?q=${encodeURIComponent(query)}`);
-    const pairs =
-      raw !== null && typeof raw === 'object' && 'pairs' in raw
-        ? (raw as { pairs: unknown }).pairs
-        : raw;
-
-    const snapshots = this.#mapMany(pairs, chain);
-    return snapshots.sort(byLiquidityDescending);
+    return this.#mapMany(unwrapPairs(raw), chain).sort(byLiquidityDescending);
   }
 
   /**
@@ -212,6 +214,17 @@ export class DexScreenerProvider implements MarketDataProvider {
       clearTimeout(timer);
     }
   }
+}
+
+/**
+ * Some endpoints answer with `{ pairs: [...] }` and others with a bare array.
+ * Normalising here keeps that inconsistency out of the mapping code.
+ */
+function unwrapPairs(raw: unknown): unknown {
+  if (raw !== null && typeof raw === 'object' && 'pairs' in raw) {
+    return raw.pairs;
+  }
+  return raw;
 }
 
 function toSnapshot(pair: Pair, chain: ChainId, fetchedAt: number): MarketSnapshot {

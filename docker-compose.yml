@@ -40,7 +40,13 @@ services:
       ATRA_LOG_PRETTY: "0"
 
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/health"]
+      # node, not wget: the slim base image has no wget, and a health check
+      # that cannot run marks a perfectly healthy container as unhealthy.
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/health').then(r=>r.json()).then(b=>process.exit(b.status==='ok'?0:1)).catch(()=>process.exit(1))"
       interval: 30s
       timeout: 5s
       retries: 3
