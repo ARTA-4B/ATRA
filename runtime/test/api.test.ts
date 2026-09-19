@@ -787,3 +787,152 @@ describe('ATRA HTTP API', () => {
     });
   });
 });
+
+describe('Phase 3 routes', () => {
+  let services: Services;
+  let app: Hono<AppEnv>;
+  let client: TestClient;
+
+  beforeEach(async () => {
+    const config = loadConfig({
+      NODE_ENV: 'test',
+      ATRA_MODE: 'ci',
+      ATRA_LOG_LEVEL: 'silent',
+      ATRA_DATA_DIR: './.test-data',
+    });
+    const adapters = new Map<ChainId, ChainAdapter>([
+      ['base', stubAdapter('base')],
+      ['bsc', stubAdapter('bsc')],
+      ['robinhood', stubAdapter('robinhood')],
+      ['solana', stubAdapter('solana')],
+    ]);
+    services = buildServices(config, { databaseFile: ':memory:', adapters, kdfParams: FAST_KDF });
+    app = createApp(services);
+    client = new TestClient(app);
+
+    await client.post('/api/v1/auth/setup', { password: PASSWORD });
+    await client.post('/api/v1/setup/wallets');
+    await client.post('/api/v1/setup/complete', {
+      chains: ['base', 'solana'],
+      paperAcknowledged: true,
+    });
+  });
+
+  afterEach(() => {
+    shutdownServices(services);
+  });
+
+  it('reports the trading view with no positions, no decisions and no executable Robinhood Chain', async () => {
+    const response = await client.get('/api/v1/trading');
+    expect(response.status).toBe(200);
+    expect(response.body.data.positions).toEqual([]);
+    expect(response.body.data.decisions).toEqual([]);
+    expect(response.body.data.status.enabled).toBe(false);
+    expect(response.body.data.modelStatus).toBe('UNTRAINED');
+    const robinhood = response.body.data.execution.find(
+      (row: { chain: string }) => row.chain === 'robinhood',
+    );
+    expect(robinhood.executable).toBe(false);
+    expect(robinhood.reason).toMatch(/no execution adapter/);
+  });
+
+  it('seeds and lists paper balances, refusing unknown tokens', async () => {
+    const bad = await client.put('/api/v1/trading/paper-balances', {
+      chain: 'base',
+      token: '0x' + 'ab'.repeat(20),
+      amount: '1000000',
+    });
+    expect(bad.status).toBe(422);
+
+    const ok = await client.put('/api/v1/trading/paper-balances', {
+      chain: 'base',
+      token: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
+      amount: '250000000',
+    });
+    expect(ok.status).toBe(200);
+
+    const list = await client.get('/api/v1/trading/paper-balances');
+    expect(list.body.data).toHaveLength(1);
+    expect(list.body.data[0].symbol).toBe('USDC');
+    expect(list.body.data[0].formatted).toBe('250');
+  });
+
+  it('refuses to run a cycle while paused, and runs one (to no action) otherwise', async () => {
+    await client.post('/api/v1/control/pause', { reason: 'test' });
+    const paused = await client.post('/api/v1/trading/run', {
+      chain: 'base',
+      token: '0x4200000000000000000000000000000000000006',
+    });
+    expect(paused.status).toBe(409);
+
+    await client.post('/api/v1/control/resume');
+    const run = await client.post('/api/v1/trading/run', {
+      chain: 'base',
+      token: '0x4200000000000000000000000000000000000006',
+    });
+    expect(run.status).toBe(202);
+    // CI mode: no market providers, no model, no execution adapter.
+    expect(['no_action', 'skipped']).toContain(run.body.data.outcome);
+    expect(run.body.data.execution).toBeNull();
+  });
+
+  it('configures the scheduler and refuses to enable it under emergency stop', async () => {
+    const bad = await client.put('/api/v1/trading/scheduler', {
+      enabled: true,
+      intervalSeconds: 10,
+    });
+    expect(bad.status).toBe(422);
+
+    const on = await client.put('/api/v1/trading/scheduler', {
+      enabled: true,
+      intervalSeconds: 300,
+    });
+    expect(on.status).toBe(200);
+    expect(on.body.data.enabled).toBe(true);
+    expect(on.body.data.nextRunAt).not.toBeNull();
+
+    await client.post('/api/v1/control/emergency-stop', { reason: 'test' });
+    const after = await client.get('/api/v1/trading/scheduler');
+    expect(after.body.data.enabled).toBe(false);
+
+    const blocked = await client.put('/api/v1/trading/scheduler', {
+      enabled: true,
+      intervalSeconds: 300,
+    });
+    expect(blocked.status).toBe(409);
+  });
+
+  it('validates withdrawal destinations and requires re-authentication to submit', async () => {
+    const invalid = await client.post('/api/v1/wallet/withdraw/quote', {
+      chainId: 'base',
+      asset: 'USDC',
+      destination: '0x0000000000000000000000000000000000000000',
+      amount: '1',
+    });
+    expect(invalid.status).toBe(422);
+    expect(invalid.body.errors[0].message).toBe('INVALID_ADDRESS');
+
+    // The stub chain adapter cannot prepare transfers, so quoting is 503.
+    const quote = await client.post('/api/v1/wallet/withdraw/quote', {
+      chainId: 'base',
+      asset: 'USDC',
+      destination: '0x' + '11'.repeat(20),
+      amount: '1',
+    });
+    expect(quote.status).toBe(503);
+    expect(quote.body.code).toBe('ADAPTER_UNAVAILABLE');
+
+    const submit = await client.post('/api/v1/wallet/withdraw', {
+      quoteId: '00000000-0000-4000-8000-000000000000',
+      ack: true,
+    });
+    expect(submit.status).toBe(403);
+    expect(submit.body.code).toBe('REAUTH_REQUIRED');
+  });
+
+  it('lists withdrawals as an empty history before any are made', async () => {
+    const response = await client.get('/api/v1/wallet/transactions');
+    expect(response.status).toBe(200);
+    expect(response.body.data).toEqual([]);
+  });
+});

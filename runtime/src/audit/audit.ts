@@ -31,7 +31,7 @@ export type AuditCategory =
   | 'telegram'
   | 'system';
 
-export type AuditStatus = 'ok' | 'rejected' | 'failed' | 'pending';
+export type AuditStatus = 'ok' | 'rejected' | 'failed' | 'pending' | 'hold';
 
 export interface AuditEvent {
   category: AuditCategory;
@@ -75,6 +75,8 @@ export interface AuditQuery {
   category?: AuditCategory;
   chain?: ChainId;
   status?: AuditStatus;
+  /** Every row of one decision cycle, trade or withdrawal. */
+  correlationId?: string;
   /** Cursor: return rows with an id strictly below this. */
   before?: number;
   limit?: number;
@@ -139,6 +141,10 @@ export class AuditLog {
     if (query.status) {
       clauses.push('status = ?');
       params.push(query.status);
+    }
+    if (query.correlationId) {
+      clauses.push('correlation_id = ?');
+      params.push(query.correlationId);
     }
     if (query.before !== undefined) {
       clauses.push('id < ?');

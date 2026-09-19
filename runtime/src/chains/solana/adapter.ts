@@ -4,6 +4,11 @@ import type { ChainId } from '../registry.js';
 import { AppError, ErrorCode, errorMessage } from '../../util/errors.js';
 import { childLogger } from '../../logging/logger.js';
 import type {
+  PreparedTransfer,
+  SignedTransaction,
+  SigningContext,
+  TransferCapable,
+  TransferRequest,
   ChainAdapter,
   ChainHealth,
   FeeEstimate,
@@ -30,6 +35,24 @@ import type {
 const DEFAULT_TIMEOUT_MS = 10_000;
 /** Base fee per signature, fixed by the protocol. */
 const LAMPORTS_PER_SIGNATURE = 5_000n;
+
+import {
+  TOKEN_ACCOUNT_BYTES,
+  TOKEN_2022_PROGRAM,
+  TOKEN_PROGRAM,
+  associatedTokenAddress,
+  compileLegacyMessage,
+  createAssociatedTokenAccountIdempotent,
+  systemTransfer,
+  transferChecked,
+  unsignedTransactionBase64,
+} from './transfer.js';
+
+interface SolanaTransferPayload {
+  feePayer: string;
+  transactionBase64: string;
+  lastValidBlockHeight: number;
+}
 
 export const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 export const TOKEN_2022_PROGRAM_ID = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
@@ -76,7 +99,7 @@ interface AccountInfoResponse {
   } | null;
 }
 
-export class SolanaChainAdapter implements ChainAdapter {
+export class SolanaChainAdapter implements ChainAdapter, TransferCapable {
   readonly chain: ChainId = 'solana';
   readonly #endpoint: string;
   readonly #timeoutMs: number;
@@ -259,6 +282,134 @@ export class SolanaChainAdapter implements ChainAdapter {
       confirmations: status.confirmations,
       error: status.err ? JSON.stringify(status.err).slice(0, 200) : null,
     });
+  }
+
+  // --- transfers (operator withdrawals) --------------------------------------
+
+  /**
+   * Build a SOL or SPL transfer.
+   *
+   * A token transfer creates the destination's associated token account if it
+   * does not exist (idempotently), which costs rent; that rent is read from
+   * the chain and included in the fee. The token program is taken from the
+   * mint's owner so Token-2022 mints are handled with the right program.
+   */
+  async prepareTransfer(request: TransferRequest): Promise<PreparedTransfer> {
+    assertPubkey(request.from);
+    assertPubkey(request.to);
+    if (request.amount <= 0n) {
+      throw new AppError(ErrorCode.SCHEMA_INVALID, 'Transfer amount must be positive');
+    }
+    if (request.from === request.to) {
+      throw new AppError(ErrorCode.SCHEMA_INVALID, 'Destination is the agent wallet itself');
+    }
+
+    const warnings: string[] = [];
+    const blockhash = await this.#rpc<{
+      value: { blockhash: string; lastValidBlockHeight: number };
+    }>('getLatestBlockhash', [{ commitment: 'confirmed' }]);
+
+    let fee = BigInt(LAMPORTS_PER_SIGNATURE);
+    let message: Uint8Array;
+    let summary: string;
+
+    if (request.token === null) {
+      message = compileLegacyMessage(request.from, blockhash.value.blockhash, [
+        systemTransfer(request.from, request.to, request.amount),
+      ]);
+      summary = `send ${request.amount.toString()} lamports to ${request.to}`;
+    } else {
+      assertPubkey(request.token);
+      const mintInfo = await this.#rpc<AccountInfoResponse>('getAccountInfo', [
+        request.token,
+        { encoding: 'jsonParsed', commitment: 'confirmed' },
+      ]);
+      if (!mintInfo.value) {
+        throw new AppError(ErrorCode.NOT_FOUND, 'Token mint does not exist');
+      }
+      const tokenProgram = mintInfo.value.owner;
+      if (tokenProgram !== TOKEN_PROGRAM && tokenProgram !== TOKEN_2022_PROGRAM) {
+        throw new AppError(ErrorCode.SCHEMA_INVALID, 'Mint is not owned by a token program');
+      }
+      const mintDecimals = !Array.isArray(mintInfo.value.data)
+        ? mintInfo.value.data.parsed?.info?.decimals
+        : undefined;
+      if (mintDecimals !== undefined && mintDecimals !== request.decimals) {
+        throw new AppError(ErrorCode.CONFLICT, 'Token decimals disagree with the mint');
+      }
+
+      const sourceAta = associatedTokenAddress(request.from, request.token, tokenProgram);
+      const destinationAta = associatedTokenAddress(request.to, request.token, tokenProgram);
+
+      const destinationInfo = await this.#rpc<AccountInfoResponse>('getAccountInfo', [
+        destinationAta,
+        { encoding: 'base64', commitment: 'confirmed' },
+      ]);
+      if (!destinationInfo.value) {
+        const rent = await this.getRentExemptMinimum(TOKEN_ACCOUNT_BYTES);
+        fee += rent;
+        warnings.push(
+          `Destination has no token account; creating one costs ${rent.toString()} lamports of rent.`,
+        );
+      }
+
+      message = compileLegacyMessage(request.from, blockhash.value.blockhash, [
+        createAssociatedTokenAccountIdempotent(
+          request.from,
+          destinationAta,
+          request.to,
+          request.token,
+          tokenProgram,
+        ),
+        transferChecked(
+          sourceAta,
+          request.token,
+          destinationAta,
+          request.from,
+          request.amount,
+          request.decimals,
+          tokenProgram,
+        ),
+      ]);
+      summary = `transfer ${request.amount.toString()} of ${request.token} to ${request.to}`;
+    }
+
+    const payload: SolanaTransferPayload = {
+      feePayer: request.from,
+      transactionBase64: unsignedTransactionBase64(message),
+      lastValidBlockHeight: blockhash.value.lastValidBlockHeight,
+    };
+
+    return {
+      chain: this.chain,
+      payload,
+      feeNative: fee.toString(),
+      feeSource: 'chain-rpc',
+      summary,
+      warnings,
+    };
+  }
+
+  async transferSigningContext(prepared: PreparedTransfer): Promise<SigningContext> {
+    const payload = prepared.payload as SolanaTransferPayload;
+    return Promise.resolve({
+      family: 'solana',
+      feePayer: payload.feePayer,
+      transactionBase64: payload.transactionBase64,
+      lastValidBlockHeight: payload.lastValidBlockHeight,
+    });
+  }
+
+  async broadcastSigned(signed: SignedTransaction): Promise<void> {
+    const reported = await this.#rpc<string>('sendTransaction', [
+      signed.raw,
+      { encoding: 'base64', skipPreflight: false, preflightCommitment: 'confirmed', maxRetries: 3 },
+    ]);
+    if (reported !== signed.hash) {
+      throw new AppError(ErrorCode.CONFLICT, 'Node reported a different transaction signature', {
+        details: { recorded: signed.hash, reported },
+      });
+    }
   }
 
   /** Rent-exempt minimum for an account of `bytes`, queried never hard-coded. */

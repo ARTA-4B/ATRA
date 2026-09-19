@@ -1,6 +1,6 @@
 import { loadConfig } from './config/env.js';
 import { createLogger, setRootLogger, childLogger } from './logging/logger.js';
-import { buildServices, shutdownServices } from './core/services.js';
+import { buildServices, shutdownServices, startBackgroundServices } from './core/services.js';
 import { startServer } from './http/server.js';
 import { isAppError } from './util/errors.js';
 import type { StartedServer } from './http/server.js';
@@ -55,6 +55,13 @@ async function main(): Promise<void> {
 
   const server = await startServer(services);
   installShutdownHandlers(server, services);
+
+  // Reconcile before the scheduler can propose anything new.
+  try {
+    await startBackgroundServices(services);
+  } catch (error) {
+    log.error({ err: error }, 'background services failed to start; trading stays idle');
+  }
 
   services.audit.append({
     category: 'system',

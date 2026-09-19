@@ -101,6 +101,8 @@ export class StateStore {
   readonly #audit: AuditLog;
   readonly #log = childLogger('state');
 
+  readonly #emergencyHandlers: Array<(active: boolean, reason: string | null) => void> = [];
+
   constructor(db: Db, audit: AuditLog) {
     this.#db = db;
     this.#audit = audit;
@@ -266,6 +268,14 @@ export class StateStore {
    * operator must walk the activation checklist again rather than resuming
    * live trading with a single click.
    */
+  /**
+   * Register a hook that runs when the emergency stop changes. Phase 3 uses it
+   * to disarm the auto-trade scheduler without the scheduler polling state.
+   */
+  onEmergencyStop(handler: (active: boolean, reason: string | null) => void): void {
+    this.#emergencyHandlers.push(handler);
+  }
+
   setEmergencyStop(active: boolean, reason: string | null, actor: string): void {
     const now = new Date().toISOString();
     this.#db
@@ -293,6 +303,14 @@ export class StateStore {
       detail: { revertedToPaper: active },
     });
     this.#log.error({ active, actor }, 'emergency stop changed');
+
+    for (const handler of this.#emergencyHandlers) {
+      try {
+        handler(active, reason);
+      } catch (error) {
+        this.#log.error({ err: error }, 'emergency stop hook failed');
+      }
+    }
   }
 
   // --- mode ----------------------------------------------------------------

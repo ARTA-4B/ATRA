@@ -7,6 +7,7 @@ import { AppError, ErrorCode } from '../../util/errors.js';
 import { REAUTH_HEADER, localOnly, requireSession } from '../middleware.js';
 import { CHAIN_IDS, CHAINS } from '../../chains/registry.js';
 import type { ChainId } from '../../chains/registry.js';
+import { WITHDRAW_ASSETS } from '../../wallet/withdrawal.js';
 
 /**
  * Wallet routes.
@@ -22,6 +23,19 @@ const exportSchema = z.object({
   keystorePassword: z.string().min(12).max(512).optional(),
   /** The operator must type this exactly, so an export is never a stray click. */
   confirmation: z.literal('EXPORT'),
+});
+
+const withdrawQuoteSchema = z.object({
+  chainId: z.enum(CHAIN_IDS),
+  asset: z.enum(WITHDRAW_ASSETS),
+  destination: z.string().min(1).max(64),
+  amount: z.union([z.literal('all'), z.string().regex(/^\d+(\.\d+)?$/)]),
+});
+
+const withdrawSchema = z.object({
+  quoteId: z.uuid(),
+  ack: z.literal(true),
+  confirmation: z.string().max(16).optional(),
 });
 
 export function walletRoutes(): Hono<AppEnv> {
@@ -115,17 +129,59 @@ export function walletRoutes(): Hono<AppEnv> {
     );
   });
 
+  /** Operator-initiated transfers. Agent trades are under /trading. */
   app.get('/transactions', (c) => {
     const services = c.get('services');
     const limit = Math.min(Number(c.req.query('limit') ?? 50), 200);
+    return c.json(envelope(c, services.withdrawals.list(limit), { source: 'local' }));
+  });
 
-    const rows = services.db
-      .prepare<[number], Record<string, unknown>>(
-        'SELECT * FROM wallet_transactions ORDER BY created_at DESC LIMIT ?',
-      )
-      .all(limit);
+  /** Re-read one transfer's status from the chain. */
+  app.get('/transactions/:txId', async (c) => {
+    const services = c.get('services');
+    const result = await services.withdrawals.refresh(c.req.param('txId'));
+    if (!result) throw new AppError(ErrorCode.NOT_FOUND, 'No such transaction');
+    return c.json(envelope(c, result, { source: 'rpc' }));
+  });
 
-    return c.json(envelope(c, rows, { source: 'local' }));
+  /**
+   * Quote a withdrawal: validates the destination, reads the balance and the
+   * fee, and says whether typed confirmation will be needed. Valid 90 s. A
+   * quote whose fee could not be read is returned with `submittable: false`.
+   */
+  app.post('/withdraw/quote', async (c) => {
+    const services = c.get('services');
+    const body = await parse(c, withdrawQuoteSchema);
+    const quote = await services.withdrawals.quote(body);
+    return c.json(
+      envelope(c, quote, {
+        source: quote.fee.source === 'none' ? 'none' : 'rpc',
+        ...(quote.fee.source === 'none' ? { reason: 'fee could not be estimated' } : {}),
+      }),
+    );
+  });
+
+  /**
+   * Submit a quoted withdrawal. Requires a re-auth token bound to
+   * `wallet.withdraw` and an unlocked vault; honours `Idempotency-Key`.
+   * Allowed in PAPER mode: these are the operator's own funds.
+   */
+  app.post('/withdraw', async (c) => {
+    const services = c.get('services');
+    const session = c.get('session')!;
+    const body = await parse(c, withdrawSchema);
+
+    services.auth.consumeReauthToken(c.req.header(REAUTH_HEADER), 'wallet.withdraw', session.id);
+    if (!services.vault.isUnlocked) {
+      throw new AppError(ErrorCode.VAULT_LOCKED, 'Re-authenticate to unlock the vault');
+    }
+
+    const idempotencyKey = c.req.header('idempotency-key');
+    const result = await services.withdrawals.execute(
+      { quoteId: body.quoteId, ack: body.ack, confirmation: body.confirmation },
+      idempotencyKey && idempotencyKey.length <= 128 ? idempotencyKey : undefined,
+    );
+    return c.json(envelope(c, result, { source: 'rpc' }), 202);
   });
 
   /**

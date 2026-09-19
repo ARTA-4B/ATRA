@@ -100,3 +100,79 @@ export interface ChainAdapter {
 
   getTransactionStatus(hash: string): Promise<Observation<TransactionStatus>>;
 }
+
+// ---------------------------------------------------------------------------
+// Transfers (Phase 3). Used by operator withdrawals only; agent trades go
+// through the execution adapters, which know their contracts.
+// ---------------------------------------------------------------------------
+
+export interface TransferRequest {
+  from: string;
+  to: string;
+  /** Null for the native coin. */
+  token: string | null;
+  amount: bigint;
+  decimals: number;
+}
+
+export interface PreparedTransfer {
+  chain: ChainId;
+  /** Family-specific unsigned payload. Never contains key material. */
+  payload: unknown;
+  /**
+   * Total fee in native base units, or null when it could not be estimated.
+   * A null fee means the transfer must not be submitted.
+   */
+  feeNative: string | null;
+  feeSource: string;
+  summary: string;
+  warnings: string[];
+}
+
+/**
+ * Everything the synchronous signer needs, fetched by the adapter before the
+ * key is touched. Family-specific because the transaction formats are.
+ */
+export type SigningContext =
+  | {
+      family: 'evm';
+      chainId: number;
+      from: string;
+      to: string;
+      data: string;
+      value: string;
+      gas: string;
+      nonce: number;
+      maxFeePerGas: string;
+      maxPriorityFeePerGas: string;
+    }
+  | {
+      family: 'solana';
+      feePayer: string;
+      transactionBase64: string;
+      lastValidBlockHeight: number | null;
+    };
+
+export interface SignedTransaction {
+  /** Serialized signed transaction (hex for EVM, base64 for Solana). */
+  raw: string;
+  /** Transaction hash or signature, known before broadcast. */
+  hash: string;
+}
+
+export interface TransferCapable {
+  prepareTransfer(request: TransferRequest): Promise<PreparedTransfer>;
+  transferSigningContext(prepared: PreparedTransfer): Promise<SigningContext>;
+  broadcastSigned(signed: SignedTransaction): Promise<void>;
+}
+
+export function supportsTransfers(
+  adapter: ChainAdapter,
+): adapter is ChainAdapter & TransferCapable {
+  const candidate = adapter as Partial<TransferCapable>;
+  return (
+    typeof candidate.prepareTransfer === 'function' &&
+    typeof candidate.transferSigningContext === 'function' &&
+    typeof candidate.broadcastSigned === 'function'
+  );
+}

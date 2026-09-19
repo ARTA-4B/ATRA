@@ -1,4 +1,11 @@
-import { createPublicClient, defineChain, erc20Abi, http, isAddress } from 'viem';
+import {
+  createPublicClient,
+  defineChain,
+  encodeFunctionData,
+  erc20Abi,
+  http,
+  isAddress,
+} from 'viem';
 import type { PublicClient } from 'viem';
 import { CHAINS } from '../registry.js';
 import type { ChainId } from '../registry.js';
@@ -10,9 +17,14 @@ import type {
   FeeEstimate,
   NativeBalance,
   Observation,
+  PreparedTransfer,
+  SignedTransaction,
+  SigningContext,
   TokenBalance,
   TokenMetadata,
   TransactionStatus,
+  TransferCapable,
+  TransferRequest,
 } from '../types.js';
 
 /**
@@ -30,6 +42,16 @@ import type {
 const DEFAULT_TIMEOUT_MS = 10_000;
 /** Gas a plain native transfer costs on every EVM chain. */
 const NATIVE_TRANSFER_GAS = 21_000;
+/** Ceiling for an ERC-20 transfer when the node cannot estimate. */
+const TOKEN_TRANSFER_GAS_FALLBACK = 90_000;
+
+interface EvmTransferPayload {
+  from: `0x${string}`;
+  to: `0x${string}`;
+  data: `0x${string}`;
+  value: string;
+  gas: string;
+}
 
 export interface EvmAdapterOptions {
   /** Overrides the registry endpoints; supplied by an operator using BYOK. */
@@ -37,7 +59,7 @@ export interface EvmAdapterOptions {
   timeoutMs?: number;
 }
 
-export class EvmChainAdapter implements ChainAdapter {
+export class EvmChainAdapter implements ChainAdapter, TransferCapable {
   readonly chain: ChainId;
   readonly #client: PublicClient;
   readonly #endpoint: string;
@@ -221,6 +243,122 @@ export class EvmChainAdapter implements ChainAdapter {
     });
 
     return this.#observe(status);
+  }
+
+  // --- transfers (operator withdrawals) --------------------------------------
+
+  /**
+   * Build a native or ERC-20 transfer and estimate its fee.
+   *
+   * The fee is estimated with `eth_estimateGas` from the wallet; when that
+   * fails (most often because the wallet cannot cover the transfer) the
+   * transfer is returned with a null fee and a warning, and the withdrawal
+   * service refuses to submit it. There is no fallback fee for a transaction
+   * the node says will not run.
+   */
+  async prepareTransfer(request: TransferRequest): Promise<PreparedTransfer> {
+    this.#assertAddress(request.from);
+    this.#assertAddress(request.to);
+    if (request.amount <= 0n) {
+      throw new AppError(ErrorCode.SCHEMA_INVALID, 'Transfer amount must be positive');
+    }
+
+    const warnings: string[] = [];
+    const from = request.from as `0x${string}`;
+    const to = request.to as `0x${string}`;
+
+    const payload: EvmTransferPayload = request.token
+      ? {
+          from,
+          to: request.token as `0x${string}`,
+          data: encodeFunctionData({
+            abi: erc20Abi,
+            functionName: 'transfer',
+            args: [to, request.amount],
+          }),
+          value: '0',
+          gas: String(TOKEN_TRANSFER_GAS_FALLBACK),
+        }
+      : {
+          from,
+          to,
+          data: '0x',
+          value: request.amount.toString(),
+          gas: String(NATIVE_TRANSFER_GAS),
+        };
+
+    if (request.token) this.#assertAddress(request.token);
+
+    // Sending to a contract is allowed but worth a warning: many contracts
+    // cannot move what they receive.
+    try {
+      const code = await this.#client.getCode({ address: to });
+      if (code && code !== '0x') warnings.push('Destination is a contract address.');
+    } catch {
+      warnings.push('Could not check whether the destination is a contract.');
+    }
+
+    let feeNative: string | null = null;
+    let feeSource = 'none';
+    try {
+      const [gas, gasPrice] = await Promise.all([
+        request.token
+          ? this.#client.estimateGas({ account: from, to: payload.to, data: payload.data })
+          : Promise.resolve(BigInt(NATIVE_TRANSFER_GAS)),
+        this.#client.getGasPrice(),
+      ]);
+      const gasWithBuffer = request.token ? (gas * 120n) / 100n : gas;
+      payload.gas = gasWithBuffer.toString();
+      feeNative = (gasWithBuffer * ((gasPrice * 125n) / 100n)).toString();
+      feeSource = 'chain-rpc';
+    } catch (cause) {
+      this.#log.warn({ err: cause }, 'transfer fee estimate failed');
+      warnings.push(`Fee could not be estimated: ${errorMessage(cause)}`);
+    }
+
+    return {
+      chain: this.chain,
+      payload,
+      feeNative,
+      feeSource,
+      summary: request.token
+        ? `transfer ${request.amount.toString()} of ${request.token} to ${request.to}`
+        : `send ${request.amount.toString()} wei to ${request.to}`,
+      warnings,
+    };
+  }
+
+  async transferSigningContext(prepared: PreparedTransfer): Promise<SigningContext> {
+    const payload = prepared.payload as EvmTransferPayload;
+    const [nonce, fees] = await Promise.all([
+      this.#call('getTransactionCount', () =>
+        this.#client.getTransactionCount({ address: payload.from, blockTag: 'pending' }),
+      ),
+      this.#call('estimateFeesPerGas', () => this.#client.estimateFeesPerGas()),
+    ]);
+    return {
+      family: 'evm',
+      chainId: CHAINS[this.chain].evmChainId!,
+      from: payload.from,
+      to: payload.to,
+      data: payload.data,
+      value: payload.value,
+      gas: payload.gas,
+      nonce,
+      maxFeePerGas: ((fees.maxFeePerGas * 125n) / 100n).toString(),
+      maxPriorityFeePerGas: fees.maxPriorityFeePerGas.toString(),
+    };
+  }
+
+  async broadcastSigned(signed: SignedTransaction): Promise<void> {
+    const reported = await this.#call('sendRawTransaction', () =>
+      this.#client.sendRawTransaction({ serializedTransaction: signed.raw as `0x${string}` }),
+    );
+    if (reported.toLowerCase() !== signed.hash.toLowerCase()) {
+      throw new AppError(ErrorCode.CONFLICT, 'Node reported a different transaction hash', {
+        details: { recorded: signed.hash, reported },
+      });
+    }
   }
 
   #assertAddress(address: string): void {

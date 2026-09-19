@@ -87,7 +87,7 @@ to download, run, modify or use anything here. See [Token disclosure](#token-dis
 
 | Claim | Status |
 |---|---|
-| Wallets are generated locally and encrypted at rest | Verified by 308 tests |
+| Wallets are generated locally and encrypted at rest | Verified by 394 tests |
 | A wrong password cannot export a key | Verified by test |
 | No private key appears in logs, the database, API responses or audit rows | Verified by test and CI log scan |
 | All four chains are reachable and identity-checked | Verified live |
@@ -95,7 +95,10 @@ to download, run, modify or use anything here. See [Token disclosure](#token-dis
 | The risk engine rejects oversized, stale, unlisted and unfunded actions | Verified by 87 tests |
 | `docker compose up` reaches a healthy container | Verified in CI |
 | Graceful shutdown on SIGTERM | Verified in CI |
-| **Auto-trading** | Not built (Phase 3) |
+| **Auto-trading (paper)** | Built: research → trader → deterministic proposal → risk engine → paper fill. Verified by 53 tests |
+| **Live execution path** | Built for Solana (Jupiter), BSC (PancakeSwap v2), Base (Aerodrome). Verified against mainnet up to signing; **no live trade has been executed** |
+| **Robinhood Chain execution** | Not built (Uniswap v4 Universal Router); chain is observable only |
+| **Withdrawals** | Built; work in PAPER mode; hash recorded before broadcast |
 | **Liquidity management** | Not built (Phase 4) |
 | **Telegram bot** | Not built (Phase 4) |
 | **ATRA-4B model** | **Untrained.** Pipeline exists; no run has happened |
@@ -103,7 +106,7 @@ to download, run, modify or use anything here. See [Token disclosure](#token-dis
 | **Any performance or profit figure** | None exist, and none will be invented |
 
 Phase reports with commands, results and honest limitations:
-[Phase 1](docs/PHASE_1_REPORT.md) · [Phase 2](docs/PHASE_2_REPORT.md)
+[Phase 1](docs/PHASE_1_REPORT.md) · [Phase 2](docs/PHASE_2_REPORT.md) · [Phase 3](docs/PHASE_3_REPORT.md)
 
 ## Risk limits
 
@@ -127,9 +130,12 @@ enforcement works.
 
 There is no switch. Live mode requires six explicit steps — acknowledgement,
 re-authentication, risk review, funded wallet, gas present, adapter available —
-and the emergency stop revokes it. Auto-trading itself is not yet implemented,
-so today live mode changes nothing except what the runtime is willing to do
-once Phase 3 lands.
+and the emergency stop revokes it. In live mode the same pipeline that runs on
+paper signs real transactions: simulate first, write the transaction hash to
+disk before broadcasting, book the fill from what the chain reports. See
+[`skills/auto-trade/SKILL.md`](skills/auto-trade/SKILL.md). Nothing in this
+repository has executed a live trade; the path is tested with fake chains and
+verified against mainnet up to, not including, signing.
 
 ## Stopping
 

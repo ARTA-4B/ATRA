@@ -311,6 +311,36 @@ export class WalletService {
   }
 
   /**
+   * Sign with the chain's key inside a synchronous callback.
+   *
+   * This is the only path by which a private key reaches a signer. The
+   * callback receives the plaintext and the recorded address, must not await,
+   * and the plaintext is wiped when it returns. The key is checked against the
+   * recorded address first, exactly as for export.
+   *
+   * No audit row is written here: the executor records what was signed (the
+   * transaction hash) in the trade row and the audit log; this method only
+   * knows about bytes.
+   */
+  useSigningKey<T>(chain: ChainId, use: (secret: Uint8Array, address: string) => T): T {
+    const family = chainFamily(chain);
+    const wallet = this.get(family);
+    if (!wallet) {
+      throw new AppError(ErrorCode.NOT_FOUND, `No ${family} wallet exists`);
+    }
+
+    const row = this.#db
+      .prepare<[WalletFamily], WalletRow>('SELECT * FROM wallets WHERE family = ?')
+      .get(family)!;
+
+    return this.#vault.useSecret(row.secret_id, (plaintext) => {
+      if (family === 'evm') this.#assertEvmMatches(plaintext, wallet.address);
+      else this.#assertSolanaConsistent(plaintext);
+      return use(plaintext, wallet.address);
+    });
+  }
+
+  /**
    * Refuse to hand out a key that does not control the recorded address.
    *
    * A mismatch means the vault row and the wallet row disagree, and an export

@@ -13,10 +13,23 @@ import { MarketService } from '../market/service.js';
 import { DexScreenerProvider } from '../market/providers/dexscreener.js';
 import { GeckoTerminalProvider } from '../market/providers/geckoterminal.js';
 import { ResearchAgent } from '../agents/research/agent.js';
+import { TraderAgent } from '../agents/trader/agent.js';
 import { HttpLlmProvider, NullLlmProvider } from '../llm/provider.js';
+import { LedgerService } from '../trading/ledger.js';
+import { TradeStore } from '../trading/trades.js';
+import { RiskGate } from '../risk/gate.js';
+import { ProposalBuilder } from '../trading/proposal.js';
+import { AutoTradePipeline } from '../trading/pipeline.js';
+import { AutoTradeScheduler } from '../trading/scheduler.js';
+import { PaperExecutor } from '../execution/paper.js';
+import { LiveExecutor } from '../execution/live.js';
+import { ExecutionRegistry, buildExecutionRegistry } from '../execution/registry.js';
+import type { ExecutionAdapter } from '../execution/types.js';
+import { WithdrawalService } from '../wallet/withdrawal.js';
 import type { LlmProvider } from '../llm/provider.js';
 import type { ChainId } from '../chains/registry.js';
 import type { ChainAdapter } from '../chains/types.js';
+import type { MarketDataProvider } from '../market/types.js';
 import type { RuntimeConfig } from '../config/env.js';
 import { childLogger } from '../logging/logger.js';
 import { join } from 'node:path';
@@ -43,6 +56,18 @@ export interface Services {
   market: MarketService;
   llm: LlmProvider;
   research: ResearchAgent;
+  // Phase 3
+  ledger: LedgerService;
+  trades: TradeStore;
+  gate: RiskGate;
+  execution: ExecutionRegistry;
+  paper: PaperExecutor;
+  live: LiveExecutor;
+  trader: TraderAgent;
+  builder: ProposalBuilder;
+  pipeline: AutoTradePipeline;
+  scheduler: AutoTradeScheduler;
+  withdrawals: WithdrawalService;
   startedAt: Date;
 }
 
@@ -53,6 +78,12 @@ export interface BuildOptions {
   withAdapters?: boolean;
   /** Inject adapters directly, for tests. */
   adapters?: Map<ChainId, ChainAdapter>;
+  /** Inject execution adapters, for tests. Default: none in CI, real ones otherwise. */
+  executionAdapters?: ExecutionAdapter[];
+  /** Override the reasoning provider, for tests. */
+  llm?: LlmProvider;
+  /** Override the market data providers, for tests. */
+  marketProviders?: MarketDataProvider[];
   /**
    * Weaker key-derivation parameters, so a test suite is not dominated by
    * Argon2. Only ever set from test code; the production entry point leaves it
@@ -93,11 +124,59 @@ export function buildServices(config: RuntimeConfig, options: BuildOptions = {})
   // it simply reports that it has no data, which is what a smoke test wants to
   // exercise anyway.
   const market = new MarketService(
-    config.isCi ? [] : [new DexScreenerProvider(), new GeckoTerminalProvider()],
+    options.marketProviders ??
+      (config.isCi ? [] : [new DexScreenerProvider(), new GeckoTerminalProvider()]),
     db,
   );
-  const llm = buildLlmProvider(config);
+  const llm = options.llm ?? buildLlmProvider(config);
   const research = new ResearchAgent(market, llm, { db, audit });
+
+  // --- Phase 3: trading ----------------------------------------------------
+  const ledger = new LedgerService(db);
+  const trades = new TradeStore(db);
+  const gate = new RiskGate({ db, audit, state, policy: riskPolicy, ledger });
+  const execution =
+    options.executionAdapters !== undefined
+      ? new ExecutionRegistry(options.executionAdapters)
+      : (options.withAdapters ?? !config.isCi)
+        ? buildExecutionRegistry(config)
+        : new ExecutionRegistry([]);
+  const paper = new PaperExecutor({ ledger, trades, gate, audit });
+  const live = new LiveExecutor({
+    ledger,
+    trades,
+    gate,
+    audit,
+    wallets,
+    state,
+    registry: execution,
+  });
+  const trader = new TraderAgent(llm);
+  const builder = new ProposalBuilder({ market, ledger, wallets });
+  const pipeline = new AutoTradePipeline({
+    research,
+    trader,
+    builder,
+    market,
+    trades,
+    ledger,
+    gate,
+    policy: riskPolicy,
+    state,
+    audit,
+    wallets,
+    registry: execution,
+    paper,
+    live,
+  });
+  const scheduler = new AutoTradeScheduler({ db, state, audit, pipeline });
+  const withdrawals = new WithdrawalService({ db, audit, wallets, state, market, adapters });
+
+  // An emergency stop disarms the schedule outright; the operator re-enables
+  // it deliberately after clearing the stop.
+  state.onEmergencyStop((active, reason) => {
+    if (active) scheduler.disableForEmergency(reason ?? 'emergency stop');
+  });
 
   log.info(
     {
@@ -121,6 +200,17 @@ export function buildServices(config: RuntimeConfig, options: BuildOptions = {})
     market,
     llm,
     research,
+    ledger,
+    trades,
+    gate,
+    execution,
+    paper,
+    live,
+    trader,
+    builder,
+    pipeline,
+    scheduler,
+    withdrawals,
     startedAt: new Date(),
   };
 }
@@ -180,8 +270,31 @@ export function buildAdapters(config: RuntimeConfig): Map<ChainId, ChainAdapter>
   return adapters;
 }
 
+/**
+ * Work that must happen once at boot, after construction and before the
+ * scheduler runs: settle any trade that was in flight when the last process
+ * died, then arm the schedule if the operator left it on.
+ */
+export async function startBackgroundServices(services: Services): Promise<void> {
+  const log = childLogger('services');
+  const report = await services.live.reconcile();
+  if (report.checked > 0) {
+    log.warn(report, 'reconciled in-flight trades from a previous run');
+    services.audit.append({
+      category: 'system',
+      action: 'trades.reconciled',
+      status: report.stillPending > 0 ? 'pending' : 'ok',
+      summary: `Reconciled ${String(report.checked)} in-flight trade(s): ${String(report.filled)} filled, ${String(report.failed)} failed, ${String(report.stillPending)} still pending`,
+      mode: services.state.getMode(),
+      detail: { ...report },
+    });
+  }
+  services.scheduler.start();
+}
+
 /** Release everything. Safe to call more than once. */
 export function shutdownServices(services: Services): void {
+  services.scheduler.stop();
   services.vault.lock();
   closeDatabase(services.db);
 }

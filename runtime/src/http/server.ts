@@ -14,6 +14,7 @@ import { walletRoutes } from './routes/wallet.js';
 import { activityRoutes, controlRoutes, riskRoutes } from './routes/control.js';
 import { overviewRoutes } from './routes/overview.js';
 import { marketRoutes, watchlistRoutes } from './routes/market.js';
+import { tradingRoutes } from './routes/trading.js';
 import { childLogger } from '../logging/logger.js';
 import { AppError, ErrorCode } from '../util/errors.js';
 import { toProblem } from './respond.js';
@@ -78,6 +79,7 @@ export function createApp(services: Services): Hono<AppEnv> {
   app.route('/api/v1/activity', activityRoutes());
   app.route('/api/v1/market', marketRoutes());
   app.route('/api/v1/watchlist', watchlistRoutes());
+  app.route('/api/v1/trading', tradingRoutes());
   app.route('/api/v1', overviewRoutes());
 
   app.all('/api/*', (c) => {

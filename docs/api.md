@@ -6,7 +6,7 @@ Base URL in production: same origin as the dashboard (the runtime serves both).
 In development the Vite dev server proxies `/api` and `/health` to
 `http://127.0.0.1:3000`.
 
-This documents what is **implemented**, not what is planned. Phase 3–5 routes
+This documents what is **implemented**, not what is planned. Phase 4–5 routes
 (trading, liquidity, telegram, settings) are not listed because they do not
 exist yet. The full intended contract is in
 [`specs/dashboard-api-contract.md`](specs/dashboard-api-contract.md).
@@ -124,7 +124,7 @@ Password minimum is 12 characters. There are no composition rules.
 
 `balances[].native` is `null` with `error` set when a chain could not be read.
 `portfolio.totalValueUsd` is `null` until pricing is wired to balances
-(Phase 3). `warnings[]` includes `gasLow` per chain.
+(Phase 4). `warnings[]` includes `gasLow` per chain.
 
 `chains[]` entries: `{ chain, healthy, height, latencyMs, endpoint, error, identity, identityMatches }`.
 
@@ -135,7 +135,10 @@ Password minimum is 12 characters. There are no composition rules.
 | `GET /api/v1/wallet` | `{ wallets: [{ family, address, chains[], createdAt }], vaultUnlocked }` |
 | `GET /api/v1/wallet/deposit-address` | `[{ chain, address, nativeSymbol, explorerUrl, warning }]` — one per enabled chain |
 | `GET /api/v1/wallet/balances?chain=` | `[{ chain, address, native: { symbol, decimals, amount } \| null, tokens: [{ address, symbol, decimals, amount }], observedAt, source, error, gasLow }]` |
-| `GET /api/v1/wallet/transactions?limit=` | local records |
+| `GET /api/v1/wallet/transactions?limit=` | `WithdrawResult[]` — operator withdrawals, newest first |
+| `GET /api/v1/wallet/transactions/:txId` | one withdrawal, re-read from the chain if still `submitted` |
+| `POST /api/v1/wallet/withdraw/quote` | `{ chainId, asset: "USDC"\|"ETH"\|"BNB"\|"SOL", destination, amount: "<decimal>"\|"all" }` → `WithdrawQuote` |
+| `POST /api/v1/wallet/withdraw` | `{ quoteId, ack: true, confirmation?: "WITHDRAW" }` + reauth `wallet.withdraw` (+ `Idempotency-Key`) → `WithdrawResult`, 202 |
 | `POST /api/v1/wallet/export` | `{ format, keystorePassword?, confirmation: "EXPORT" }` + reauth `wallet.export`; loopback only |
 
 Amounts are **base-unit strings** (wei, lamports, token base units). Convert
@@ -145,7 +148,40 @@ Export formats: `evm-private-key`, `evm-keystore` (needs `keystorePassword`,
 ≥12 chars), `solana-id-json`, `solana-base58`. Response:
 `{ format, address, material, warning }`. Show `warning` before `material`.
 
-Withdrawal routes are **not implemented yet** (Phase 3).
+### Withdrawals
+
+Withdrawals are the operator moving their own funds. They do **not** go
+through the risk engine and they work in PAPER mode and under emergency stop.
+
+`WithdrawQuote`:
+
+```json
+{
+  "quoteId": "…", "expiresAt": "…", "chainId": "base", "asset": "USDC", "destination": "0x…",
+  "amount": { "raw": "25000000", "decimals": 6, "formatted": "25", "symbol": "USDC" },
+  "availableBalance": { … } | null,
+  "fee": { "native": { … } | null, "usd": 0.06 | null, "source": "chain-rpc" | "none" },
+  "remainingBalance": { … } | null,
+  "requiresTypedConfirmation": false,
+  "warnings": [],
+  "mode": "PAPER",
+  "submittable": true
+}
+```
+
+Rules the server enforces:
+
+- quotes expire after **90 s** and are consumed on use;
+- `requiresTypedConfirmation` is true for `"all"`, for ≥ 1,000 USD, and when
+  the USD value is unknown; then `confirmation` must be exactly `WITHDRAW`
+  (422 otherwise);
+- `submittable: false` (fee unknown, balance short) → submit is 409;
+- EVM destinations: 40 hex, not the zero address, EIP-55 checksum enforced
+  when mixed-case; Solana: base58 32-byte key; the agent wallet itself is
+  refused;
+- the transaction hash is written to the local record **before** broadcast.
+
+`WithdrawResult`: `{ txId, txHash, status: "submitted"|"confirmed"|"failed", explorerUrl, activityId }`.
 
 ## Risk
 
@@ -234,8 +270,55 @@ Show `modelStatus` — it is `UNAVAILABLE` when no model is configured and
 
 ---
 
+## Trading
+
+The dashboard **observes** trading. There is no route that executes a trade
+from a token and an amount; the only operator action is "run a cycle now",
+which walks the same research → decide → gate → execute path as the scheduler.
+
+| Route | Body | Returns |
+|---|---|---|
+| `GET /api/v1/trading` | — | `{ status: { enabled, paused, running, lastCycleAt, lastCycleStatus, nextCycleAt, intervalSeconds }, positions[], decisions[], execution[], modelStatus: "UNTRAINED" }` |
+| `GET /api/v1/trading/positions` | — | `[{ id, mode, chain, chainName, token, symbol, size: { raw, decimals, formatted, symbol }, costBasisUsd, status: "SIMULATED"\|"LIVE", source, openedAt, updatedAt }]` for the current mode |
+| `GET /api/v1/trading/decisions?limit=` | — | `[{ actionId, decisionCycleId, chain, kind, mode, allowed, code, reason, createdAt }]` newest first |
+| `GET /api/v1/trading/decisions/:actionId` | — | the full `RiskDecision`: every check with observed/limit, derived values |
+| `GET /api/v1/trading/trades?limit=&status=` | — | trade rows (`proposed → rejected \| allowed → dispatched → signed → broadcast → filled \| failed \| cancelled`) |
+| `GET /api/v1/trading/trades/:tradeId` | — | one trade row |
+| `GET /api/v1/trading/execution` | — | `[{ chain, executable, protocol, reason }]` — Robinhood Chain is `executable: false` with the reason |
+| `POST /api/v1/trading/run` | `{ chain, token? \| poolId? }` | `CycleReport`, 202; 409 while paused, stopped, or a cycle is running |
+| `GET /api/v1/trading/scheduler` | — | `{ enabled, intervalSeconds, running, lastCycleId, lastCycleAt, lastCycleStatus, nextRunAt }` |
+| `PUT /api/v1/trading/scheduler` | `{ enabled, intervalSeconds: 60..86400 }` | same; 409 when enabling under emergency stop |
+| `GET /api/v1/trading/paper-balances` | — | `[{ chain, token, decimals, amount, symbol, formatted }]` |
+| `PUT /api/v1/trading/paper-balances` | `{ chain, token, amount: "<base units>" }` | seeds a paper balance; token must be in the registry |
+
+`CycleReport`:
+
+```json
+{
+  "cycleId": "…", "chain": "base", "mode": "PAPER", "startedAt": "…", "finishedAt": "…",
+  "outcome": "blocked | skipped | no_action | rejected | filled | failed",
+  "reason": "…",
+  "research": { "id": "…", "status": "OK" } | null,
+  "decision": { "action": "NO_ACTION", "chain": "base", "market": "…", "reason": "…", "confidence": 0.9, "requestedNotionalUsd": "0", "evidence": [], "token": null } | null,
+  "modelStatus": "UNTRAINED | UNAVAILABLE" | null,
+  "trade": { "tradeId": "…", "actionId": "…" } | null,
+  "risk": { "allowed": false, "code": "SIZE_EXCEEDS_MAX_TRADE", "reason": "…" } | null,
+  "execution": { "actionId": "…", "mode": "PAPER", "status": "filled | failed", "amountOut": "…", "feeUsd": "…", "txHash": null, "error": null, "filledAt": 0 } | null,
+  "notes": ["tokenIn price 1 USD via dexscreener+geckoterminal", "…"]
+}
+```
+
+Positions in PAPER mode are `SIMULATED` and carry `source: "paper-sim"`. A
+LIVE position carries `source: "chain"`. Show the difference.
+
+Every cycle writes audit rows correlated by `cycleId`: `trade.decision`
+(`hold` for NO ACTION), `risk.allowed` / `risk.rejected` with the failing
+rule, `trade.signed`, `trade.filled` / `trade.failed`, and a closing
+`trade.cycle`. `GET /api/v1/activity` shows them.
+
+---
+
 ## Not yet implemented
 
-Trading, positions, decisions, liquidity, telegram, settings, SSE events,
-withdrawals. Calling any of these returns `404 NOT_FOUND`. Do not mock them as
-working.
+Liquidity, telegram, settings, SSE events. Calling any of these returns
+`404 NOT_FOUND`. Do not mock them as working.
