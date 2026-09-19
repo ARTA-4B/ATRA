@@ -66,7 +66,10 @@ async function main(): Promise<void> {
   });
 }
 
-function installShutdownHandlers(server: StartedServer, services: ReturnType<typeof buildServices>): void {
+function installShutdownHandlers(
+  server: StartedServer,
+  services: ReturnType<typeof buildServices>,
+): void {
   const log = childLogger('shutdown');
   let shuttingDown = false;
 

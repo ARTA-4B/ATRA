@@ -135,7 +135,11 @@ export const proposedActionSchema = z
 
     if (action.kind === 'approve') {
       if (action.quote !== null) {
-        ctx.addIssue({ code: 'custom', path: ['quote'], message: 'approve must not carry a quote' });
+        ctx.addIssue({
+          code: 'custom',
+          path: ['quote'],
+          message: 'approve must not carry a quote',
+        });
       }
       if (action.tokenIn.address !== action.tokenOut.address) {
         ctx.addIssue({

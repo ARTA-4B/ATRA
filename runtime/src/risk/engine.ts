@@ -263,7 +263,13 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
   }
 
   ctx.check(
-    freshnessCheck('freshness.price.native', priceNative, now, policy.freshness.priceMaxAgeMs, skew),
+    freshnessCheck(
+      'freshness.price.native',
+      priceNative,
+      now,
+      policy.freshness.priceMaxAgeMs,
+      skew,
+    ),
   );
 
   if (isApprove || !action.quote) {
@@ -521,13 +527,13 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
   if (isExit || isApprove) {
     ctx.skip('cooldown.market', 'COOLDOWN_ACTIVE', 'not-applicable');
   } else {
-    const elapsedMs = lastMarketAction === undefined ? Number.MAX_SAFE_INTEGER : now - lastMarketAction;
+    const elapsedMs =
+      lastMarketAction === undefined ? Number.MAX_SAFE_INTEGER : now - lastMarketAction;
     ctx.check({
       name: 'cooldown.market',
       code: 'COOLDOWN_ACTIVE',
       passed: elapsedMs >= policy.cooldownSeconds * 1_000,
-      observed:
-        lastMarketAction === undefined ? 'never' : String(Math.floor(elapsedMs / 1_000)),
+      observed: lastMarketAction === undefined ? 'never' : String(Math.floor(elapsedMs / 1_000)),
       limit: String(policy.cooldownSeconds),
     });
   }
@@ -788,9 +794,7 @@ class EvaluationContext {
   }
 
   finish(derived: RiskDerived | null): RiskDecision {
-    const firstFailure = this.checks.find(
-      (check) => !check.passed && check.skipped === undefined,
-    );
+    const firstFailure = this.checks.find((check) => !check.passed && check.skipped === undefined);
 
     return {
       schemaVersion: 1,

@@ -158,9 +158,7 @@ export function overviewRoutes(): Hono<AppEnv> {
           source: unreadable.length === chains.length && chains.length > 0 ? 'none' : 'rpc',
           asOf: new Date().toISOString(),
           stale: unreadable.length > 0,
-          ...(unreadable.length > 0
-            ? { reason: `could not read: ${unreadable.join(', ')}` }
-            : {}),
+          ...(unreadable.length > 0 ? { reason: `could not read: ${unreadable.join(', ')}` } : {}),
         },
       ),
     );

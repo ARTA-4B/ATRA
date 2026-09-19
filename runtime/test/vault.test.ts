@@ -110,7 +110,9 @@ describe('Vault', () => {
     const id = vault.putSecret('evm_private_key', 'agent', new Uint8Array([1, 2, 3, 4]));
 
     const row = db
-      .prepare<[string], { ciphertext: Buffer }>('SELECT ciphertext FROM vault_secrets WHERE id = ?')
+      .prepare<[string], { ciphertext: Buffer }>(
+        'SELECT ciphertext FROM vault_secrets WHERE id = ?',
+      )
       .get(id)!;
     const tampered = Buffer.from(row.ciphertext);
     tampered[0] = tampered[0]! ^ 0xff;

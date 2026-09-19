@@ -5,7 +5,6 @@ import type { AppEnv } from '../context.js';
 import { envelope, invalid } from '../respond.js';
 import { AppError, ErrorCode } from '../../util/errors.js';
 import { SESSION_COOKIE, REAUTH_HEADER, loopbackOnly, requireSession } from '../middleware.js';
-import type { ReauthPurpose } from '../../core/auth.js';
 
 /**
  * Authentication routes.
@@ -123,11 +122,7 @@ export function authRoutes(): Hono<AppEnv> {
     const session = c.get('session')!;
     const body = await parse(c, reauthSchema);
 
-    const token = await services.auth.issueReauthToken(
-      session.id,
-      body.purpose as ReauthPurpose,
-      body.password,
-    );
+    const token = await services.auth.issueReauthToken(session.id, body.purpose, body.password);
 
     // Unlocking here means a sensitive action does not fail on an auto-locked
     // vault immediately after the operator proved they know the password.
@@ -135,7 +130,9 @@ export function authRoutes(): Hono<AppEnv> {
       await services.vault.unlock(body.password);
     }
 
-    return c.json(envelope(c, { token: token.token, expiresAt: token.expiresAt, header: REAUTH_HEADER }));
+    return c.json(
+      envelope(c, { token: token.token, expiresAt: token.expiresAt, header: REAUTH_HEADER }),
+    );
   });
 
   /** Change the password and rewrap the vault in the same operation. */
@@ -161,7 +158,11 @@ export function authRoutes(): Hono<AppEnv> {
   return app;
 }
 
-function writeSessionCookie(c: Parameters<typeof setCookie>[0], token: string, expiresAt: string): void {
+function writeSessionCookie(
+  c: Parameters<typeof setCookie>[0],
+  token: string,
+  expiresAt: string,
+): void {
   setCookie(c, SESSION_COOKIE, token, {
     path: '/',
     httpOnly: true,

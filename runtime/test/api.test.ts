@@ -57,14 +57,23 @@ function stubAdapter(chain: ChainId, overrides: Partial<ChainAdapter> = {}): Cha
         observation({ chain, owner, token, amount: '5000000', symbol: 'USDC', decimals: 6 }),
       ),
     getTokenMetadata: (address: string) =>
-      Promise.resolve(observation({ chain, address, symbol: 'USDC', name: 'USD Coin', decimals: 6 })),
+      Promise.resolve(
+        observation({ chain, address, symbol: 'USDC', name: 'USD Coin', decimals: 6 }),
+      ),
     estimateTransferFee: () =>
       Promise.resolve(
         observation({ chain, nativeAmount: '126000000000', unitPrice: '6000000', units: 21000 }),
       ),
     getTransactionStatus: (hash: string) =>
       Promise.resolve(
-        observation({ chain, hash, state: 'confirmed' as const, height: 1, confirmations: 1, error: null }),
+        observation({
+          chain,
+          hash,
+          state: 'confirmed' as const,
+          height: 1,
+          confirmations: 1,
+          error: null,
+        }),
       ),
     ...overrides,
   };

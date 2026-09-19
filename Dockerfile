@@ -1,9 +1,8 @@
 # ATRA runtime container.
 #
-# Multi-stage so the shipped image carries no compilers, no test tooling and no
-# frontend build chain. Debian slim rather than Alpine because better-sqlite3
-# publishes glibc prebuilds; on musl it would compile from source and drag a
-# full toolchain into the build.
+# Multi-stage so the shipped image carries no test tooling and no frontend build
+# chain. There is no native addon to compile either: the runtime uses Node's own
+# node:sqlite, so no build toolchain appears in any stage.
 #
 # The dashboard is optional. `--build-arg WITH_FRONTEND=0` selects an empty
 # asset stage, and BuildKit then skips the frontend build entirely — useful for
@@ -44,7 +43,7 @@ WORKDIR /build
 
 RUN corepack enable
 
-COPY runtime/package.json runtime/pnpm-lock.yaml runtime/pnpm-workspace.yaml runtime/.npmrc ./
+COPY runtime/package.json runtime/pnpm-lock.yaml runtime/.npmrc ./
 RUN pnpm install --frozen-lockfile
 
 COPY runtime/tsconfig.json runtime/tsconfig.build.json ./

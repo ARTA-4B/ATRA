@@ -120,10 +120,7 @@ export function startServer(services: Services): Promise<StartedServer> {
       const server = serve(
         { fetch: app.fetch, hostname: services.config.host, port: services.config.port },
         (info) => {
-          log.info(
-            { host: services.config.host, port: info.port },
-            'ATRA runtime listening',
-          );
+          log.info({ host: services.config.host, port: info.port }, 'ATRA runtime listening');
           resolve({
             server,
             port: info.port,

@@ -1,4 +1,5 @@
 import type { Context } from 'hono';
+import type { AppEnv } from './context.js';
 import { AppError, ErrorCode, isAppError } from '../util/errors.js';
 import type { FieldIssue } from '../util/errors.js';
 import { childLogger } from '../logging/logger.js';
@@ -45,13 +46,16 @@ export interface MetaOptions {
 
 const log = childLogger('http');
 
-export function envelope<T>(c: Context, data: T, options: MetaOptions = {}): Envelope<T> {
+export function envelope<T>(c: Context<AppEnv>, data: T, options: MetaOptions = {}): Envelope<T> {
+  const mode: ResponseMeta['mode'] = options.mode ?? c.get('mode') ?? 'NONE';
+  const requestId: string = c.get('requestId') ?? 'unknown';
+
   const meta: ResponseMeta = {
     source: options.source ?? 'local',
     asOf: options.asOf ?? null,
     stale: options.stale ?? false,
-    mode: options.mode ?? (c.get('mode') ?? 'NONE'),
-    requestId: c.get('requestId') ?? 'unknown',
+    mode,
+    requestId,
   };
   if (options.reason !== undefined) meta.reason = options.reason;
   if (options.nextCursor !== undefined) meta.nextCursor = options.nextCursor;

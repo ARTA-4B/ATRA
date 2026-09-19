@@ -1,6 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { ENGINE_VERSION, deriveIdempotencyKey, evaluate, feeInNativeUnits } from '../src/risk/engine.js';
-import { canonicalJson, defaultRiskPolicy, parseRiskPolicy, policyHash } from '../src/risk/policy.js';
+import {
+  ENGINE_VERSION,
+  deriveIdempotencyKey,
+  evaluate,
+  feeInNativeUnits,
+} from '../src/risk/engine.js';
+import {
+  canonicalJson,
+  defaultRiskPolicy,
+  parseRiskPolicy,
+  policyHash,
+} from '../src/risk/policy.js';
 import { marketKey } from '../src/risk/types.js';
 import type { RiskDecision } from '../src/risk/types.js';
 import {
@@ -182,7 +192,9 @@ describe('malformed proposals', () => {
   });
 
   it('rejects token decimals that disagree with the allowlist', () => {
-    const decision = decide({ action: makeAction({ tokenIn: { address: BASE_USDC, decimals: 18 } }) });
+    const decision = decide({
+      action: makeAction({ tokenIn: { address: BASE_USDC, decimals: 18 } }),
+    });
     expect(decision.code).toBe('SCHEMA_INVALID');
     expect(decision.checks.find((c) => c.name === 'schema.decimals')?.passed).toBe(false);
   });
@@ -199,7 +211,9 @@ describe('malformed proposals', () => {
   });
 
   it('rejects an EVM action that carries program ids', () => {
-    expect(decide({ action: makeAction({ programIds: [JUPITER_V6] }) }).code).toBe('SCHEMA_INVALID');
+    expect(decide({ action: makeAction({ programIds: [JUPITER_V6] }) }).code).toBe(
+      'SCHEMA_INVALID',
+    );
   });
 
   it('rejects a fee detail from the wrong chain family', () => {
@@ -636,9 +650,9 @@ describe('reduce-only exits', () => {
 
 describe('fee arithmetic', () => {
   it('computes an EVM fee as gas limit times max fee per gas', () => {
-    expect(
-      feeInNativeUnits({ family: 'evm', gasLimit: '250000', maxFeePerGas: '10000000' }),
-    ).toBe(2_500_000_000_000n);
+    expect(feeInNativeUnits({ family: 'evm', gasLimit: '250000', maxFeePerGas: '10000000' })).toBe(
+      2_500_000_000_000n,
+    );
   });
 
   it('computes a Solana fee from signatures, compute units and rent', () => {
@@ -729,9 +743,9 @@ describe('policy validation', () => {
   });
 
   it('rejects a per-trade cap above the total deployment cap', () => {
-    expect(() =>
-      parseRiskPolicy({ ...defaultRiskPolicy(), maxAmountPerTradeUsd: '1000' }),
-    ).toThrow(/not valid/);
+    expect(() => parseRiskPolicy({ ...defaultRiskPolicy(), maxAmountPerTradeUsd: '1000' })).toThrow(
+      /not valid/,
+    );
   });
 
   it('rejects a zero per-trade cap', () => {

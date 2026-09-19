@@ -5,7 +5,6 @@ import { envelope } from '../respond.js';
 import { parse } from './auth.js';
 import { AppError, ErrorCode } from '../../util/errors.js';
 import { REAUTH_HEADER, requireSession } from '../middleware.js';
-import type { ActivationStep } from '../../core/state.js';
 
 /**
  * Runtime control: pause, emergency stop, risk policy and LIVE activation.
@@ -97,7 +96,7 @@ export function controlRoutes(): Hono<AppEnv> {
   app.post('/activation/step', async (c) => {
     const services = c.get('services');
     const body = await parse(c, stepSchema);
-    const progress = services.state.recordActivationStep(body.step as ActivationStep, 'operator');
+    const progress = services.state.recordActivationStep(body.step, 'operator');
     return c.json(envelope(c, progress));
   });
 

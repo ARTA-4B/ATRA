@@ -71,7 +71,10 @@ export class EvmChainAdapter implements ChainAdapter {
 
     this.#client = createPublicClient({
       chain: viemChain,
-      transport: http(endpoint, { timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS, retryCount: 1 }),
+      transport: http(endpoint, {
+        timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        retryCount: 1,
+      }),
     });
   }
 
@@ -146,9 +149,7 @@ export class EvmChainAdapter implements ChainAdapter {
           args: [owner as `0x${string}`],
         }),
         this.#client.readContract({ ...contract, functionName: 'decimals' }),
-        this.#client
-          .readContract({ ...contract, functionName: 'symbol' })
-          .catch(() => null),
+        this.#client.readContract({ ...contract, functionName: 'symbol' }).catch(() => null),
       ]);
     });
 

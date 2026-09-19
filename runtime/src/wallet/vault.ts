@@ -44,13 +44,13 @@ export type SecretKind = 'evm_private_key' | 'solana_keypair' | 'provider_api_ke
 export interface VaultHeaderRow {
   version: number;
   kdf: string;
-  kdf_salt: Buffer;
+  kdf_salt: Uint8Array;
   kdf_memory_kib: number;
   kdf_iterations: number;
   kdf_parallelism: number;
   cipher: string;
-  wrapped_dek: Buffer;
-  wrap_nonce: Buffer;
+  wrapped_dek: Uint8Array;
+  wrap_nonce: Uint8Array;
   created_at: string;
   rotated_at: string | null;
 }
@@ -59,8 +59,8 @@ interface SecretRow {
   id: string;
   kind: SecretKind;
   label: string;
-  nonce: Buffer;
-  ciphertext: Buffer;
+  nonce: Uint8Array;
+  ciphertext: Uint8Array;
   aad: string;
   created_at: string;
 }
@@ -135,13 +135,13 @@ export class Vault {
         .run(
           VAULT_VERSION,
           KDF_ALGORITHM,
-          Buffer.from(salt),
+          salt,
           params.memoryKib,
           params.iterations,
           params.parallelism,
           CIPHER_ALGORITHM,
-          Buffer.from(wrapped.ciphertext),
-          Buffer.from(wrapped.nonce),
+          wrapped.ciphertext,
+          wrapped.nonce,
           new Date().toISOString(),
         );
 
@@ -174,7 +174,7 @@ export class Vault {
       });
     }
 
-    const kek = await deriveKey(password, new Uint8Array(header.kdf_salt), {
+    const kek = await deriveKey(password, header.kdf_salt, {
       memoryKib: header.kdf_memory_kib,
       iterations: header.kdf_iterations,
       parallelism: header.kdf_parallelism,
@@ -184,8 +184,8 @@ export class Vault {
       const dek = open(
         kek,
         {
-          nonce: new Uint8Array(header.wrap_nonce),
-          ciphertext: new Uint8Array(header.wrapped_dek),
+          nonce: header.wrap_nonce,
+          ciphertext: header.wrapped_dek,
         },
         WRAP_AAD,
         'the vault key',
@@ -224,7 +224,7 @@ export class Vault {
       throw new AppError(ErrorCode.VAULT_NOT_FOUND, 'No vault exists yet');
     }
 
-    const oldKek = await deriveKey(currentPassword, new Uint8Array(header.kdf_salt), {
+    const oldKek = await deriveKey(currentPassword, header.kdf_salt, {
       memoryKib: header.kdf_memory_kib,
       iterations: header.kdf_iterations,
       parallelism: header.kdf_parallelism,
@@ -236,8 +236,8 @@ export class Vault {
       dek = open(
         oldKek,
         {
-          nonce: new Uint8Array(header.wrap_nonce),
-          ciphertext: new Uint8Array(header.wrapped_dek),
+          nonce: header.wrap_nonce,
+          ciphertext: header.wrapped_dek,
         },
         WRAP_AAD,
         'the vault key',
@@ -253,12 +253,12 @@ export class Vault {
             ' kdf_parallelism = ?, wrapped_dek = ?, wrap_nonce = ?, rotated_at = ? WHERE id = 1',
         )
         .run(
-          Buffer.from(salt),
+          salt,
           params.memoryKib,
           params.iterations,
           params.parallelism,
-          Buffer.from(wrapped.ciphertext),
-          Buffer.from(wrapped.nonce),
+          wrapped.ciphertext,
+          wrapped.nonce,
           new Date().toISOString(),
         );
 
@@ -282,15 +282,7 @@ export class Vault {
         'INSERT INTO vault_secrets (id, kind, label, nonce, ciphertext, aad, created_at)' +
           ' VALUES (?, ?, ?, ?, ?, ?, ?)',
       )
-      .run(
-        id,
-        kind,
-        label,
-        Buffer.from(sealed.nonce),
-        Buffer.from(sealed.ciphertext),
-        aad,
-        new Date().toISOString(),
-      );
+      .run(id, kind, label, sealed.nonce, sealed.ciphertext, aad, new Date().toISOString());
 
     this.#log.info({ secretId: id, kind }, 'secret stored');
     return id;
@@ -314,7 +306,7 @@ export class Vault {
 
     const plaintext = open(
       dek,
-      { nonce: new Uint8Array(row.nonce), ciphertext: new Uint8Array(row.ciphertext) },
+      { nonce: row.nonce, ciphertext: row.ciphertext },
       row.aad,
       `secret ${id}`,
     );
@@ -352,7 +344,7 @@ export class Vault {
     const header = this.#header();
     if (!header) return false;
 
-    const kek = await deriveKey(password, new Uint8Array(header.kdf_salt), {
+    const kek = await deriveKey(password, header.kdf_salt, {
       memoryKib: header.kdf_memory_kib,
       iterations: header.kdf_iterations,
       parallelism: header.kdf_parallelism,
@@ -363,8 +355,8 @@ export class Vault {
       dek = open(
         kek,
         {
-          nonce: new Uint8Array(header.wrap_nonce),
-          ciphertext: new Uint8Array(header.wrapped_dek),
+          nonce: header.wrap_nonce,
+          ciphertext: header.wrapped_dek,
         },
         WRAP_AAD,
         'the vault key',
@@ -379,9 +371,7 @@ export class Vault {
   }
 
   #header(): VaultHeaderRow | undefined {
-    return this.#db
-      .prepare<[], VaultHeaderRow>('SELECT * FROM vault_header WHERE id = 1')
-      .get();
+    return this.#db.prepare<[], VaultHeaderRow>('SELECT * FROM vault_header WHERE id = 1').get();
   }
 
   #requireDek(): Uint8Array {

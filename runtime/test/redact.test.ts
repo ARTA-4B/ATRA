@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { REDACTED, containsSecret, isSecretKey, redact, redactString } from '../src/logging/redact.js';
+import {
+  REDACTED,
+  containsSecret,
+  isSecretKey,
+  redact,
+  redactString,
+} from '../src/logging/redact.js';
 
 /**
  * Redaction is a security control, so the tests are written as a list of things
@@ -11,8 +17,7 @@ const EVM_KEY = '0x7a28b5ba57c53603b0b07b56bba752f7784bf506fa95edc395f5cf6c7514f
 const SOLANA_B58 =
   '4wBqpZM9xaSheZzJSMawUHDgZ7miWfSsxmfVF5jJpYP2d8QyYqPGyhCjL9BJ4Gv2EZJ8vdEuVyHqcrHBTXDzRsTL';
 const ID_JSON = `[${Array.from({ length: 64 }, (_, i) => i).join(',')}]`;
-const MNEMONIC =
-  'legal winner thank year wave sausage worth useful legal winner thank yellow';
+const MNEMONIC = 'legal winner thank year wave sausage worth useful legal winner thank yellow';
 
 describe('redactString', () => {
   it('removes an EVM private key', () => {

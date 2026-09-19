@@ -109,7 +109,9 @@ export class StateStore {
       )
       .run(now);
     this.#db
-      .prepare('INSERT INTO live_activation (id, updated_at) VALUES (1, ?) ON CONFLICT(id) DO NOTHING')
+      .prepare(
+        'INSERT INTO live_activation (id, updated_at) VALUES (1, ?) ON CONFLICT(id) DO NOTHING',
+      )
       .run(now);
   }
 
@@ -173,7 +175,12 @@ export class StateStore {
 
   // --- pause / emergency ---------------------------------------------------
 
-  getSwitches(): { globalPause: boolean; emergencyStop: boolean; pausedReason: string | null; emergencyReason: string | null } {
+  getSwitches(): {
+    globalPause: boolean;
+    emergencyStop: boolean;
+    pausedReason: string | null;
+    emergencyReason: string | null;
+  } {
     const row = this.#db
       .prepare<[], RuntimeStateRow>('SELECT * FROM runtime_state WHERE id = 1')
       .get();
@@ -187,7 +194,9 @@ export class StateStore {
 
   setGlobalPause(paused: boolean, reason: string | null, actor: string): void {
     this.#db
-      .prepare('UPDATE runtime_state SET global_pause = ?, paused_reason = ?, updated_at = ? WHERE id = 1')
+      .prepare(
+        'UPDATE runtime_state SET global_pause = ?, paused_reason = ?, updated_at = ? WHERE id = 1',
+      )
       .run(paused ? 1 : 0, paused ? reason : null, new Date().toISOString());
 
     this.#audit.append({
@@ -300,11 +309,9 @@ export class StateStore {
 
     const progress = this.getActivation();
     if (progress.missing.length > 0) {
-      throw new AppError(
-        ErrorCode.LIVE_ACTIVATION_INCOMPLETE,
-        'LIVE activation is incomplete',
-        { details: { missing: progress.missing } },
-      );
+      throw new AppError(ErrorCode.LIVE_ACTIVATION_INCOMPLETE, 'LIVE activation is incomplete', {
+        details: { missing: progress.missing },
+      });
     }
 
     const now = new Date().toISOString();

@@ -35,8 +35,8 @@ export type ReauthPurpose =
 
 interface CredentialRow {
   algorithm: string;
-  salt: Buffer;
-  hash: Buffer;
+  salt: Uint8Array;
+  hash: Uint8Array;
   memory_kib: number;
   iterations: number;
   parallelism: number;
@@ -103,8 +103,8 @@ export class AuthService {
         )
         .run(
           'argon2id',
-          Buffer.from(salt),
-          Buffer.from(hash),
+          salt,
+          hash,
           this.#kdf.memoryKib,
           this.#kdf.iterations,
           this.#kdf.parallelism,
@@ -145,8 +145,8 @@ export class AuthService {
             ' parallelism = ?, updated_at = ? WHERE id = 1',
         )
         .run(
-          Buffer.from(salt),
-          Buffer.from(hash),
+          salt,
+          hash,
           this.#kdf.memoryKib,
           this.#kdf.iterations,
           this.#kdf.parallelism,
@@ -172,14 +172,14 @@ export class AuthService {
     const credential = this.#credential();
     if (!credential) return false;
 
-    const candidate = await deriveKey(password, new Uint8Array(credential.salt), {
+    const candidate = await deriveKey(password, credential.salt, {
       memoryKib: credential.memory_kib,
       iterations: credential.iterations,
       parallelism: credential.parallelism,
     });
 
     try {
-      return equalBytes(candidate, new Uint8Array(credential.hash));
+      return equalBytes(candidate, credential.hash);
     } finally {
       wipe(candidate);
     }
@@ -241,7 +241,7 @@ export class AuthService {
     if (!token) return undefined;
 
     const row = this.#db
-      .prepare<[Buffer], SessionRow>('SELECT * FROM sessions WHERE token_hash = ?')
+      .prepare<[Uint8Array], SessionRow>('SELECT * FROM sessions WHERE token_hash = ?')
       .get(hashToken(token));
 
     if (!row || row.revoked_at !== null) return undefined;
@@ -334,7 +334,7 @@ export class AuthService {
 
     const now = new Date().toISOString();
     const row = this.#db
-      .prepare<[string, Buffer, string, string, string], ReauthRow>(
+      .prepare<[string, Uint8Array, string, string, string], ReauthRow>(
         'UPDATE reauth_tokens SET used_at = ? WHERE token_hash = ? AND purpose = ?' +
           ' AND session_id = ? AND used_at IS NULL AND expires_at > ? RETURNING *',
       )
@@ -350,16 +350,16 @@ export class AuthService {
   }
 
   #credential(): CredentialRow | undefined {
-    return this.#db
-      .prepare<[], CredentialRow>('SELECT * FROM auth_credential WHERE id = 1')
-      .get();
+    return this.#db.prepare<[], CredentialRow>('SELECT * FROM auth_credential WHERE id = 1').get();
   }
 
   #pruneExpired(): void {
     const now = new Date().toISOString();
     this.#db.prepare('DELETE FROM reauth_tokens WHERE expires_at <= ?').run(now);
     this.#db
-      .prepare("DELETE FROM sessions WHERE expires_at <= ? AND id NOT IN (SELECT session_id FROM reauth_tokens)")
+      .prepare(
+        'DELETE FROM sessions WHERE expires_at <= ? AND id NOT IN (SELECT session_id FROM reauth_tokens)',
+      )
       .run(now);
   }
 }
@@ -384,7 +384,7 @@ export function assertPasswordStrength(password: string): void {
   }
 }
 
-function hashToken(token: string): Buffer {
+function hashToken(token: string): Uint8Array {
   // A token is 32 random bytes, so a fast hash is the right primitive here:
   // there is nothing to brute force, and the lookup happens on every request.
   return createHash('sha256').update(token).digest();

@@ -132,7 +132,10 @@ export const SOLANA_SYSTEM_PROGRAMS: readonly string[] = [
 ];
 
 /** Protocols seeded into a fresh allowlist, verified to have code on-chain. */
-export const DEFAULT_PROTOCOLS: Record<ChainId, Record<string, { contracts: string[]; approveSpenders: string[] }>> = {
+export const DEFAULT_PROTOCOLS: Record<
+  ChainId,
+  Record<string, { contracts: string[]; approveSpenders: string[] }>
+> = {
   base: {
     'uniswap-v4': {
       contracts: [

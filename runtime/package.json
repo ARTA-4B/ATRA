@@ -27,7 +27,6 @@
     "@noble/curves": "2.4.0",
     "@noble/hashes": "2.4.0",
     "@scure/base": "2.4.0",
-    "better-sqlite3": "13.0.3",
     "croner": "10.0.1",
     "hono": "4.13.8",
     "pino": "10.3.1",
@@ -36,7 +35,6 @@
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
-    "@types/better-sqlite3": "9.6.0",
     "@types/node": "26.6.2",
     "@vitest/coverage-v8": "5.0.1",
     "eslint": "10.11.0",
@@ -46,10 +44,5 @@
     "typescript": "6.0.3",
     "typescript-eslint": "8.70.0",
     "vitest": "5.0.1"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "better-sqlite3"
-    ]
   }
 }

@@ -150,11 +150,7 @@ export class WalletService {
     if (!this.get('solana')) {
       const keypair = generateSolanaKeypair();
       try {
-        const secretId = this.#vault.putSecret(
-          'solana_keypair',
-          'agent-solana',
-          keypair.secretKey,
-        );
+        const secretId = this.#vault.putSecret('solana_keypair', 'agent-solana', keypair.secretKey);
         created.push(this.#insert('solana', keypair.address, secretId));
       } finally {
         wipe(keypair.secretKey);

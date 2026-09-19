@@ -290,9 +290,13 @@ export class SolanaChainAdapter implements ChainAdapter {
 
       const payload = (await response.json()) as RpcResponse<T>;
       if (payload.error) {
-        throw new AppError(ErrorCode.UPSTREAM_UNAVAILABLE, `Solana RPC error: ${payload.error.message}`, {
-          details: { method, code: payload.error.code },
-        });
+        throw new AppError(
+          ErrorCode.UPSTREAM_UNAVAILABLE,
+          `Solana RPC error: ${payload.error.message}`,
+          {
+            details: { method, code: payload.error.code },
+          },
+        );
       }
       if (payload.result === undefined) {
         throw new AppError(ErrorCode.UPSTREAM_UNAVAILABLE, 'Solana RPC returned no result', {

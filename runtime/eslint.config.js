@@ -19,7 +19,19 @@ export default tseslint.config(
     },
   },
   {
+    // Tests assert against JSON decoded from real HTTP responses. Modelling
+    // every response shape as a type would duplicate the API contract in the
+    // test file and make the tests agree with the code by construction rather
+    // than by observation, so the unsafe-* rules are relaxed here only.
     files: ['test/**/*.ts'],
-    rules: { '@typescript-eslint/no-non-null-assertion': 'off' },
+    rules: {
+      '@typescript-eslint/no-non-null-assertion': 'off',
+      '@typescript-eslint/no-explicit-any': 'off',
+      '@typescript-eslint/no-unsafe-member-access': 'off',
+      '@typescript-eslint/no-unsafe-assignment': 'off',
+      '@typescript-eslint/no-unsafe-argument': 'off',
+      '@typescript-eslint/no-unsafe-call': 'off',
+      '@typescript-eslint/no-unsafe-return': 'off',
+    },
   },
 );

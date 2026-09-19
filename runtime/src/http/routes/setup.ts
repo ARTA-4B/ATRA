@@ -25,9 +25,18 @@ const completeSchema = z.object({
   chains: z.array(z.enum(CHAIN_IDS)).min(1),
   risk: z
     .object({
-      maxAmountPerTradeUsd: z.string().regex(/^(0|[1-9]\d*)(\.\d{1,6})?$/).optional(),
-      maxDailyLossUsd: z.string().regex(/^(0|[1-9]\d*)(\.\d{1,6})?$/).optional(),
-      maxTotalDeployedUsd: z.string().regex(/^(0|[1-9]\d*)(\.\d{1,6})?$/).optional(),
+      maxAmountPerTradeUsd: z
+        .string()
+        .regex(/^(0|[1-9]\d*)(\.\d{1,6})?$/)
+        .optional(),
+      maxDailyLossUsd: z
+        .string()
+        .regex(/^(0|[1-9]\d*)(\.\d{1,6})?$/)
+        .optional(),
+      maxTotalDeployedUsd: z
+        .string()
+        .regex(/^(0|[1-9]\d*)(\.\d{1,6})?$/)
+        .optional(),
     })
     .optional(),
   /** The operator must explicitly acknowledge that they start in PAPER mode. */
@@ -114,12 +123,12 @@ export function setupRoutes(): Hono<AppEnv> {
 
     services.state.setEnabledChains(body.chains);
 
-    let policy = services.riskPolicy.exists()
+    const policy = services.riskPolicy.exists()
       ? services.riskPolicy.get()
       : services.riskPolicy.initialize(body.chains);
 
     if (body.risk) {
-      policy = services.riskPolicy.update(
+      services.riskPolicy.update(
         {
           ...policy,
           enabledChains: body.chains,

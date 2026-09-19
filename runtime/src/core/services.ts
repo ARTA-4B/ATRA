@@ -65,7 +65,9 @@ export function buildServices(config: RuntimeConfig, options: BuildOptions = {})
 
   const adapters =
     options.adapters ??
-    (options.withAdapters ?? !config.isCi ? buildAdapters(config) : new Map<ChainId, ChainAdapter>());
+    ((options.withAdapters ?? !config.isCi)
+      ? buildAdapters(config)
+      : new Map<ChainId, ChainAdapter>());
 
   const wallets = new WalletService(db, vault, audit, adapters);
 
@@ -78,7 +80,18 @@ export function buildServices(config: RuntimeConfig, options: BuildOptions = {})
     'services constructed',
   );
 
-  return { config, db, audit, auth, state, vault, wallets, riskPolicy, adapters, startedAt: new Date() };
+  return {
+    config,
+    db,
+    audit,
+    auth,
+    state,
+    vault,
+    wallets,
+    riskPolicy,
+    adapters,
+    startedAt: new Date(),
+  };
 }
 
 /**

@@ -1,14 +1,45 @@
-import Database from 'better-sqlite3';
-import type { Database as Db } from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AppError, ErrorCode, errorMessage } from '../util/errors.js';
 import { childLogger } from '../logging/logger.js';
 
-export type { Db };
+/**
+ * Local persistence.
+ *
+ * Built on Node's own `node:sqlite` rather than a native addon. That is a
+ * deliberate supply-chain decision for a process that holds wallet keys: no
+ * compiler in the container image, no node-gyp step that can fail on an
+ * operator's machine, and one fewer third-party package with native code in
+ * the same address space as the vault.
+ *
+ * The thin wrapper below keeps the call sites typed, since `node:sqlite`
+ * returns `unknown` rows.
+ */
 
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), 'migrations');
+
+/** Values SQLite can bind. */
+export type SqlValue = string | number | bigint | boolean | null | Uint8Array;
+
+export interface Statement<Params extends SqlValue[], Row> {
+  run(...params: Params): { changes: number | bigint; lastInsertRowid: number | bigint };
+  get(...params: Params): Row | undefined;
+  all(...params: Params): Row[];
+}
+
+export interface Db {
+  prepare<Params extends SqlValue[] = SqlValue[], Row = Record<string, unknown>>(
+    sql: string,
+  ): Statement<Params, Row>;
+  exec(sql: string): void;
+  pragma(statement: string): unknown;
+  /** Run `fn` inside a transaction, rolling back if it throws. */
+  transaction<T>(fn: () => T): () => T;
+  readonly open: boolean;
+  close(): void;
+}
 
 export interface OpenDatabaseOptions {
   /** Absolute path to the SQLite file, or ':memory:' for tests. */
@@ -21,7 +52,7 @@ export interface OpenDatabaseOptions {
  * Open the local database and bring it up to the current schema.
  *
  * Pragmas are chosen for a service that runs unattended for weeks:
- *  - WAL keeps readers from blocking the writer during a long sync.
+ *  - WAL keeps readers from blocking the writer.
  *  - `synchronous = FULL` because this database records money movements; the
  *    throughput cost is irrelevant at ATRA's transaction rate.
  *  - `foreign_keys` is off by default in SQLite and must be enabled per
@@ -35,13 +66,13 @@ export function openDatabase(options: OpenDatabaseOptions): Db {
     mkdirSync(dirname(options.file), { recursive: true });
   }
 
-  const db = new Database(options.file);
+  const handle = new DatabaseSync(options.file);
+  const db = wrap(handle);
 
-  db.pragma('journal_mode = ' + (inMemory ? 'MEMORY' : 'WAL'));
+  db.pragma(`journal_mode = ${inMemory ? 'MEMORY' : 'WAL'}`);
   db.pragma('synchronous = FULL');
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 5000');
-  db.pragma('trusted_schema = OFF');
 
   if (options.migrate !== false) {
     const applied = migrate(db);
@@ -51,6 +82,74 @@ export function openDatabase(options: OpenDatabaseOptions): Db {
   }
 
   return db;
+}
+
+function wrap(handle: DatabaseSync): Db {
+  // SQLite has no nested BEGIN, and node:sqlite does not expose the autocommit
+  // flag, so the wrapper tracks nesting itself: only the outermost call issues
+  // BEGIN/COMMIT.
+  let depth = 0;
+
+  return {
+    prepare<Params extends SqlValue[] = SqlValue[], Row = Record<string, unknown>>(sql: string) {
+      const statement = handle.prepare(sql);
+      return {
+        run: (...params: Params) => statement.run(...(params as unknown as never[])),
+        get: (...params: Params) =>
+          statement.get(...(params as unknown as never[])) as Row | undefined,
+        all: (...params: Params) => statement.all(...(params as unknown as never[])) as Row[],
+      };
+    },
+
+    exec(sql: string) {
+      handle.exec(sql);
+    },
+
+    pragma(statement: string) {
+      return handle.prepare(`PRAGMA ${statement}`).get();
+    },
+
+    /**
+     * Wrap `fn` in a transaction.
+     *
+     * Returns a callable rather than running immediately, mirroring the shape
+     * the call sites already use. Nested calls reuse the outer transaction:
+     * SQLite has no nested BEGIN, and a savepoint would add complexity ATRA
+     * does not currently need.
+     */
+    transaction<T>(fn: () => T): () => T {
+      return () => {
+        const outermost = depth === 0;
+        if (outermost) handle.exec('BEGIN');
+        depth += 1;
+        try {
+          const result = fn();
+          depth -= 1;
+          if (outermost) handle.exec('COMMIT');
+          return result;
+        } catch (error) {
+          depth -= 1;
+          if (outermost) {
+            try {
+              handle.exec('ROLLBACK');
+            } catch {
+              // A rollback failure would mask the original error, which is the
+              // one the caller actually needs to see.
+            }
+          }
+          throw error;
+        }
+      };
+    },
+
+    get open() {
+      return handle.isOpen;
+    },
+
+    close() {
+      handle.close();
+    },
+  };
 }
 
 interface MigrationFile {
