@@ -29,6 +29,13 @@ them. The base model is Apache-2.0 and downloads anonymously from Hugging Face.
 > Kaggle's CUDA one, so only `gguf` is installed now, with `--no-deps`.
 > Both checkouts moved to `/kaggle/temp` so the notebook's output stays small.
 >
+> Run 3 cleared all of that — single GPU, 5.40 GiB peak, the failure stopped
+> the cell — and died one step into training with
+> `"_amp_foreach_non_finite_check_and_unscale_cuda" not implemented for
+> 'BFloat16'`. The checkpoint is stored in bfloat16 and `from_pretrained`
+> kept it, so fp16 AMP's gradient scaler met bfloat16 gradients. `train.py`
+> now loads the model in the same dtype it trains in.
+>
 > Training itself is still unproven. Do not edit the UNTRAINED label until a
 > run completes **and** `evaluate.py` passes.
 

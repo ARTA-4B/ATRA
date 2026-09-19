@@ -248,6 +248,18 @@ def main() -> int:
     load_in_4bit = bool(resolve(config, "model", "load_in_4bit", default=True)) and use_cuda
     model_kwargs: dict[str, Any] = {}
 
+    # One dtype decision, used everywhere. The checkpoint is stored in
+    # bfloat16, and without an explicit dtype `from_pretrained` keeps it — so
+    # on a T4, where the trainer runs fp16 AMP, the gradient scaler met
+    # bfloat16 gradients and raised
+    #   "_amp_foreach_non_finite_check_and_unscale_cuda" not implemented for 'BFloat16'
+    # (observed on Kaggle 2026-09-20, after the DataParallel fix). Loading in
+    # float16 keeps the model, the 4-bit compute dtype and the scaler in
+    # agreement.
+    compute_dtype = torch.bfloat16 if supports_bf16(torch) else torch.float16
+    if use_cuda:
+        model_kwargs["torch_dtype"] = compute_dtype
+
     if load_in_4bit:
         from transformers import BitsAndBytesConfig
 
@@ -255,10 +267,11 @@ def main() -> int:
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16 if supports_bf16(torch) else torch.float16,
+            bnb_4bit_compute_dtype=compute_dtype,
         )
 
     model = AutoModelForCausalLM.from_pretrained(base_model, **model_kwargs)
+    print(f"dtype          : {compute_dtype if use_cuda else 'float32 (cpu)'}")
 
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
