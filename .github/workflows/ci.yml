@@ -76,6 +76,71 @@ jobs:
           wait $PID
           echo "exited cleanly"
 
+  model:
+    name: model pipeline (dataset, evaluation)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: model/atra-4b
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: model/atra-4b/requirements-cpu.txt
+
+      - run: pip install -r requirements-cpu.txt
+
+      - name: Tests
+        run: python -m pytest tests -q
+
+      - name: Build the dataset
+        run: python -m data.build --out data/out --seed 42 --per-domain 100
+
+      - name: Validate the dataset
+        run: python -m data.checks data/out
+
+      # The training script must refuse a dataset that fails its gates, and must
+      # reach that decision without loading a model.
+      - name: Training dry run
+        run: python train.py --dry-run
+
+      # Calibration: the oracle is the upper bound and must score perfectly; a
+      # metric that does not is measuring the wrong thing.
+      - name: Evaluation calibration (oracle)
+        run: python evaluate.py --model oracle --data data/out/test.jsonl --out runs/oracle.json
+
+      # And the null model must fail everything. A suite that scores it well is
+      # broken, so a zero exit code here would be the failure.
+      - name: Evaluation calibration (null model)
+        run: |
+          if python evaluate.py --model echo --data data/out/test.jsonl; then
+            echo "::error::The evaluation suite passed a model that returns nothing"
+            exit 1
+          fi
+          echo "null model correctly fails every metric"
+
+      - name: Model status must stay honest
+        run: |
+          grep -q "UNTRAINED" MODEL_CARD.md
+          grep -q "UNTRAINED" README.md
+          if ls runs/*/manifest.json >/dev/null 2>&1; then
+            echo "::error::A training manifest is committed; update the model status"
+            exit 1
+          fi
+          echo "model is correctly reported as UNTRAINED"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: evaluation-report
+          path: model/atra-4b/runs/oracle.json
+          if-no-files-found: ignore
+
   secrets:
     name: secret scan
     runs-on: ubuntu-24.04

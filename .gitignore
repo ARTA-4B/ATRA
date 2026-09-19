@@ -15,3 +15,9 @@ runtime/coverage/
 /data/
 runtime/.smoke*/
 runtime/.ci-data/
+
+# Model pipeline outputs
+model/atra-4b/data/out/
+model/atra-4b/runs/
+model/atra-4b/**/__pycache__/
+model/atra-4b/.pytest_cache/

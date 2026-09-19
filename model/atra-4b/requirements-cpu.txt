@@ -1,0 +1,4 @@
+# CPU-only dependencies: dataset build, validation, evaluation, and the smoke
+# training path with a tiny model. This is what CI installs.
+pyyaml==6.0.3
+pytest==9.0.2

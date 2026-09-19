@@ -342,10 +342,23 @@ function tokenAddressFromId(id: string | null | undefined): string {
   return index === -1 ? id : id.slice(index + 1);
 }
 
+/**
+ * Split a pool name into its two symbols.
+ *
+ * GeckoTerminal appends the fee tier to the second symbol, e.g.
+ * "USDG / WETH 0.01%". The tier belongs to the pool, not to the token, so it is
+ * trimmed: leaving it in makes the symbol wrong everywhere it is displayed.
+ */
 function splitPairName(name: string | null | undefined): [string | null, string | null] {
   if (!name) return [null, null];
   const parts = name.split('/').map((part) => part.trim());
-  return [parts[0] ?? null, parts[1] ?? null];
+  return [cleanSymbol(parts[0]), cleanSymbol(parts[1])];
+}
+
+function cleanSymbol(value: string | undefined): string | null {
+  if (!value) return null;
+  const symbol = value.replace(/\s+[\d.]+%$/, '').trim();
+  return symbol.length > 0 ? symbol : null;
 }
 
 function decimalOrNull(value: string | null | undefined): string | null {

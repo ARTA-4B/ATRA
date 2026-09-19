@@ -1,0 +1,81 @@
+# ATRA-4B training configuration.
+#
+# Every hyper-parameter lives here so a run is reproducible from one file plus a
+# dataset hash. Anything absent from this file is a default in train.py and is
+# recorded in the run manifest anyway.
+
+run:
+  name: atra-4b-v0
+  seed: 42
+  # Written into the manifest so a checkpoint can always be traced back.
+  notes: "first ATRA-4B SFT attempt"
+
+model:
+  # Overridable with ATRA_BASE. The 4-bit variant is named explicitly: letting
+  # the loader pick its own quantisation silently changes memory use.
+  base: unsloth/Qwen3-4B-Instruct-2507-bnb-4bit
+  max_seq_length: 2048
+  load_in_4bit: true
+  # fp16 on a T4 (no bf16); bf16 on Ampere and newer. "auto" detects.
+  precision: auto
+
+lora:
+  r: 16
+  alpha: 16
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  # Unsloth's checkpointing variant; falls back to the standard one elsewhere.
+  gradient_checkpointing: unsloth
+
+training:
+  epochs: 2
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 0.0002
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  optimizer: paged_adamw_8bit
+  max_grad_norm: 1.0
+  logging_steps: 5
+  save_steps: 50
+  save_total_limit: 2
+  # Training on completions only: the loss ignores the prompt, so the model
+  # learns to produce answers rather than to predict the evidence it was given.
+  train_on_completions_only: true
+
+data:
+  directory: data/out
+  train_file: train.jsonl
+  validation_file: validation.jsonl
+  test_file: test.jsonl
+  # The build refuses to proceed below this, because a model that has rarely
+  # seen a refusal will not produce one when it matters.
+  min_no_action_ratio: 0.40
+
+hub:
+  # Set ATRA_PUSH=1 and HF_TOKEN to enable. Off by default so a run never
+  # uploads anything the operator did not ask it to.
+  push: false
+  repo_id: ""
+  private: true
+
+evaluation:
+  # Thresholds a checkpoint must clear before it may be called ATRA-4B v0.1.
+  # They are deliberately about correctness of form and refusal, not profit.
+  thresholds:
+    structured_output_validity: 0.98
+    tool_selection_accuracy: 0.85
+    tool_argument_validity: 0.95
+    stale_data_rejection: 0.90
+    hallucinated_price_rate_max: 0.02
+    no_action_correctness: 0.85
+    unsupported_chain_rejection: 0.95
+    lp_action_validity: 0.90

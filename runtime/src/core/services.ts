@@ -9,6 +9,12 @@ import { RiskPolicyStore } from '../risk/store.js';
 import { EvmChainAdapter } from '../chains/evm/adapter.js';
 import { SolanaChainAdapter } from '../chains/solana/adapter.js';
 import { CHAIN_IDS, CHAINS } from '../chains/registry.js';
+import { MarketService } from '../market/service.js';
+import { DexScreenerProvider } from '../market/providers/dexscreener.js';
+import { GeckoTerminalProvider } from '../market/providers/geckoterminal.js';
+import { ResearchAgent } from '../agents/research/agent.js';
+import { HttpLlmProvider, NullLlmProvider } from '../llm/provider.js';
+import type { LlmProvider } from '../llm/provider.js';
 import type { ChainId } from '../chains/registry.js';
 import type { ChainAdapter } from '../chains/types.js';
 import type { RuntimeConfig } from '../config/env.js';
@@ -34,6 +40,9 @@ export interface Services {
   wallets: WalletService;
   riskPolicy: RiskPolicyStore;
   adapters: Map<ChainId, ChainAdapter>;
+  market: MarketService;
+  llm: LlmProvider;
+  research: ResearchAgent;
   startedAt: Date;
 }
 
@@ -71,6 +80,17 @@ export function buildServices(config: RuntimeConfig, options: BuildOptions = {})
 
   const wallets = new WalletService(db, vault, audit, adapters);
 
+  // In CI mode there are no outbound calls at all, so the market layer gets no
+  // providers and the model is the null provider. Everything above still works;
+  // it simply reports that it has no data, which is what a smoke test wants to
+  // exercise anyway.
+  const market = new MarketService(
+    config.isCi ? [] : [new DexScreenerProvider(), new GeckoTerminalProvider()],
+    db,
+  );
+  const llm = buildLlmProvider(config);
+  const research = new ResearchAgent(market, llm, { db, audit });
+
   log.info(
     {
       databaseFile: databaseFile === ':memory:' ? ':memory:' : databaseFile,
@@ -90,8 +110,44 @@ export function buildServices(config: RuntimeConfig, options: BuildOptions = {})
     wallets,
     riskPolicy,
     adapters,
+    market,
+    llm,
+    research,
     startedAt: new Date(),
   };
+}
+
+/**
+ * Build the reasoning provider from configuration.
+ *
+ * Defaults to a local Ollama endpoint, because a model on the operator's own
+ * machine is the only configuration where the prompt never leaves it. An
+ * unreachable endpoint is not an error here: the provider reports itself
+ * unavailable and the agents degrade to observations only.
+ *
+ * The API key is read from the environment variable the operator names, never
+ * from a config file that might be committed.
+ */
+export function buildLlmProvider(config: RuntimeConfig): LlmProvider {
+  if (config.llm.kind === 'none') {
+    return new NullLlmProvider('the runtime is configured without a reasoning model');
+  }
+
+  const endpoint =
+    config.llm.url ?? (config.llm.kind === 'ollama' ? 'http://127.0.0.1:11434' : undefined);
+
+  if (!endpoint) {
+    return new NullLlmProvider('no model endpoint is configured');
+  }
+
+  const apiKey = config.llm.apiKeyEnv ? process.env[config.llm.apiKeyEnv] : undefined;
+
+  return new HttpLlmProvider({
+    kind: config.llm.kind,
+    endpoint,
+    model: config.llm.model ?? 'atra-4b',
+    apiKey,
+  });
 }
 
 /**
