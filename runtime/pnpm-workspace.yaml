@@ -1,6 +1,11 @@
-allowBuilds:
-  better-sqlite3: true
-  esbuild: true
+# pnpm 11 refuses packages published within its minimum release age unless they
+# are listed here. These two were current when the lockfile was written.
 minimumReleaseAgeExclude:
   - '@types/node@26.6.2'
   - eslint@10.11.0
+
+# esbuild ships a prebuilt binary that its postinstall script unpacks; it is a
+# build-time dependency of tsx and vitest only. The runtime itself now has no
+# native dependency at all.
+allowBuilds:
+  esbuild: true

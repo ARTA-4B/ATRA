@@ -43,7 +43,7 @@ WORKDIR /build
 
 RUN corepack enable
 
-COPY runtime/package.json runtime/pnpm-lock.yaml runtime/.npmrc ./
+COPY runtime/package.json runtime/pnpm-lock.yaml runtime/pnpm-workspace.yaml runtime/.npmrc ./
 RUN pnpm install --frozen-lockfile
 
 COPY runtime/tsconfig.json runtime/tsconfig.build.json ./
