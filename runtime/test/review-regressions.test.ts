@@ -281,8 +281,7 @@ describe('review: password guessing is throttled', () => {
 describe('review: providers never emit a zero price', () => {
   function dex(payload: unknown): DexScreenerProvider {
     return new DexScreenerProvider({
-      fetchImpl: (() =>
-        Promise.resolve(new Response(JSON.stringify(payload), { status: 200 }))),
+      fetchImpl: () => Promise.resolve(new Response(JSON.stringify(payload), { status: 200 })),
     });
   }
 
@@ -308,20 +307,20 @@ describe('review: providers never emit a zero price', () => {
 
   it('GeckoTerminal: "0" from the token-price endpoint becomes null', async () => {
     const gecko = new GeckoTerminalProvider({
-      fetchImpl: (() =>
+      fetchImpl: () =>
         Promise.resolve(
           new Response(
             JSON.stringify({ data: { attributes: { token_prices: { '0xtok': '0' } } } }),
             { status: 200 },
           ),
-        )),
+        ),
     });
     expect(await gecko.getTokenPriceUsd('base', '0xtok')).toBeNull();
   });
 
   it('GeckoTerminal: an empty percentage is unknown, not zero', async () => {
     const gecko = new GeckoTerminalProvider({
-      fetchImpl: (() =>
+      fetchImpl: () =>
         Promise.resolve(
           new Response(
             JSON.stringify({
@@ -340,7 +339,7 @@ describe('review: providers never emit a zero price', () => {
             }),
             { status: 200 },
           ),
-        )),
+        ),
     });
     const [pool] = await gecko.getPoolsForToken('base', '0xtok');
     expect(pool?.change.h24).toBeNull();
