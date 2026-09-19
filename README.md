@@ -48,7 +48,7 @@ rejection. The emergency stop works with the model offline.
 ## Install
 
 ```bash
-git clone https://github.com/sighttrue/ATRA.git
+git clone https://github.com/lamaokamg-hub/ATRA.git
 cd ATRA
 docker compose up -d
 ```

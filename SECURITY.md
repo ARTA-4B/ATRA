@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Please report security issues privately rather than in a public issue. Open a
-[private security advisory](https://github.com/sighttrue/ATRA/security/advisories/new)
+[private security advisory](https://github.com/lamaokamg-hub/ATRA/security/advisories/new)
 on GitHub. You will get an acknowledgement, and a fix or a mitigation before
 any public disclosure.
 
