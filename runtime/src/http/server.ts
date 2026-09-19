@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { serve } from '@hono/node-server';
 import { existsSync } from 'node:fs';
@@ -52,6 +53,21 @@ export function createApp(services: Services): Hono<AppEnv> {
   });
   app.use('*', hostGuard(services.config.hostAllowlist));
   app.use('*', csrfGuard(services.config.corsOrigins));
+
+  // The largest legitimate body is a full risk policy, a few kilobytes. Anything
+  // approaching a megabyte is not a dashboard request, and buffering it before
+  // authentication would let an anonymous caller consume memory at will.
+  app.use(
+    '/api/*',
+    bodyLimit({
+      maxSize: 256 * 1024,
+      onError: () => {
+        throw new AppError(ErrorCode.SCHEMA_INVALID, 'Request body is too large', {
+          status: 413,
+        });
+      },
+    }),
+  );
 
   app.route('/', systemRoutes());
   app.route('/api/v1/auth', authRoutes());

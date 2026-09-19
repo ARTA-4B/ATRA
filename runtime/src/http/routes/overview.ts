@@ -14,6 +14,14 @@ import type { ChainHealth } from '../../chains/types.js';
  * reported as null until Phase 2 provides a priced market snapshot, rather than
  * showing a zero that an operator would read as "my wallet is empty".
  */
+function hostOnly(endpoint: string): string {
+  try {
+    return new URL(endpoint).host;
+  } catch {
+    return 'unknown';
+  }
+}
+
 export function overviewRoutes(): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
 
@@ -69,7 +77,9 @@ export function overviewRoutes(): Hono<AppEnv> {
                 enabledChains: installation.enabledChains,
               }
             : null,
-          chains: health,
+          // Endpoints are reduced to their host: a BYOK URL carries the key in
+          // its path, and it must not be echoed to the browser.
+          chains: health.map((entry) => ({ ...entry, endpoint: hostOnly(entry.endpoint) })),
           // Honest about what is not built yet, rather than showing an idle
           // agent that does not exist.
           agents: [

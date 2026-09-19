@@ -102,6 +102,13 @@ export function nativeToUsdMicros(
   if (!Number.isInteger(decimals) || decimals < 0 || decimals > 36) {
     throw new MoneyFormatError(`Unsupported token decimals: ${decimals}`);
   }
+  // A zero price is not a price: it is a provider saying "unknown" in the
+  // shape of a number. Valuing anything at it makes every USD cap pass
+  // trivially, so it is refused here as defence in depth; the engine treats a
+  // zero price as missing data long before reaching this point.
+  if (priceAtto <= 0n) {
+    throw new MoneyFormatError('Cannot value an amount at a non-positive price');
+  }
   const numerator = amount * priceAtto;
   const denominator = 10n ** BigInt(decimals) * (PRICE_SCALE / USD_SCALE);
   return rounding === 'ceil' ? ceilDiv(numerator, denominator) : floorDiv(numerator, denominator);

@@ -133,6 +133,28 @@ export const proposedActionSchema = z
       ctx.addIssue({ code: 'custom', path: ['amountIn'], message: 'must be greater than zero' });
     }
 
+    // Exit privileges (skipping the exposure caps) belong to swaps only. An
+    // approve or LP action flagged reduceOnly would inherit them for nothing.
+    if (action.reduceOnly && action.kind !== 'swap') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['reduceOnly'],
+        message: `${action.kind} cannot be reduce-only`,
+      });
+    }
+
+    // LP execution is Phase 4. Until its checks exist the engine must refuse
+    // these kinds outright rather than evaluate them as swaps — which is what
+    // happened before this guard: an lp_add against a policy with LP disabled
+    // was approved using the swap checks.
+    if (action.kind.startsWith('lp_')) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['kind'],
+        message: 'lp actions are not enabled in this build',
+      });
+    }
+
     if (action.kind === 'approve') {
       if (action.quote !== null) {
         ctx.addIssue({

@@ -46,8 +46,19 @@ const completeSchema = z.object({
 export function setupRoutes(): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
 
-  app.get('/', (c) => {
+  /**
+   * Setup progress.
+   *
+   * Requires a session once a password exists: wallet addresses and the
+   * installation's state are not for anonymous callers. Before setup there is
+   * nothing to protect and no session to require.
+   */
+  app.get('/', async (c, next) => {
     const services = c.get('services');
+    if (services.auth.isConfigured) {
+      await requireSession()(c, next);
+      if (c.get('session') === undefined) return;
+    }
     const installation = services.state.getInstallation();
     const wallets = services.auth.isConfigured ? services.wallets.list() : [];
 

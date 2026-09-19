@@ -150,7 +150,12 @@ export class ResearchAgent {
 
     // Not enough to reason about. This is the common case for an unknown token
     // and it must not produce confident-sounding prose.
-    const usable = evidence.facts.filter((fact) => !fact.stale);
+    //
+    // Registry facts (the chain's own name and native symbol) are excluded from
+    // the count: they are always present and always fresh, so counting them
+    // made INSUFFICIENT_DATA unreachable — every request looked like it had
+    // two solid data points before a single provider had been asked.
+    const usable = evidence.facts.filter((fact) => !fact.stale && fact.source !== 'registry');
     if (usable.length === 0) {
       result.status = 'INSUFFICIENT_DATA';
       result.summary =

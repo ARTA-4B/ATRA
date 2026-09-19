@@ -231,6 +231,7 @@ function toSnapshot(pair: Pair, chain: ChainId, fetchedAt: number): MarketSnapsh
   // DexScreener does not stamp its rows, so the fetch time is the best claim
   // that can honestly be made about when the data was true.
   const observedAt = fetchedAt;
+  const priceUsd = normalizeDecimal(pair.priceUsd);
 
   return {
     chain,
@@ -238,7 +239,7 @@ function toSnapshot(pair: Pair, chain: ChainId, fetchedAt: number): MarketSnapsh
     dexId: pair.dexId ?? null,
     base: toTokenRef(pair.baseToken),
     quote: toTokenRef(pair.quoteToken),
-    priceUsd: normalizeDecimal(pair.priceUsd),
+    priceUsd,
     priceNative: normalizeDecimal(pair.priceNative),
     liquidityUsd: numberToDecimal(pair.liquidity?.usd),
     volume24hUsd: numberToDecimal(pair.volume?.h24),
@@ -252,7 +253,7 @@ function toSnapshot(pair: Pair, chain: ChainId, fetchedAt: number): MarketSnapsh
     fetchedAt: new Date(fetchedAt).toISOString(),
     source: 'dexscreener',
     freshnessMs: 0,
-    ...(pair.priceUsd ? {} : { reason: 'provider returned no USD price for this pair' }),
+    ...(priceUsd === null ? { reason: 'provider returned no usable USD price for this pair' } : {}),
   };
 }
 
@@ -267,10 +268,17 @@ function toTokenRef(token: Pair['baseToken']): TokenRef {
   };
 }
 
-/** Keep provider decimals as a string; never parse a price into a float. */
+/**
+ * Keep provider decimals as a string; never parse a price into a float.
+ *
+ * A zero is rejected along with malformed values: a provider reporting "0"
+ * means it has no price, and passing that through as a number would let it
+ * satisfy every downstream comparison.
+ */
 function normalizeDecimal(value: string | null | undefined): string | null {
   if (value === null || value === undefined) return null;
-  return /^\d+(\.\d+)?$/.test(value) ? value : null;
+  if (!/^\d+(\.\d+)?$/.test(value)) return null;
+  return /[1-9]/.test(value) ? value : null;
 }
 
 /**

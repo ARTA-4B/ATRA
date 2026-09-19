@@ -294,6 +294,7 @@ type Pool = z.infer<typeof poolSchema>;
 function toSnapshot(pool: Pool, chain: ChainId, fetchedAt: number): MarketSnapshot {
   const attributes = pool.attributes;
   const [baseSymbol, quoteSymbol] = splitPairName(attributes.name);
+  const priceUsd = decimalOrNull(attributes.base_token_price_usd);
 
   return {
     chain,
@@ -311,7 +312,7 @@ function toSnapshot(pool: Pool, chain: ChainId, fetchedAt: number): MarketSnapsh
       name: null,
       decimals: null,
     },
-    priceUsd: decimalOrNull(attributes.base_token_price_usd),
+    priceUsd,
     priceNative: decimalOrNull(attributes.base_token_price_native_currency),
     liquidityUsd: decimalOrNull(attributes.reserve_in_usd),
     volume24hUsd: decimalOrNull(attributes.volume_usd?.h24),
@@ -325,7 +326,7 @@ function toSnapshot(pool: Pool, chain: ChainId, fetchedAt: number): MarketSnapsh
     fetchedAt: new Date(fetchedAt).toISOString(),
     source: 'geckoterminal',
     freshnessMs: 0,
-    ...(attributes.base_token_price_usd ? {} : { reason: 'provider returned no USD price' }),
+    ...(priceUsd === null ? { reason: 'provider returned no usable USD price' } : {}),
   };
 }
 
@@ -363,13 +364,18 @@ function cleanSymbol(value: string | undefined): string | null {
 
 function decimalOrNull(value: string | null | undefined): string | null {
   if (value === null || value === undefined) return null;
-  // Scientific notation and negatives are rejected rather than coerced: a price
-  // ATRA cannot parse exactly is a price it should not use.
-  return /^\d+(\.\d+)?$/.test(value) ? value : null;
+  // Scientific notation, negatives and zero are rejected rather than coerced: a
+  // price ATRA cannot parse exactly, or that is not a price at all, is one it
+  // must not use.
+  if (!/^\d+(\.\d+)?$/.test(value)) return null;
+  return /[1-9]/.test(value) ? value : null;
 }
 
 function percentStringToBps(value: string | null | undefined): number | null {
   if (value === null || value === undefined) return null;
+  // Number('') is 0 and Number('0x10') is 16; neither is a percentage. Only a
+  // plain signed decimal is accepted.
+  if (!/^-?\d+(\.\d+)?$/.test(value.trim())) return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? Math.round(parsed * 100) : null;
 }

@@ -252,7 +252,7 @@ describe('DexScreener mapping', () => {
       '0xWETH',
     );
     expect(pool?.priceUsd).toBeNull();
-    expect(pool?.reason).toContain('no USD price');
+    expect(pool?.reason).toContain('no usable USD price');
   });
 
   it('rejects a price that is not a plain decimal', async () => {

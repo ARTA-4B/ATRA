@@ -29,6 +29,7 @@ const reauthSchema = z.object({
     'wallet.export',
     'wallet.withdraw',
     'mode.live',
+    'emergency.clear',
     'auth.password',
     'settings.reset',
     'settings.secret',

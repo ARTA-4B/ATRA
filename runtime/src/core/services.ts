@@ -80,6 +80,14 @@ export function buildServices(config: RuntimeConfig, options: BuildOptions = {})
 
   const wallets = new WalletService(db, vault, audit, adapters);
 
+  // A policy change while LIVE drops the runtime back to PAPER. The operator
+  // reviewed the old limits, not the new ones.
+  riskPolicy.onChanged(() => {
+    if (state.getMode() === 'LIVE') {
+      state.revertToPaper('system', 'risk policy changed');
+    }
+  });
+
   // In CI mode there are no outbound calls at all, so the market layer gets no
   // providers and the model is the null provider. Everything above still works;
   // it simply reports that it has no data, which is what a smoke test wants to

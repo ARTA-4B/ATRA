@@ -219,7 +219,8 @@ export class WalletService {
         amount: native.value.amount,
       };
       reading.observedAt = new Date(native.observedAt).toISOString();
-      reading.source = native.source;
+      // Host only: a BYOK endpoint embeds the operator's key in its path.
+      reading.source = hostOnly(native.source);
 
       const fee = await adapter.estimateTransferFee();
       // "Low" means the wallet could not pay for three plain transfers: enough
@@ -273,8 +274,10 @@ export class WalletService {
     const material = this.#vault.exportSecret(row.secret_id, (plaintext) => {
       switch (format) {
         case 'evm-private-key':
+          this.#assertEvmMatches(plaintext, wallet.address);
           return exportEvmPrivateKeyHex(plaintext);
         case 'evm-keystore': {
+          this.#assertEvmMatches(plaintext, wallet.address);
           if (!keystorePassword || keystorePassword.length < 12) {
             throw new AppError(
               ErrorCode.SCHEMA_INVALID,
@@ -307,6 +310,21 @@ export class WalletService {
     return { format, address: wallet.address, material, warning: EXPORT_WARNING };
   }
 
+  /**
+   * Refuse to hand out a key that does not control the recorded address.
+   *
+   * A mismatch means the vault row and the wallet row disagree, and an export
+   * would give the operator a key for an address they were never told to fund.
+   */
+  #assertEvmMatches(privateKey: Uint8Array, recorded: string): void {
+    if (evmAddressFromPrivateKey(privateKey).toLowerCase() !== recorded.toLowerCase()) {
+      throw new AppError(
+        ErrorCode.VAULT_CORRUPT,
+        'The stored EVM key does not match the recorded address; refusing to export it',
+      );
+    }
+  }
+
   #assertSolanaConsistent(secretKey: Uint8Array): void {
     if (!isConsistentSecretKey(secretKey)) {
       throw new AppError(
@@ -333,6 +351,14 @@ export class WalletService {
       .run(randomUUID(), family, address, secretId, createdAt);
 
     return { family, address, createdAt, chains: chainsFor(family) };
+  }
+}
+
+function hostOnly(endpoint: string): string {
+  try {
+    return new URL(endpoint).host;
+  } catch {
+    return endpoint;
   }
 }
 

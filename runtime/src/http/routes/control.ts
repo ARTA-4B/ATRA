@@ -80,7 +80,9 @@ export function controlRoutes(): Hono<AppEnv> {
     const services = c.get('services');
     const session = c.get('session')!;
 
-    services.auth.consumeReauthToken(c.req.header(REAUTH_HEADER), 'mode.live', session.id);
+    // Its own purpose, so the audit trail says what the token was spent on and
+    // a token obtained to clear the stop cannot also switch the runtime live.
+    services.auth.consumeReauthToken(c.req.header(REAUTH_HEADER), 'emergency.clear', session.id);
     services.state.setEmergencyStop(false, null, 'operator');
 
     return c.json(envelope(c, services.state.getSwitches()));

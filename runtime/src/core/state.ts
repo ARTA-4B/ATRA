@@ -24,6 +24,13 @@ import type { ChainId } from '../chains/registry.js';
 
 export const LIVE_SESSION_TTL_MS = 12 * 60 * 60 * 1_000;
 
+/**
+ * A recorded checklist step is good for this long. The checklist is meant to
+ * be walked in one sitting immediately before going live; a step recorded
+ * yesterday says nothing about today's wallet balance or risk settings.
+ */
+export const ACTIVATION_STEP_TTL_MS = 10 * 60 * 1_000;
+
 interface InstallationRow {
   id: string;
   name: string;
@@ -98,6 +105,48 @@ export class StateStore {
     this.#db = db;
     this.#audit = audit;
     this.#ensureRows();
+    this.#demoteOnBoot();
+  }
+
+  /**
+   * A process start never resumes LIVE.
+   *
+   * Whatever stopped the previous process — a crash, a host reboot, an
+   * operator's `docker compose restart` — the runtime cannot know that the
+   * conditions under which LIVE was activated still hold. It comes back in
+   * PAPER and the operator re-activates deliberately.
+   */
+  #demoteOnBoot(): void {
+    const row = this.#db
+      .prepare<[], { mode: Mode }>('SELECT mode FROM installation WHERE singleton = 1')
+      .get();
+    if (row?.mode !== 'LIVE') return;
+
+    const now = new Date().toISOString();
+    this.#db.prepare("UPDATE installation SET mode = 'PAPER' WHERE singleton = 1").run();
+    this.#resetChecklist(now);
+
+    this.#audit.append({
+      category: 'mode',
+      action: 'mode.paper',
+      status: 'ok',
+      summary: 'Runtime restarted; LIVE mode was not resumed',
+      actor: 'system',
+      mode: 'PAPER',
+      detail: { reason: 'restart' },
+    });
+    this.#log.warn('runtime restarted while LIVE; demoted to PAPER');
+  }
+
+  /** Clear every checklist step. Going live again means walking it again. */
+  #resetChecklist(now: string): void {
+    this.#db
+      .prepare(
+        'UPDATE live_activation SET acknowledged_at = NULL, reauth_at = NULL,' +
+          ' risk_reviewed_at = NULL, wallet_funded_at = NULL, gas_checked_at = NULL,' +
+          ' adapter_checked_at = NULL, activated_at = NULL, updated_at = ? WHERE id = 1',
+      )
+      .run(now);
   }
 
   #ensureRows(): void {
@@ -227,9 +276,9 @@ export class StateStore {
 
     if (active) {
       this.#db.prepare("UPDATE installation SET mode = 'PAPER' WHERE singleton = 1").run();
-      this.#db
-        .prepare('UPDATE live_activation SET activated_at = NULL, updated_at = ? WHERE id = 1')
-        .run(now);
+      // Every step is cleared, not just the activation: recovering from an
+      // emergency means walking the whole checklist again.
+      this.#resetChecklist(now);
     }
 
     this.#audit.append({
@@ -260,13 +309,19 @@ export class StateStore {
       .prepare<[], LiveActivationRow>('SELECT * FROM live_activation WHERE id = 1')
       .get();
 
+    // A step counts only while it is recent. See ACTIVATION_STEP_TTL_MS.
+    const fresh = (stamp: string | null | undefined): boolean =>
+      stamp !== null &&
+      stamp !== undefined &&
+      Date.now() - Date.parse(stamp) <= ACTIVATION_STEP_TTL_MS;
+
     const progress: LiveActivationProgress = {
-      acknowledged: row?.acknowledged_at !== null && row?.acknowledged_at !== undefined,
-      reauthenticated: row?.reauth_at !== null && row?.reauth_at !== undefined,
-      riskReviewed: row?.risk_reviewed_at !== null && row?.risk_reviewed_at !== undefined,
-      walletFunded: row?.wallet_funded_at !== null && row?.wallet_funded_at !== undefined,
-      gasChecked: row?.gas_checked_at !== null && row?.gas_checked_at !== undefined,
-      adapterChecked: row?.adapter_checked_at !== null && row?.adapter_checked_at !== undefined,
+      acknowledged: fresh(row?.acknowledged_at),
+      reauthenticated: fresh(row?.reauth_at),
+      riskReviewed: fresh(row?.risk_reviewed_at),
+      walletFunded: fresh(row?.wallet_funded_at),
+      gasChecked: fresh(row?.gas_checked_at),
+      adapterChecked: fresh(row?.adapter_checked_at),
       activatedAt: row?.activated_at ?? null,
       missing: [],
     };
@@ -306,6 +361,9 @@ export class StateStore {
     if (switches.emergencyStop) {
       throw new AppError(ErrorCode.LIVE_ACTIVATION_INCOMPLETE, 'Clear the emergency stop first');
     }
+    if (switches.globalPause) {
+      throw new AppError(ErrorCode.LIVE_ACTIVATION_INCOMPLETE, 'Resume from pause first');
+    }
 
     const progress = this.getActivation();
     if (progress.missing.length > 0) {
@@ -316,6 +374,9 @@ export class StateStore {
 
     const now = new Date().toISOString();
     this.#db.prepare("UPDATE installation SET mode = 'LIVE' WHERE singleton = 1").run();
+    // The steps are consumed by activation. The next activation, for whatever
+    // reason it becomes necessary, starts from nothing.
+    this.#resetChecklist(now);
     this.#db
       .prepare('UPDATE live_activation SET activated_at = ?, updated_at = ? WHERE id = 1')
       .run(now, now);
@@ -337,9 +398,7 @@ export class StateStore {
   revertToPaper(actor: string, reason: string): Installation {
     const now = new Date().toISOString();
     this.#db.prepare("UPDATE installation SET mode = 'PAPER' WHERE singleton = 1").run();
-    this.#db
-      .prepare('UPDATE live_activation SET activated_at = NULL, updated_at = ? WHERE id = 1')
-      .run(now);
+    this.#resetChecklist(now);
 
     this.#audit.append({
       category: 'mode',

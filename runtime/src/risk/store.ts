@@ -18,10 +18,21 @@ export class RiskPolicyStore {
   readonly #db: Db;
   readonly #audit: AuditLog;
   readonly #log = childLogger('risk-policy');
+  #onChanged: (() => void) | undefined;
 
   constructor(db: Db, audit: AuditLog) {
     this.#db = db;
     this.#audit = audit;
+  }
+
+  /**
+   * Called after every successful update.
+   *
+   * The state store uses it to drop LIVE: limits the operator has not reviewed
+   * since they changed are limits they have not agreed to trade under.
+   */
+  onChanged(handler: () => void): void {
+    this.#onChanged = handler;
   }
 
   exists(): boolean {
@@ -109,6 +120,7 @@ export class RiskPolicyStore {
       },
     });
 
+    this.#onChanged?.();
     return next;
   }
 

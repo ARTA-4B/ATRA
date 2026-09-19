@@ -204,7 +204,10 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
   const { action, policy, state, snapshot, now } = input;
   const chain = action.chain;
   const isApprove = action.kind === 'approve';
-  const isExit = action.reduceOnly;
+  // Defence in depth: the schema already refuses reduceOnly on anything but a
+  // swap, so this can only differ from action.reduceOnly if the schema is
+  // loosened later.
+  const isExit = action.reduceOnly && action.kind === 'swap';
 
   ctx.check({
     name: 'chain.enabled',
@@ -245,31 +248,19 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
   const priceNative = snapshot.prices[priceKey(chain, nativeToken.address)];
 
   ctx.check(
-    freshnessCheck('freshness.price.tokenIn', priceIn, now, policy.freshness.priceMaxAgeMs, skew),
+    priceCheck('freshness.price.tokenIn', priceIn, now, policy.freshness.priceMaxAgeMs, skew),
   );
 
   if (isApprove) {
     ctx.skip('freshness.price.tokenOut', 'DATA_STALE', 'not-applicable');
   } else {
     ctx.check(
-      freshnessCheck(
-        'freshness.price.tokenOut',
-        priceOut,
-        now,
-        policy.freshness.priceMaxAgeMs,
-        skew,
-      ),
+      priceCheck('freshness.price.tokenOut', priceOut, now, policy.freshness.priceMaxAgeMs, skew),
     );
   }
 
   ctx.check(
-    freshnessCheck(
-      'freshness.price.native',
-      priceNative,
-      now,
-      policy.freshness.priceMaxAgeMs,
-      skew,
-    ),
+    priceCheck('freshness.price.native', priceNative, now, policy.freshness.priceMaxAgeMs, skew),
   );
 
   if (isApprove || !action.quote) {
@@ -361,7 +352,11 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
   }
 
   const protocols = policy.protocolAllowlist[chain] ?? {};
-  const protocolEntry = protocols[action.protocol];
+  // Own-property lookup: a protocol named "constructor" or "toString" must not
+  // resolve through Object.prototype into something that is not an entry.
+  const protocolEntry = Object.hasOwn(protocols, action.protocol)
+    ? protocols[action.protocol]
+    : undefined;
 
   ctx.check({
     name: 'allowlist.protocol',
@@ -402,14 +397,22 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
   // Anything that depends on missing or stale data is reported as
   // not-evaluated and failed, rather than computed from a guess.
   const amountIn = amountToBigint(action.amountIn);
-  const amountInUsd = priceIn
-    ? nativeToUsdMicros(amountIn, action.tokenIn.decimals, priceToAtto(priceIn.value), 'ceil')
-    : undefined;
+  // A price parses to undefined when absent, malformed or zero; all mean
+  // "unknown", and everything valued at it is reported as not-evaluated and
+  // fails.
+  const priceInAtto = usablePrice(priceIn);
+  const priceNativeAtto = usablePrice(priceNative);
+
+  const amountInUsd =
+    priceInAtto === undefined
+      ? undefined
+      : nativeToUsdMicros(amountIn, action.tokenIn.decimals, priceInAtto, 'ceil');
 
   const feeNative = feeInNativeUnits(action.feeEstimate.detail);
-  const feeUsd = priceNative
-    ? nativeToUsdMicros(feeNative, nativeToken.decimals, priceToAtto(priceNative.value), 'ceil')
-    : undefined;
+  const feeUsd =
+    priceNativeAtto === undefined
+      ? undefined
+      : nativeToUsdMicros(feeNative, nativeToken.decimals, priceNativeAtto, 'ceil');
 
   // --- size ----------------------------------------------------------------
   const maxTrade = usdToMicros(policy.maxAmountPerTradeUsd);
@@ -653,8 +656,24 @@ function contractCheck(
   // On Solana the top-level program set matters as much as the entry point: a
   // transaction may carry instructions the router never asked for.
   if (action.chain === 'solana') {
+    const programIds = action.programIds ?? [];
+
+    // The declared contract must actually be invoked. An empty list, or one
+    // that omits the router, describes a transaction other than the one being
+    // checked.
+    if (!programIds.includes(action.contract)) {
+      return {
+        name: 'allowlist.contract',
+        code: 'CONTRACT_UNKNOWN',
+        passed: false,
+        observed: action.contract,
+        limit: 'n/a',
+        detail: 'declared program is not among the transaction top-level programs',
+      };
+    }
+
     const permitted = new Set([...entry.contracts, ...SOLANA_SYSTEM_PROGRAMS]);
-    const offending = (action.programIds ?? []).find((id) => !permitted.has(id));
+    const offending = programIds.find((id) => !permitted.has(id));
     if (offending) {
       return {
         name: 'allowlist.contract',
@@ -674,6 +693,48 @@ function contractCheck(
     observed: action.contract,
     limit: 'n/a',
   };
+}
+
+/**
+ * A freshness check that also refuses a zero price.
+ *
+ * A provider reporting "0" is saying "unknown" in the shape of a number. If
+ * it were accepted, every USD-denominated limit would compare against zero and
+ * pass, so a zero is treated exactly like a missing datum.
+ */
+function priceCheck(
+  name: string,
+  stamped: Stamped<string> | undefined,
+  now: number,
+  maxAgeMs: number,
+  skewMs: number,
+): RiskCheck {
+  const fresh = freshnessCheck(name, stamped, now, maxAgeMs, skewMs);
+  if (!fresh.passed || !stamped) return fresh;
+
+  if (usablePrice(stamped) === undefined) {
+    return {
+      name,
+      code: 'DATA_STALE',
+      passed: false,
+      observed: 'zero',
+      limit: String(maxAgeMs),
+      detail: 'provider reported a zero or unparseable price; treated as unknown',
+    };
+  }
+
+  return fresh;
+}
+
+/** The parsed price, or undefined when it is absent, malformed or zero. */
+function usablePrice(stamped: Stamped<string> | undefined): bigint | undefined {
+  if (!stamped) return undefined;
+  try {
+    const atto = priceToAtto(stamped.value);
+    return atto > 0n ? atto : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function freshnessCheck(

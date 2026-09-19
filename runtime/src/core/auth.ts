@@ -25,10 +25,23 @@ import type { KdfParams } from '../wallet/crypto.js';
 export const SESSION_TTL_MS = 12 * 60 * 60 * 1_000;
 export const REAUTH_TTL_MS = 5 * 60 * 1_000;
 
+/**
+ * Password-guess throttling.
+ *
+ * ATRA has one operator, so a burst of wrong passwords is either a typo streak
+ * or an attacker. Five failures in the window lock the password check for the
+ * lockout period. The KDF already makes each guess cost about a second; this
+ * bounds the guess rate regardless of how many requests arrive in parallel.
+ */
+export const LOGIN_FAILURE_LIMIT = 5;
+export const LOGIN_FAILURE_WINDOW_MS = 15 * 60 * 1_000;
+export const LOGIN_LOCKOUT_MS = 5 * 60 * 1_000;
+
 export type ReauthPurpose =
   | 'wallet.export'
   | 'wallet.withdraw'
   | 'mode.live'
+  | 'emergency.clear'
   | 'auth.password'
   | 'settings.reset'
   | 'settings.secret';
@@ -73,11 +86,57 @@ export class AuthService {
   readonly #audit: AuditLog;
   readonly #log = childLogger('auth');
   readonly #kdf: KdfParams;
+  /** Timestamps of recent password failures, newest last. */
+  #failures: number[] = [];
+  #lockedUntil = 0;
+  readonly #now: () => number;
 
-  constructor(db: Db, audit: AuditLog, kdf: KdfParams | undefined = DEFAULT_KDF_PARAMS) {
+  constructor(
+    db: Db,
+    audit: AuditLog,
+    kdf: KdfParams | undefined = DEFAULT_KDF_PARAMS,
+    now: () => number = () => Date.now(),
+  ) {
     this.#db = db;
     this.#audit = audit;
     this.#kdf = kdf ?? DEFAULT_KDF_PARAMS;
+    this.#now = now;
+  }
+
+  /**
+   * Refuse to check a password while locked out.
+   *
+   * Applied before the KDF runs, so a locked-out caller cannot even burn CPU.
+   */
+  #assertNotLockedOut(): void {
+    const now = this.#now();
+    if (now < this.#lockedUntil) {
+      throw new AppError(ErrorCode.RATE_LIMITED, 'Too many failed password attempts', {
+        retryAfterSec: Math.ceil((this.#lockedUntil - now) / 1_000),
+      });
+    }
+  }
+
+  #recordFailure(): void {
+    const now = this.#now();
+    this.#failures = this.#failures.filter((at) => now - at < LOGIN_FAILURE_WINDOW_MS);
+    this.#failures.push(now);
+
+    if (this.#failures.length >= LOGIN_FAILURE_LIMIT) {
+      this.#lockedUntil = now + LOGIN_LOCKOUT_MS;
+      this.#failures = [];
+      this.#audit.append({
+        category: 'auth',
+        action: 'login.locked',
+        status: 'rejected',
+        summary: `Password checks locked for ${String(LOGIN_LOCKOUT_MS / 60_000)} minutes after repeated failures`,
+      });
+      this.#log.warn('password checks locked out after repeated failures');
+    }
+  }
+
+  #recordSuccess(): void {
+    this.#failures = [];
   }
 
   get isConfigured(): boolean {
@@ -191,7 +250,10 @@ export class AuthService {
       throw new AppError(ErrorCode.SETUP_REQUIRED, 'Run first-time setup before signing in');
     }
 
+    this.#assertNotLockedOut();
+
     if (!(await this.verifyPassword(password))) {
+      this.#recordFailure();
       this.#audit.append({
         category: 'auth',
         action: 'login.failed',
@@ -201,6 +263,7 @@ export class AuthService {
       throw new AppError(ErrorCode.INVALID_CREDENTIALS, 'Incorrect password');
     }
 
+    this.#recordSuccess();
     const session = this.createSession();
     this.#audit.append({
       category: 'auth',
@@ -279,7 +342,10 @@ export class AuthService {
     purpose: ReauthPurpose,
     password: string,
   ): Promise<{ token: string; expiresAt: string }> {
+    this.#assertNotLockedOut();
+
     if (!(await this.verifyPassword(password))) {
+      this.#recordFailure();
       this.#audit.append({
         category: 'auth',
         action: 'reauth.failed',
@@ -290,6 +356,7 @@ export class AuthService {
       throw new AppError(ErrorCode.INVALID_CREDENTIALS, 'Incorrect password');
     }
 
+    this.#recordSuccess();
     const token = `reauth_${base64url(nodeRandomBytes(32))}`;
     const now = new Date();
     const expiresAt = new Date(now.getTime() + REAUTH_TTL_MS);
