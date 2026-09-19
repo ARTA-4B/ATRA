@@ -87,10 +87,12 @@ export class Vault {
   #unlockedAt: number | undefined;
   #lastUsedAt: number | undefined;
   readonly #autolockMs: number;
+  readonly #defaultKdf: KdfParams;
 
-  constructor(db: Db, options: { autolockMs?: number } = {}) {
+  constructor(db: Db, options: { autolockMs?: number; kdfParams?: KdfParams | undefined } = {}) {
     this.#db = db;
     this.#autolockMs = options.autolockMs ?? 30 * 60_000;
+    this.#defaultKdf = options.kdfParams ?? DEFAULT_KDF_PARAMS;
   }
 
   get isInitialized(): boolean {
@@ -113,7 +115,7 @@ export class Vault {
    * password, and leaves the vault unlocked so that setup can immediately
    * generate wallets without asking for the password twice.
    */
-  async initialize(password: string, params: KdfParams = DEFAULT_KDF_PARAMS): Promise<void> {
+  async initialize(password: string, params: KdfParams = this.#defaultKdf): Promise<void> {
     if (this.isInitialized) {
       throw new AppError(ErrorCode.VAULT_ALREADY_EXISTS, 'The vault has already been created');
     }
@@ -215,7 +217,7 @@ export class Vault {
   async changePassword(
     currentPassword: string,
     newPassword: string,
-    params: KdfParams = DEFAULT_KDF_PARAMS,
+    params: KdfParams = this.#defaultKdf,
   ): Promise<void> {
     const header = this.#header();
     if (!header) {
