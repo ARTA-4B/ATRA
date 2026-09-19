@@ -127,10 +127,7 @@ export function marketRoutes(): Hono<AppEnv> {
       );
     } catch (error) {
       if (error instanceof AppError) {
-        return c.json(
-          envelope(c, [], { source: 'none', stale: true, reason: error.message }),
-          200,
-        );
+        return c.json(envelope(c, [], { source: 'none', stale: true, reason: error.message }), 200);
       }
       throw error;
     }

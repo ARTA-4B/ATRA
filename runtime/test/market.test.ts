@@ -206,8 +206,7 @@ describe('DexScreener mapping', () => {
 
   function provider(payload: unknown): DexScreenerProvider {
     return new DexScreenerProvider({
-      fetchImpl: (() =>
-        Promise.resolve(new Response(JSON.stringify(payload), { status: 200 }))),
+      fetchImpl: () => Promise.resolve(new Response(JSON.stringify(payload), { status: 200 })),
     });
   }
 
@@ -284,7 +283,7 @@ describe('DexScreener mapping', () => {
 
   it('surfaces a rate limit as a typed error', async () => {
     const limited = new DexScreenerProvider({
-      fetchImpl: (() => Promise.resolve(new Response('', { status: 429 }))),
+      fetchImpl: () => Promise.resolve(new Response('', { status: 429 })),
     });
     await expect(limited.getPoolsForToken('base', '0xtoken')).rejects.toThrow(/rate limit/i);
   });
@@ -293,8 +292,7 @@ describe('DexScreener mapping', () => {
 describe('GeckoTerminal mapping', () => {
   function provider(payload: unknown): GeckoTerminalProvider {
     return new GeckoTerminalProvider({
-      fetchImpl: (() =>
-        Promise.resolve(new Response(JSON.stringify(payload), { status: 200 }))),
+      fetchImpl: () => Promise.resolve(new Response(JSON.stringify(payload), { status: 200 })),
     });
   }
 

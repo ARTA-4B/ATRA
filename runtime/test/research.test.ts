@@ -442,7 +442,7 @@ describe('LLM providers', () => {
       kind: 'openai-compatible',
       endpoint: 'http://127.0.0.1:1',
       model: 'test',
-      fetchImpl: (() => Promise.reject(new Error('should never be called'))),
+      fetchImpl: () => Promise.reject(new Error('should never be called')),
     });
 
     await expect(
@@ -524,7 +524,7 @@ describe('LLM providers', () => {
       kind: 'ollama',
       endpoint: 'http://127.0.0.1:1',
       model: 'atra-4b',
-      fetchImpl: (() => Promise.reject(new Error('ECONNREFUSED'))),
+      fetchImpl: () => Promise.reject(new Error('ECONNREFUSED')),
     });
 
     const availability = await provider.available();
