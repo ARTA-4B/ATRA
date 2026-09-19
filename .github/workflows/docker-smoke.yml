@@ -1,0 +1,133 @@
+name: docker-smoke
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: docker-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compose:
+    name: docker compose up and health check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Versions
+        run: |
+          docker version
+          docker compose version
+
+      # ATRA must boot with no configuration at all: the operator supplies
+      # everything from the dashboard afterwards.
+      - name: Validate the compose file with an empty environment
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
+          echo "compose file is valid"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the image
+        run: docker compose build --pull
+
+      - name: Start and wait for the health check
+        run: |
+          docker compose up -d --wait --wait-timeout 180
+          echo "container reported healthy"
+
+      - name: Probe the API
+        run: |
+          set -e
+          curl -fsS http://127.0.0.1:3000/health | tee /tmp/health.json
+          grep -q '"status":"ok"' /tmp/health.json
+
+          # A fresh install is not ready until setup is completed, which is a
+          # 503 by design rather than a failure.
+          code=$(curl -s -o /tmp/ready.json -w '%{http_code}' http://127.0.0.1:3000/ready)
+          test "$code" = "503"
+          grep -q '"setupRequired":true' /tmp/ready.json
+
+          # PAPER is the only mode a fresh install can be in.
+          curl -fsS http://127.0.0.1:3000/api/v1/meta | tee /tmp/meta.json
+          grep -q '"mode":"PAPER"' /tmp/meta.json
+          grep -q '"modelStatus":"UNTRAINED"' /tmp/meta.json
+
+          # Wallet routes must refuse an unauthenticated caller.
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/api/v1/wallet)
+          test "$code" = "401"
+          echo "API behaves as expected"
+
+      - name: Check the container logs contain no key material
+        run: |
+          docker compose logs --no-color > /tmp/atra.log
+          if grep -qE '(0x)?[0-9a-fA-F]{64}|[1-9A-HJ-NP-Za-km-z]{86,88}' /tmp/atra.log; then
+            echo "::error::Possible key material in container logs"
+            exit 1
+          fi
+          echo "logs are clean"
+
+      - name: Restart and confirm the runtime comes back
+        run: |
+          docker compose restart
+          docker compose up -d --wait --wait-timeout 120
+          curl -fsS http://127.0.0.1:3000/health | grep -q '"status":"ok"'
+          echo "restart survived"
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs --no-color --tail=300
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+  api-only:
+    name: build without the dashboard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # A headless server does not need the frontend; this proves the backend
+      # has no build-time dependency on it.
+      - name: Build and run the API-only image
+        run: |
+          docker build --build-arg WITH_FRONTEND=0 -t atra/runtime:api-only .
+          docker run -d --name atra-api -p 3001:3000 \
+            -e ATRA_MODE=ci -e ATRA_HOST=0.0.0.0 atra/runtime:api-only
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3001/health > /tmp/health.json; then break; fi
+            sleep 2
+          done
+          cat /tmp/health.json
+          grep -q '"status":"ok"' /tmp/health.json
+
+      - name: Confirm a graceful stop
+        run: |
+          docker stop --timeout 30 atra-api
+          docker inspect atra-api --format '{{.State.ExitCode}}' | tee /tmp/exit
+          # 0 means the runtime handled SIGTERM itself; 137 would mean it was
+          # killed after the grace period.
+          test "$(cat /tmp/exit)" = "0"
+
+      - name: Logs on failure
+        if: failure()
+        run: docker logs atra-api || true
+
+      - name: Tear down
+        if: always()
+        run: docker rm -f atra-api || true

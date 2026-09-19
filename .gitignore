@@ -11,3 +11,5 @@ runtime/node_modules/
 runtime/dist/
 runtime/coverage/
 data/
+runtime/.smoke*/
+runtime/.ci-data/

@@ -1,0 +1,139 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# A push that lands while an earlier run is still going cancels it: the older
+# result is about to be irrelevant anyway.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    name: runtime (lint, typecheck, test, build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: runtime
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: runtime/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Format check
+        run: pnpm run format:check
+
+      - name: Test
+        run: pnpm run test
+
+      - name: Build
+        run: pnpm run build
+
+      # The runtime must start with an empty environment and reach /health
+      # without any credential. This is the property the container health check
+      # and `docker compose up --wait` depend on.
+      - name: Boot with no configuration
+        run: |
+          cp -r src/db/migrations dist/db/migrations
+          ATRA_MODE=ci ATRA_PORT=3999 ATRA_DATA_DIR=./.ci-data ATRA_LOG_PRETTY=0 \
+            node dist/index.js &
+          PID=$!
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3999/health > /tmp/health.json; then break; fi
+            sleep 1
+          done
+          cat /tmp/health.json
+          grep -q '"status":"ok"' /tmp/health.json
+
+          # Graceful shutdown: SIGTERM must lock the vault, checkpoint the
+          # database and exit 0 rather than being killed by the supervisor.
+          kill -TERM $PID
+          wait $PID
+          echo "exited cleanly"
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # A deliberately blunt check for the shapes that must never be committed:
+      # 32-byte hex keys, Solana secret keys, Telegram bot tokens. Test vectors
+      # published in public specifications are allowed by path.
+      - name: Scan for committed key material
+        run: |
+          set -o pipefail
+          PATTERN='(0x)?[0-9a-fA-F]{64}|[1-9A-HJ-NP-Za-km-z]{86,88}|[0-9]{8,12}:[A-Za-z0-9_-]{30,}'
+          if git grep -nIE "$PATTERN" -- \
+               ':!runtime/test/**' ':!docs/**' ':!*.lock' ':!pnpm-lock.yaml' \
+               ':!package-lock.json' ':!*.md' ':!.github/workflows/ci.yml' \
+             | grep -v 'integrity sha' ; then
+            echo "::error::Possible key material committed"
+            exit 1
+          fi
+          echo "no key material found"
+
+      - name: Ensure no .env file is committed
+        run: |
+          if git ls-files | grep -E '^\.env$|^\.env\.(local|production)$'; then
+            echo "::error::An environment file is committed"
+            exit 1
+          fi
+          echo "no environment file committed"
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: runtime
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: runtime/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+
+      # Reported, not enforced: a transitive advisory with no fix available
+      # should not block a security fix from being merged. The release
+      # checklist reviews this output.
+      - name: Audit
+        run: pnpm audit --audit-level moderate || true
+
+      - name: Fail on high or critical advisories
+        run: pnpm audit --audit-level high
