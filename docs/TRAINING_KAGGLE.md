@@ -6,13 +6,17 @@ The whole run costs nothing and needs no API key. Kaggle gives a phone-verified
 account 30 GPU-hours per week; one ATRA-4B run uses roughly one to three of
 them. The base model is Apache-2.0 and downloads anonymously from Hugging Face.
 
-> **Honesty note.** The notebook in `model/atra-4b/kaggle/atra-4b-kaggle.ipynb`
-> has been written and checked for consistency with `train.py`, `export.py`
-> and the dataset tools, but it has **not yet been executed on Kaggle**. The
-> first person to run it will find out whether Kaggle's current PyTorch and
-> the pinned `bitsandbytes`/`trl` versions agree. If they do not, fix the pins
-> in `requirements-train.txt` and the notebook, and record it in the Phase
-> report. Do not edit the UNTRAINED label until `evaluate.py` passes.
+> **Run log.** The notebook has been executed on Kaggle. Run 1 (2026-09-20)
+> **failed** at the dependency cell: `transformers==4.62.1` and
+> `huggingface_hub==0.38.2` had never been published to PyPI. Both pins are
+> fixed (4.57.6 / 0.36.2, verified against the index). The same run also
+> showed that `torch.cuda.is_bf16_supported()` returns **True on a Tesla T4**,
+> which has no bf16 hardware; `train.py` now decides from the compute
+> capability instead. Kaggle's image on that date: 2× Tesla T4 (15 GB each),
+> torch 2.10.0+cu128, Python 3.12.13.
+>
+> Everything after the dependency cell is still unproven. Do not edit the
+> UNTRAINED label until a run completes **and** `evaluate.py` passes.
 
 ## 1. Accounts (10 minutes)
 

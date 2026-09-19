@@ -92,7 +92,10 @@ def merge(adapter: Path, base: str, out: Path) -> Path:
     merged_dir.mkdir(parents=True)
 
     use_cuda = torch.cuda.is_available()
-    dtype = torch.bfloat16 if use_cuda and torch.cuda.is_bf16_supported() else torch.float16
+    # Native bf16 only (Ampere and newer); see supports_bf16 in train.py for
+    # why torch.cuda.is_bf16_supported() is the wrong question on a T4.
+    capability = torch.cuda.get_device_capability() if use_cuda else (0, 0)
+    dtype = torch.bfloat16 if capability[0] >= 8 else torch.float16
     print(f"base model : {base}")
     print(f"adapter    : {adapter}")
     print(f"dtype      : {dtype}")

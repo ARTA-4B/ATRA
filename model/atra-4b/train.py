@@ -152,6 +152,22 @@ def render_example(example: Example, tokenizer: Any) -> str:
         )
 
 
+def supports_bf16(torch_module: Any) -> bool:
+    """Whether this GPU has *native* bfloat16.
+
+    `torch.cuda.is_bf16_supported()` is not that test: on recent PyTorch it
+    answers True for a Tesla T4 (compute capability 7.5), which has no bf16
+    hardware and would run it emulated — slowly, or not at all. Ampere (8.0)
+    is the first generation with real bf16, so the capability major version is
+    the honest check. Observed on Kaggle 2026-09-20: T4, torch 2.10.0+cu128,
+    `is_bf16_supported()` returned True.
+    """
+    if not torch_module.cuda.is_available():
+        return False
+    major, _minor = torch_module.cuda.get_device_capability()
+    return bool(major >= 8)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fine-tune ATRA-4B")
     parser.add_argument("--config", type=Path, default=Path("config/default.yaml"))
@@ -225,9 +241,7 @@ def main() -> int:
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16
-            if torch.cuda.is_bf16_supported()
-            else torch.float16,
+            bnb_4bit_compute_dtype=torch.bfloat16 if supports_bf16(torch) else torch.float16,
         )
 
     model = AutoModelForCausalLM.from_pretrained(base_model, **model_kwargs)
@@ -283,8 +297,8 @@ def main() -> int:
         max_length=seq_length,
         seed=seed,
         report_to=[],
-        bf16=use_cuda and torch.cuda.is_bf16_supported(),
-        fp16=use_cuda and not torch.cuda.is_bf16_supported(),
+        bf16=use_cuda and supports_bf16(torch),
+        fp16=use_cuda and not supports_bf16(torch),
         optim=str(resolve(config, "training", "optimizer", default="paged_adamw_8bit"))
         if use_cuda
         else "adamw_torch",
