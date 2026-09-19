@@ -34,6 +34,20 @@ from typing import Any
 # swapped after the first allocation does nothing.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+# QLoRA here is single-GPU, and must say so before CUDA is initialised.
+#
+# bitsandbytes pins a 4-bit model's weights to one device, while Hugging Face's
+# Trainer silently switches to `nn.DataParallel` as soon as it sees a second
+# GPU. That combination dies in the backward pass — observed on Kaggle's 2x
+# Tesla T4 on 2026-09-20: "Caught AcceleratorError in replica 0 on device 0"
+# from `torch/nn/parallel/parallel_apply.py`, after the model had loaded and
+# tokenised fine.
+#
+# A real multi-GPU run is launched with torchrun, which sets LOCAL_RANK; that
+# case is left alone, as is an operator who chose the device themselves.
+if "LOCAL_RANK" not in os.environ:
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
 from data.checks import check, dataset_hash, load_jsonl  # noqa: E402
 from data.schema import Example  # noqa: E402
 

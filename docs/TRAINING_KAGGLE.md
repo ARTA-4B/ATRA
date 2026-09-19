@@ -15,8 +15,22 @@ them. The base model is Apache-2.0 and downloads anonymously from Hugging Face.
 > capability instead. Kaggle's image on that date: 2× Tesla T4 (15 GB each),
 > torch 2.10.0+cu128, Python 3.12.13.
 >
-> Everything after the dependency cell is still unproven. Do not edit the
-> UNTRAINED label until a run completes **and** `evaluate.py` passes.
+> Run 2 got through dependencies, the clone, the dataset (1,000 examples,
+> 800/105/95, 70 % `NO_ACTION`), the checks, the dry run and the 4-bit model
+> load (33 M trainable of 2.24 B, 1.48 %), then **failed in the first backward
+> pass**: Hugging Face's Trainer turns on `nn.DataParallel` when it sees two
+> GPUs, and a bitsandbytes 4-bit model has its weights on one device —
+> `Caught AcceleratorError in replica 0 on device 0`. `train.py` now pins
+> itself to `CUDA_VISIBLE_DEVICES=0` unless a distributed launcher set
+> `LOCAL_RANK`. Two smaller fixes came with it: the notebook's training cell
+> lacked `set -o pipefail`, so `tee` hid train.py's non-zero exit and the run
+> carried on to the export (which correctly refused a failed manifest); and
+> llama.cpp's converter requirements installed a **CPU** build of torch over
+> Kaggle's CUDA one, so only `gguf` is installed now, with `--no-deps`.
+> Both checkouts moved to `/kaggle/temp` so the notebook's output stays small.
+>
+> Training itself is still unproven. Do not edit the UNTRAINED label until a
+> run completes **and** `evaluate.py` passes.
 
 ## 1. Accounts (10 minutes)
 
