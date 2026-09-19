@@ -40,7 +40,7 @@ describe('Phase 4: liquidity routes', () => {
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
     const text = await response.text();
-    return { status: response.status, body: text ? (JSON.parse(text)) : null };
+    return { status: response.status, body: text ? JSON.parse(text) : null };
   };
 
   beforeEach(async () => {
