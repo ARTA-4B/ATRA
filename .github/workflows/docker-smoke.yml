@@ -65,7 +65,26 @@ jobs:
           # Wallet routes must refuse an unauthenticated caller.
           code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/api/v1/wallet)
           test "$code" = "401"
-          echo "API behaves as expected"
+
+          # First-run setup must work through the container's port mapping.
+          # The runtime sees this request arriving from the docker bridge, not
+          # from loopback, which is exactly the case a strict loopback check
+          # would have broken.
+          code=$(curl -s -o /tmp/setup.json -w '%{http_code}' -c /tmp/cookies.txt             -H 'content-type: application/json' -H 'x-atra-client: atra-dashboard'             -X POST http://127.0.0.1:3000/api/v1/auth/setup             -d '{"password":"correct horse battery staple"}')
+          test "$code" = "201" || { cat /tmp/setup.json; exit 1; }
+          grep -q '"vaultUnlocked":true' /tmp/setup.json
+
+          code=$(curl -s -o /tmp/wallets.json -w '%{http_code}' -b /tmp/cookies.txt             -H 'x-atra-client: atra-dashboard'             -X POST http://127.0.0.1:3000/api/v1/setup/wallets)
+          test "$code" = "201" || { cat /tmp/wallets.json; exit 1; }
+          grep -q '"family":"evm"' /tmp/wallets.json
+          grep -q '"family":"solana"' /tmp/wallets.json
+
+          # And the response must carry addresses only, never key material.
+          if grep -qE '0x[0-9a-fA-F]{64}' /tmp/wallets.json; then
+            echo "::error::Key material in the wallet creation response"
+            exit 1
+          fi
+          echo "API behaves as expected; setup works through the port mapping"
 
       - name: Check the container logs contain no key material
         run: |

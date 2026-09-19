@@ -5,7 +5,7 @@ import type { AppEnv } from '../context.js';
 import { envelope } from '../respond.js';
 import { parse } from './auth.js';
 import { AppError, ErrorCode } from '../../util/errors.js';
-import { loopbackOnly, requireSession } from '../middleware.js';
+import { localOnly, requireSession } from '../middleware.js';
 import { CHAIN_IDS } from '../../chains/registry.js';
 
 /**
@@ -86,7 +86,7 @@ export function setupRoutes(): Hono<AppEnv> {
    * cannot create a second pair of keys and strand funds at a forgotten
    * address.
    */
-  app.post('/wallets', loopbackOnly(), requireSession(), (c) => {
+  app.post('/wallets', localOnly(), requireSession(), (c) => {
     const services = c.get('services');
 
     if (!services.vault.isUnlocked) {

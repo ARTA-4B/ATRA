@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { BlockList, isIP } from 'node:net';
 import type { Context, MiddlewareHandler } from 'hono';
 import { getCookie } from 'hono/cookie';
 import { AppError, ErrorCode } from '../util/errors.js';
@@ -113,24 +114,99 @@ export function csrfGuard(corsOrigins: string[]): MiddlewareHandler<AppEnv> {
 }
 
 /**
- * Restrict a route to callers on the machine itself.
+ * Restrict a route to local callers.
  *
  * Used for setup and export: even if an operator deliberately exposes the
  * dashboard to their LAN, the paths that create or reveal key material stay
  * local.
+ *
+ * "Local" is configurable because the obvious definition — loopback — is wrong
+ * inside a container: with the port published on the host's 127.0.0.1, the
+ * runtime sees the operator's requests arriving from the bridge gateway (for
+ * example 172.17.0.1), and a strict loopback check would block first-run setup
+ * on the primary install path. Compose therefore lists the private ranges.
+ *
+ * Fails closed: a request whose source address cannot be determined is
+ * refused, not waved through.
  */
-export function loopbackOnly(): MiddlewareHandler<AppEnv> {
+export function localOnly(): MiddlewareHandler<AppEnv> {
   return async (c, next) => {
+    const list = addressListFor(c.get('services').config.localClients);
     const address = remoteAddress(c);
-    if (address && !isLoopbackAddress(address)) {
+
+    if (!address) {
+      throw new AppError(
+        ErrorCode.LOOPBACK_ONLY,
+        'This action requires a local client, and the client address could not be determined',
+      );
+    }
+
+    if (!isLocalAddress(list, address)) {
       throw new AppError(
         ErrorCode.LOOPBACK_ONLY,
         'This action can only be performed from the machine running ATRA',
         { details: { remote: address } },
       );
     }
+
     await next();
   };
+}
+
+// The matcher is built once per configuration rather than per request; the
+// config object is stable for the life of the process.
+const addressLists = new WeakMap<string[], BlockList>();
+
+function addressListFor(entries: string[]): BlockList {
+  let list = addressLists.get(entries);
+  if (!list) {
+    list = buildAddressList(entries);
+    addressLists.set(entries, list);
+  }
+  return list;
+}
+
+/**
+ * Parse a list of IPs and CIDRs into a matcher.
+ *
+ * A malformed entry throws at startup rather than being skipped: a typo in a
+ * security allowlist must not silently narrow or widen it.
+ */
+export function buildAddressList(entries: string[]): BlockList {
+  const list = new BlockList();
+
+  for (const raw of entries) {
+    const entry = raw.trim();
+    if (!entry) continue;
+
+    const [address, prefix] = entry.split('/');
+    const family = isIP(address ?? '');
+    if (family === 0) {
+      throw new AppError(ErrorCode.SCHEMA_INVALID, `Invalid local client address: ${entry}`);
+    }
+
+    const type = family === 4 ? 'ipv4' : 'ipv6';
+    if (prefix === undefined) {
+      list.addAddress(address!, type);
+    } else {
+      const bits = Number(prefix);
+      const max = family === 4 ? 32 : 128;
+      if (!Number.isInteger(bits) || bits < 0 || bits > max) {
+        throw new AppError(ErrorCode.SCHEMA_INVALID, `Invalid CIDR prefix: ${entry}`);
+      }
+      list.addSubnet(address!, bits, type);
+    }
+  }
+
+  return list;
+}
+
+export function isLocalAddress(list: BlockList, address: string): boolean {
+  // Node reports IPv4 clients on a dual-stack socket as ::ffff:a.b.c.d.
+  const clean = address.replace(/^::ffff:/i, '');
+  const family = isIP(clean);
+  if (family === 0) return false;
+  return list.check(clean, family === 4 ? 'ipv4' : 'ipv6');
 }
 
 /** Resolve the session cookie; 401 when it is missing or expired. */
@@ -182,11 +258,6 @@ function safeHostname(origin: string): string {
   } catch {
     return '';
   }
-}
-
-function isLoopbackAddress(address: string): boolean {
-  const clean = address.replace(/^::ffff:/, '');
-  return clean === '127.0.0.1' || clean === '::1' || clean.startsWith('127.');
 }
 
 function remoteAddress(c: Context<AppEnv>): string | undefined {

@@ -90,6 +90,9 @@ class TestClient {
     this.#app = app;
   }
 
+  /** The address the runtime believes the client connected from. */
+  remoteAddress: string | undefined = '127.0.0.1';
+
   async request(
     method: string,
     path: string,
@@ -102,11 +105,23 @@ class TestClient {
     if (options.reauth && this.#reauth) headers['x-atra-reauth'] = this.#reauth;
     if (body !== undefined) headers['content-type'] = 'application/json';
 
-    const response = await this.#app.request(path, {
-      method,
-      headers,
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    });
+    // @hono/node-server exposes the Node request as c.env.incoming; the local-only
+    // guard reads the socket address from it, so the test client supplies the
+    // same shape. Leaving it undefined exercises the fail-closed path.
+    const env =
+      this.remoteAddress === undefined
+        ? undefined
+        : { incoming: { socket: { remoteAddress: this.remoteAddress } } };
+
+    const response = await this.#app.request(
+      path,
+      {
+        method,
+        headers,
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      },
+      env,
+    );
 
     const setCookie = response.headers.get('set-cookie');
     if (setCookie) {
@@ -218,6 +233,76 @@ describe('ATRA HTTP API', () => {
     it('returns 404 for an unknown API path', async () => {
       const response = await client.get('/api/v1/nonexistent');
       expect(response.status).toBe(404);
+    });
+
+    it('refuses setup from a non-local address', async () => {
+      client.remoteAddress = '203.0.113.7';
+      const response = await client.post('/api/v1/auth/setup', { password: PASSWORD });
+      expect(response.status).toBe(403);
+      expect(response.body.code).toBe('LOOPBACK_ONLY');
+    });
+
+    it('fails closed when the client address is unknown', async () => {
+      client.remoteAddress = undefined;
+      const response = await client.post('/api/v1/auth/setup', { password: PASSWORD });
+      expect(response.status).toBe(403);
+      expect(response.body.code).toBe('LOOPBACK_ONLY');
+    });
+
+    it('accepts an IPv4-mapped loopback address', async () => {
+      client.remoteAddress = '::ffff:127.0.0.1';
+      const response = await client.post('/api/v1/auth/setup', { password: PASSWORD });
+      expect(response.status).toBe(201);
+    });
+
+    it('accepts a configured private range, as a container needs', async () => {
+      const config = loadConfig({
+        NODE_ENV: 'test',
+        ATRA_MODE: 'ci',
+        ATRA_LOG_LEVEL: 'silent',
+        ATRA_DATA_DIR: './.test-data',
+        ATRA_LOCAL_CLIENTS: '127.0.0.0/8,::1,172.16.0.0/12',
+      });
+      const container = buildServices(config, {
+        databaseFile: ':memory:',
+        adapters: new Map(),
+        kdfParams: FAST_KDF,
+      });
+      const bridge = new TestClient(createApp(container));
+      bridge.remoteAddress = '172.17.0.1';
+
+      const response = await bridge.post('/api/v1/auth/setup', { password: PASSWORD });
+      expect(response.status).toBe(201);
+
+      bridge.remoteAddress = '203.0.113.7';
+      const outside = await bridge.get('/api/v1/meta');
+      // Reads are fine from anywhere the host guard admits; only setup/export
+      // are local-only.
+      expect(outside.status).toBe(200);
+
+      shutdownServices(container);
+    });
+
+    it('rejects a malformed local-client entry at startup', () => {
+      const config = loadConfig({
+        NODE_ENV: 'test',
+        ATRA_MODE: 'ci',
+        ATRA_LOG_LEVEL: 'silent',
+        ATRA_DATA_DIR: './.test-data',
+        ATRA_LOCAL_CLIENTS: 'not-an-address',
+      });
+      const broken = buildServices(config, {
+        databaseFile: ':memory:',
+        adapters: new Map(),
+        kdfParams: FAST_KDF,
+      });
+      const c = new TestClient(createApp(broken));
+      // The list is built lazily on first use, and a bad entry must surface
+      // as a server error rather than silently admitting or refusing everyone.
+      return c.post('/api/v1/auth/setup', { password: PASSWORD }).then((response) => {
+        expect(response.status).toBe(422);
+        shutdownServices(broken);
+      });
     });
   });
 

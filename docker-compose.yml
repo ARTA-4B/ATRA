@@ -38,6 +38,12 @@ services:
       ATRA_PORT: "3000"
       ATRA_DATA_DIR: /data
       ATRA_LOG_PRETTY: "0"
+      # Setup and key export are restricted to "local" clients. Inside the
+      # container the operator's browser arrives from the bridge gateway
+      # (172.17.0.1 or similar), not from 127.0.0.1, so the private ranges are
+      # listed. The real boundary is the port mapping above: only the host's
+      # loopback can reach this container at all.
+      ATRA_LOCAL_CLIENTS: "127.0.0.0/8,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 
     healthcheck:
       # node, not wget: the slim base image has no wget, and a health check

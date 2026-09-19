@@ -4,7 +4,7 @@ import type { AppEnv } from '../context.js';
 import { envelope } from '../respond.js';
 import { parse } from './auth.js';
 import { AppError, ErrorCode } from '../../util/errors.js';
-import { REAUTH_HEADER, loopbackOnly, requireSession } from '../middleware.js';
+import { REAUTH_HEADER, localOnly, requireSession } from '../middleware.js';
 import { CHAIN_IDS, CHAINS } from '../../chains/registry.js';
 import type { ChainId } from '../../chains/registry.js';
 
@@ -136,7 +136,7 @@ export function walletRoutes(): Hono<AppEnv> {
    * explicit warning, and the audit row records that an export happened without
    * recording what was exported.
    */
-  app.post('/export', loopbackOnly(), async (c) => {
+  app.post('/export', localOnly(), async (c) => {
     const services = c.get('services');
     const session = c.get('session')!;
     const body = await parse(c, exportSchema);

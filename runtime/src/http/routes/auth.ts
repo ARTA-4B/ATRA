@@ -4,7 +4,7 @@ import { z } from 'zod';
 import type { AppEnv } from '../context.js';
 import { envelope, invalid } from '../respond.js';
 import { AppError, ErrorCode } from '../../util/errors.js';
-import { SESSION_COOKIE, REAUTH_HEADER, loopbackOnly, requireSession } from '../middleware.js';
+import { SESSION_COOKIE, REAUTH_HEADER, localOnly, requireSession } from '../middleware.js';
 
 /**
  * Authentication routes.
@@ -60,7 +60,7 @@ export function authRoutes(): Hono<AppEnv> {
    * response carries a session so the wizard can continue without a second
    * prompt.
    */
-  app.post('/setup', loopbackOnly(), async (c) => {
+  app.post('/setup', localOnly(), async (c) => {
     const services = c.get('services');
     const body = await parse(c, passwordSchema);
 

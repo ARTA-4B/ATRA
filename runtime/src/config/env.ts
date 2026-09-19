@@ -54,6 +54,14 @@ const envSchema = z.object({
   /** Opt-in CORS origins. Empty means same-origin only. */
   ATRA_CORS_ORIGINS: z.string().optional(),
 
+  /**
+   * Client addresses treated as "this machine" for setup and key export, as a
+   * comma-separated list of IPs or CIDRs. Defaults to loopback. Inside a
+   * container the operator's requests arrive from the bridge gateway rather
+   * than 127.0.0.1, so compose sets this to the private ranges.
+   */
+  ATRA_LOCAL_CLIENTS: z.string().optional(),
+
   /** Idle minutes before the vault key is dropped from memory. */
   ATRA_AUTOLOCK_MINUTES: z.coerce.number().int().min(1).max(1440).default(30),
 
@@ -84,6 +92,7 @@ export interface RuntimeConfig {
   log: { level: LogLevel; pretty: boolean };
   hostAllowlist: string[];
   corsOrigins: string[];
+  localClients: string[];
   autolockMs: number;
   rpcOverrides: {
     base: string | undefined;
@@ -153,6 +162,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig 
     },
     hostAllowlist: splitList(raw.ATRA_HOST_ALLOWLIST),
     corsOrigins: splitList(raw.ATRA_CORS_ORIGINS),
+    localClients: raw.ATRA_LOCAL_CLIENTS
+      ? splitList(raw.ATRA_LOCAL_CLIENTS)
+      : ['127.0.0.0/8', '::1'],
     autolockMs: raw.ATRA_AUTOLOCK_MINUTES * 60_000,
     rpcOverrides: {
       base: raw.ATRA_RPC_BASE,
