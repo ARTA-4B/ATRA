@@ -258,7 +258,13 @@ def main() -> int:
     # agreement.
     compute_dtype = torch.bfloat16 if supports_bf16(torch) else torch.float16
     if use_cuda:
-        model_kwargs["torch_dtype"] = compute_dtype
+        # transformers renamed this keyword from `torch_dtype` to `dtype` in
+        # 4.56; an unknown keyword is swallowed silently, so ask the signature
+        # rather than guess.
+        import inspect
+
+        parameters = inspect.signature(AutoModelForCausalLM.from_pretrained).parameters
+        model_kwargs["dtype" if "dtype" in parameters else "torch_dtype"] = compute_dtype
 
     if load_in_4bit:
         from transformers import BitsAndBytesConfig
@@ -292,6 +298,23 @@ def main() -> int:
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, peft_config)
+
+    # Every trainable parameter in float32, whatever the base load produced.
+    #
+    # fp16 AMP scales the loss and then unscales the gradients, and that
+    # unscale kernel does not exist for bfloat16:
+    #   "_amp_foreach_non_finite_check_and_unscale_cuda" not implemented for 'BFloat16'
+    # (Kaggle, 2026-09-20, twice — the second time with the model loaded in
+    # float16, which proves the bfloat16 came from the adapter side, not the
+    # checkpoint). Float32 adapter weights are the standard QLoRA recipe
+    # anyway: the memory cost is a rounding error against the frozen 4-bit
+    # base, and the optimiser is better conditioned for it.
+    for parameter in model.parameters():
+        if parameter.requires_grad and parameter.dtype in (torch.float16, torch.bfloat16):
+            parameter.data = parameter.data.to(torch.float32)
+
+    observed = sorted({str(p.dtype) for p in model.parameters() if p.requires_grad})
+    print(f"trainable dtype: {', '.join(observed)}")
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())

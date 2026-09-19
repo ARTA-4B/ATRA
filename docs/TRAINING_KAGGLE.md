@@ -36,6 +36,13 @@ them. The base model is Apache-2.0 and downloads anonymously from Hugging Face.
 > kept it, so fp16 AMP's gradient scaler met bfloat16 gradients. `train.py`
 > now loads the model in the same dtype it trains in.
 >
+> Run 4 printed `dtype: torch.float16` and hit the **same** bfloat16 unscale
+> error, which ruled the checkpoint out as the source: the adapter weights
+> were the bfloat16 ones. `train.py` now casts every trainable parameter to
+> float32 after `get_peft_model` (the standard QLoRA recipe) and prints the
+> dtypes it actually observes, and it picks the `dtype` / `torch_dtype`
+> keyword from the installed transformers' signature instead of assuming.
+>
 > Training itself is still unproven. Do not edit the UNTRAINED label until a
 > run completes **and** `evaluate.py` passes.
 
