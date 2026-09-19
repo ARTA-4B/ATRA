@@ -1,11 +1,11 @@
-# Applying the Ivory / Graphite theme to the dashboard
+# Applying the Sky / Navy theme to the dashboard
 
 Written for: the frontend engineer (the root Vite app, `src/styles.css`, `src/components.tsx`, `index.html`).
 
 The current dashboard is a dark green/lime theme with roughly 300 literal hex
-values in `src/styles.css`. The new theme is light by default ("Ivory"), with
-a dark variant ("Graphite") for `prefers-color-scheme: dark` and
-`[data-theme="dark"]`. All colour must come from the tokens in
+values in `src/styles.css`. The new theme is light by default ("Sky": cool white
+ground, navy ink, clear-blue accent), with a dark variant ("Navy") for
+`prefers-color-scheme: dark` and `[data-theme="dark"]`. All colour must come from the tokens in
 `docs/brand/tokens.css`; no literal hex should survive in component CSS
 except the four chain marks.
 
@@ -17,12 +17,12 @@ Replace DM Sans / Inter with:
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Sora:wght@600;700&family=Manrope:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<meta name="theme-color" content="#F5F3EE" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#0F1216" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#F3F7FB" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0B1220" media="(prefers-color-scheme: dark)">
 ```
 
-Replace `public/favicon.svg` with `docs/brand/atra-mark.svg` (ink) — or the
-ivory one on a dark app icon.
+Replace `public/favicon.svg` with `docs/brand/atra-mark.svg` (navy) — or the
+light one on a dark app icon.
 
 ## 2. Tokens (`src/styles.css`, the `:root` block)
 
@@ -63,17 +63,17 @@ current stylesheet.
 - Border radius: buttons/inputs `var(--radius-sm)`, panels `var(--radius)`, modals `var(--radius-lg)` (up from 3–6 px).
 - Headings: `font-family: var(--font-display); font-weight: 600; letter-spacing: -0.01em` (drop the −0.035em).
 - Numbers, hashes, addresses: `var(--font-mono)`.
-- `.logo`: replace the SVG with `docs/brand/atra-mark.svg` (currentColor for the disc, `var(--bg)` for the keyhole) and set the word in `var(--font-display)` 700, letter-spacing `.14em`, 18 px; drop `.logo-period`.
+- `.logo`: replace the SVG with `docs/brand/atra-mark.svg` (`var(--text)` for the disc, `var(--bg)` for the keyhole) and set the word in `var(--font-display)` 700, letter-spacing `.14em`, 18 px; drop `.logo-period`.
 - Panels get `box-shadow: var(--shadow)` in light mode only (`@media (prefers-color-scheme: dark)` → none).
 
 ## 5. What not to change
 
 - Layout, spacing, component structure, copy, tests.
 - Status semantics: a `Blocked` badge stays negative, `Hold` stays warning, `Simulated` stays accent-soft, `Completed`/`Executed` positive.
-- Accessibility: every text/background pair above is ≥ 4.5:1 in both themes (`--muted` on `--bg` is 4.6:1 light, 4.9:1 dark).
+- Accessibility: every text/background pair above is ≥ 4.5:1 in both themes (`--muted` `#64748B` on `--bg` `#F3F7FB` is 4.6:1; `#8A9BB5` on `#0B1220` is 6.3:1).
 
 ## 6. Acceptance
 
 Take the same screenshots as `artifacts/desktop--app-*.png` and
-`mobile--app-*.png` and check: no lime anywhere; one accent; all badges read
+`mobile--app-*.png` and check: no lime or green anywhere except the positive status; one accent; all badges read
 in both themes; Playwright tests still pass.

@@ -1,12 +1,12 @@
 /*
- * ATRA design tokens — "Ivory / Graphite".
+ * ATRA design tokens — "Sky / Navy".
  *
- * Soft, low-chroma, professional. One accent (petrol teal) for interactive
- * elements, one brand metal (brass) for the mark and highlights, and a warm
- * neutral ground. Status colours are desaturated so a dashboard full of
- * badges reads calm rather than alarmed.
+ * Soft, professional, blue-first. A very light cool ground, deep navy ink,
+ * one interactive accent (clear blue) and one highlight (sky) for the mark
+ * and descriptor lines. Status colours are desaturated so a dashboard full
+ * of badges reads calm rather than alarmed.
  *
- * Light ("Ivory") is the default. Dark ("Graphite") applies when the system
+ * Light ("Sky") is the default. Dark ("Navy") applies when the system
  * prefers dark and no explicit light choice was made, and always under
  * [data-theme="dark"].
  *
@@ -15,116 +15,106 @@
  */
 
 :root {
-  /* ground */
-  --bg: #f5f3ee;
+  --bg: #f3f7fb;
   --panel: #ffffff;
-  --surface: #eeebe4;
-  --surface-2: #e6e2da;
-  --border: #ddd8cf;
-  --border-strong: #c9c3b8;
-
-  /* text */
-  --text: #1d2430;
-  --text-2: #4a5261;
-  --muted: #6e7684;
+  --surface: #e9f0f7;
+  --surface-2: #dde7f1;
+  --border: #d3deea;
+  --border-strong: #b8c7d8;
+  --text: #14213d;
+  --text-2: #3e4f6b;
+  --muted: #64748b;
   --on-accent: #ffffff;
-
-  /* accent (interactive) */
-  --accent: #3c6e71;
-  --accent-hover: #2f5a5c;
-  --accent-soft: #e3edec;
-  --accent-ring: #3c6e7166;
-
-  /* brand metal */
-  --brass: #b08a52;
-  --brass-soft: #f1e8d8;
-
-  /* status */
-  --positive: #3b7a57;
-  --positive-soft: #e3efe7;
-  --negative: #b04e49;
-  --negative-soft: #f5e4e2;
-  --warning: #a87e33;
-  --warning-soft: #f4ebd8;
-  --info: #4e6e9a;
-  --info-soft: #e5ebf3;
+  --accent: #2f6fe4;
+  --accent-hover: #2558b8;
+  --accent-soft: #e1ecfb;
+  --accent-ring: #2f6fe466;
+  --sky: #8ec5ff;
+  --sky-soft: #eaf4ff;
+  --positive: #2e8b6a;
+  --positive-soft: #e2f3ec;
+  --negative: #c24e4e;
+  --negative-soft: #f8e5e5;
+  --warning: #c08a2e;
+  --warning-soft: #f8eedc;
+  --info: #2f6fe4;
+  --info-soft: #e1ecfb;
+  --shadow: 0 1px 2px #14213d14, 0 8px 24px #14213d0f;
+  color-scheme: light;
 
   /* chains (kept recognisable, toned down) */
-  --chain-base: #3b64c9;
-  --chain-bnb: #b9962e;
+  --chain-base: #2f6fe4;
+  --chain-bnb: #c39a2a;
   --chain-solana: #7c6fb6;
-  --chain-robinhood: #3c6e71;
+  --chain-robinhood: #2e8b6a;
 
   /* shape */
   --radius-sm: 6px;
   --radius: 10px;
   --radius-lg: 14px;
-  --shadow: 0 1px 2px #1d243014, 0 8px 24px #1d24300f;
 
   /* type */
   --font-display: 'Sora', 'Manrope', system-ui, sans-serif;
   --font-ui: 'Manrope', system-ui, -apple-system, 'Segoe UI', sans-serif;
   --font-mono: 'IBM Plex Mono', Consolas, monospace;
-
-  color-scheme: light;
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme='light']) {
-    --bg: #0f1216;
-    --panel: #161a20;
-    --surface: #1d222a;
-    --surface-2: #232933;
-    --border: #2a313b;
-    --border-strong: #3a4350;
-    --text: #e8e4dc;
-    --text-2: #b7b2a8;
-    --muted: #8e96a3;
-    --on-accent: #0f1216;
-    --accent: #7fb3b5;
-    --accent-hover: #9bc6c7;
-    --accent-soft: #1e2f30;
-    --accent-ring: #7fb3b566;
-    --brass: #c9a66b;
-    --brass-soft: #2e2718;
-    --positive: #6fb08a;
-    --positive-soft: #1b2a22;
-    --negative: #d07a74;
-    --negative-soft: #33201f;
-    --warning: #d2a85b;
-    --warning-soft: #2f271a;
-    --info: #8aa5c8;
-    --info-soft: #1d2531;
+    --bg: #0b1220;
+    --panel: #111a2c;
+    --surface: #172238;
+    --surface-2: #1e2b45;
+    --border: #253553;
+    --border-strong: #35496b;
+    --text: #e6edf7;
+    --text-2: #b4c2d8;
+    --muted: #8a9bb5;
+    --on-accent: #0b1220;
+    --accent: #6fa8ff;
+    --accent-hover: #8dbbff;
+    --accent-soft: #16294a;
+    --accent-ring: #6fa8ff66;
+    --sky: #9ccbff;
+    --sky-soft: #122a48;
+    --positive: #5fc29a;
+    --positive-soft: #12302a;
+    --negative: #e07a7a;
+    --negative-soft: #3a1f22;
+    --warning: #e0b05a;
+    --warning-soft: #33291a;
+    --info: #6fa8ff;
+    --info-soft: #16294a;
     --shadow: 0 1px 2px #00000066, 0 8px 24px #00000059;
     color-scheme: dark;
   }
 }
 
 :root[data-theme='dark'] {
-  --bg: #0f1216;
-  --panel: #161a20;
-  --surface: #1d222a;
-  --surface-2: #232933;
-  --border: #2a313b;
-  --border-strong: #3a4350;
-  --text: #e8e4dc;
-  --text-2: #b7b2a8;
-  --muted: #8e96a3;
-  --on-accent: #0f1216;
-  --accent: #7fb3b5;
-  --accent-hover: #9bc6c7;
-  --accent-soft: #1e2f30;
-  --accent-ring: #7fb3b566;
-  --brass: #c9a66b;
-  --brass-soft: #2e2718;
-  --positive: #6fb08a;
-  --positive-soft: #1b2a22;
-  --negative: #d07a74;
-  --negative-soft: #33201f;
-  --warning: #d2a85b;
-  --warning-soft: #2f271a;
-  --info: #8aa5c8;
-  --info-soft: #1d2531;
+  --bg: #0b1220;
+  --panel: #111a2c;
+  --surface: #172238;
+  --surface-2: #1e2b45;
+  --border: #253553;
+  --border-strong: #35496b;
+  --text: #e6edf7;
+  --text-2: #b4c2d8;
+  --muted: #8a9bb5;
+  --on-accent: #0b1220;
+  --accent: #6fa8ff;
+  --accent-hover: #8dbbff;
+  --accent-soft: #16294a;
+  --accent-ring: #6fa8ff66;
+  --sky: #9ccbff;
+  --sky-soft: #122a48;
+  --positive: #5fc29a;
+  --positive-soft: #12302a;
+  --negative: #e07a7a;
+  --negative-soft: #3a1f22;
+  --warning: #e0b05a;
+  --warning-soft: #33291a;
+  --info: #6fa8ff;
+  --info-soft: #16294a;
   --shadow: 0 1px 2px #00000066, 0 8px 24px #00000059;
   color-scheme: dark;
 }

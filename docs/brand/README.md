@@ -5,16 +5,16 @@ Written for: whoever sets up ATRA's public profiles and whoever restyles the das
 ## The mark
 
 A solid disc with a keyhole cut out of it: the vault. It says the one thing
-ATRA promises before anything else — the keys stay with you. Ink on ivory or
-ivory on ink, one flat shape, no strokes, no gradients, no glow. It reads at
-24 px and at 800 px.
+ATRA promises before anything else — the keys stay with you. Navy on sky
+white, or white on navy, one flat shape, no strokes, no gradients, no glow.
+It reads at 24 px and at 800 px.
 
 | File | Use |
 |---|---|
-| `atra-mark.svg` | ink mark on transparent (light backgrounds) |
-| `atra-mark-ivory.svg` | ivory mark on transparent (dark backgrounds) |
-| `pp-ink-800.png` | **profile picture** (X, GitHub, Telegram) — ink background; platforms crop it to a circle |
-| `pp-ivory-800.png` | profile picture, light variant |
+| `atra-mark.svg` | navy mark on transparent (light backgrounds) |
+| `atra-mark-light.svg` | white mark on transparent (dark backgrounds) |
+| `pp-navy-800.png` | **profile picture** (X, GitHub, Telegram) — navy background; platforms crop it to a circle |
+| `pp-sky-800.png` | profile picture, light variant |
 | `logo-horizontal-light.png` | mark + wordmark for light backgrounds (transparent PNG) |
 | `logo-horizontal-dark.png` | mark + wordmark for dark backgrounds (transparent PNG) |
 | `x-banner-1500x500.png` | **X header**, dark. The avatar overlaps the lower-left corner on X; the chain line sits above that zone at 1500×500 but check after upload |
@@ -26,26 +26,26 @@ root (uses the repository's Playwright Chromium). Sources are in `src/`.
 ## Wordmark
 
 "ATRA" set in **Sora** 700, uppercase, letter-spacing 0.14em. The descriptor
-line under it ("SELF-HOSTED AUTONOMOUS CRYPTO AGENT") is Manrope 600, brass,
+line under it ("SELF-HOSTED AUTONOMOUS CRYPTO AGENT") is Manrope 600, accent blue on light / sky on dark,
 letter-spacing 0.34em. Nothing else is added to the lockup.
 
 ## Colour
 
-Tokens in `tokens.css`. The palette is deliberately quiet:
+Tokens in `tokens.css`. Blue-first, deliberately quiet:
 
 | Token | Light | Dark | Role |
 |---|---|---|---|
-| `--bg` | `#F5F3EE` | `#0F1216` | page ground (warm ivory / graphite) |
-| `--panel` | `#FFFFFF` | `#161A20` | cards |
-| `--surface` | `#EEEBE4` | `#1D222A` | inputs, table headers |
-| `--border` | `#DDD8CF` | `#2A313B` | hairlines |
-| `--text` | `#1D2430` | `#E8E4DC` | ink |
-| `--muted` | `#6E7684` | `#8E96A3` | secondary text (4.5:1 on ground) |
-| `--accent` | `#3C6E71` | `#7FB3B5` | the one interactive colour (petrol teal) |
-| `--brass` | `#B08A52` | `#C9A66B` | the mark, highlights, the wordmark period |
-| `--positive` | `#3B7A57` | `#6FB08A` | gains, confirmed |
-| `--negative` | `#B04E49` | `#D07A74` | losses, failed, emergency |
-| `--warning` | `#A87E33` | `#D2A85B` | stale data, low gas |
+| `--bg` | `#F3F7FB` | `#0B1220` | page ground (cool white / navy) |
+| `--panel` | `#FFFFFF` | `#111A2C` | cards |
+| `--surface` | `#E9F0F7` | `#172238` | inputs, table headers |
+| `--border` | `#D3DEEA` | `#253553` | hairlines |
+| `--text` | `#14213D` | `#E6EDF7` | navy ink |
+| `--muted` | `#64748B` | `#8A9BB5` | secondary text (>= 4.5:1 on ground) |
+| `--accent` | `#2F6FE4` | `#6FA8FF` | the one interactive colour (clear blue) |
+| `--sky` | `#8EC5FF` | `#9CCBFF` | highlight: descriptor lines, selected states, the mark on dark |
+| `--positive` | `#2E8B6A` | `#5FC29A` | gains, confirmed |
+| `--negative` | `#C24E4E` | `#E07A7A` | losses, failed, emergency |
+| `--warning` | `#C08A2E` | `#E0B05A` | stale data, low gas |
 
 Rules: one accent per screen; status colours only on status; never colour a
 number by sign alone without the sign itself; no lime, no neon, no gradients.
@@ -70,7 +70,7 @@ https://fonts.googleapis.com/css2?family=Sora:wght@600;700&family=Manrope:wght@4
 - **Bio, Indonesian (154):** Agen kripto otonom open-source yang lo host sendiri untuk Base, BNB Smart Chain, Robinhood Chain & Solana. Kunci tetap di mesin lo. Paper mode by default.
 - **Website:** https://github.com/lamaokamg-hub/ATRA
 - **Location:** Self-hosted
-- **Profile picture:** `pp-ink-800.png` · **Header:** `x-banner-1500x500.png`
+- **Profile picture:** `pp-navy-800.png` · **Header:** `x-banner-1500x500.png`
 
 Do not put performance, returns or "AI-powered profits" anywhere in the
 profile. The product's claim is control, not yield.
