@@ -26,6 +26,12 @@ import { LiveExecutor } from '../execution/live.js';
 import { ExecutionRegistry, buildExecutionRegistry } from '../execution/registry.js';
 import type { ExecutionAdapter } from '../execution/types.js';
 import { WithdrawalService } from '../wallet/withdrawal.js';
+import { LiquidityService } from '../liquidity/service.js';
+import { LiquidityRegistry, buildLiquidityRegistry } from '../liquidity/registry.js';
+import type { LpAdapter } from '../liquidity/types.js';
+import { TelegramService } from '../telegram/service.js';
+import type { TelegramTransport } from '../telegram/transport.js';
+import { readTelegramSecrets } from '../config/env.js';
 import type { LlmProvider } from '../llm/provider.js';
 import type { ChainId } from '../chains/registry.js';
 import type { ChainAdapter } from '../chains/types.js';
@@ -68,6 +74,9 @@ export interface Services {
   pipeline: AutoTradePipeline;
   scheduler: AutoTradeScheduler;
   withdrawals: WithdrawalService;
+  // Phase 4
+  liquidity: LiquidityService;
+  telegram: TelegramService;
   startedAt: Date;
 }
 
@@ -84,6 +93,10 @@ export interface BuildOptions {
   llm?: LlmProvider;
   /** Override the market data providers, for tests. */
   marketProviders?: MarketDataProvider[];
+  /** Inject liquidity-pool adapters, for tests. Default: none in CI, real ones otherwise. */
+  liquidityAdapters?: LpAdapter[];
+  /** Inject a Telegram transport, for tests. `null` forces "not configured". */
+  telegramTransport?: TelegramTransport | null;
   /**
    * Weaker key-derivation parameters, so a test suite is not dominated by
    * Argon2. Only ever set from test code; the production entry point leaves it
@@ -172,10 +185,64 @@ export function buildServices(config: RuntimeConfig, options: BuildOptions = {})
   const scheduler = new AutoTradeScheduler({ db, state, audit, pipeline });
   const withdrawals = new WithdrawalService({ db, audit, wallets, state, market, adapters });
 
-  // An emergency stop disarms the schedule outright; the operator re-enables
-  // it deliberately after clearing the stop.
+  // --- Phase 4: liquidity --------------------------------------------------
+  const liquidityRegistry =
+    options.liquidityAdapters !== undefined
+      ? new LiquidityRegistry(options.liquidityAdapters)
+      : (options.withAdapters ?? !config.isCi)
+        ? buildLiquidityRegistry(config)
+        : new LiquidityRegistry([]);
+  const liquidity = new LiquidityService({
+    db,
+    audit,
+    state,
+    ledger,
+    trades,
+    gate,
+    policy: riskPolicy,
+    wallets,
+    market,
+    llm,
+    registry: liquidityRegistry,
+  });
+
+  // --- Phase 4: Telegram ---------------------------------------------------
+  const telegram = new TelegramService({
+    db,
+    audit,
+    state,
+    ledger,
+    trades,
+    riskPolicy,
+    wallets,
+    market,
+    scheduler,
+    config,
+    llm,
+    // /lp answers from the liquidity view; the bot never reaches into the
+    // pipeline itself.
+    liquidity: {
+      summary: () => Promise.resolve(lpSummary(liquidity)),
+    },
+    secrets: readTelegramSecrets(),
+    ...(options.telegramTransport !== undefined ? { transport: options.telegramTransport } : {}),
+    startedAt: new Date(),
+  });
+
+  // An emergency stop disarms both schedules outright and tells the operator's
+  // phone; the operator re-enables them deliberately after clearing the stop.
   state.onEmergencyStop((active, reason) => {
-    if (active) scheduler.disableForEmergency(reason ?? 'emergency stop');
+    if (active) {
+      scheduler.disableForEmergency(reason ?? 'emergency stop');
+      liquidity.onEmergencyStop(active, reason);
+    }
+    telegram.onEmergencyStop(active, reason);
+  });
+  state.onPauseChanged((paused, reason, actor) => {
+    telegram.onPauseChanged(paused, reason, actor);
+  });
+  pipeline.onCycle((report) => {
+    void telegram.onCycleReport(report);
   });
 
   log.info(
@@ -211,8 +278,29 @@ export function buildServices(config: RuntimeConfig, options: BuildOptions = {})
     pipeline,
     scheduler,
     withdrawals,
+    liquidity,
+    telegram,
     startedAt: new Date(),
   };
+}
+
+/**
+ * One line for the Telegram `/lp` command.
+ *
+ * Built from the same view the dashboard shows, so the two can never disagree;
+ * an unpriced position is reported as unknown rather than as zero.
+ */
+function lpSummary(liquidity: LiquidityService): string {
+  const view = liquidity.view(5);
+  const lines = [
+    `LP value ${view.summary.totalValueUsd} USD across ${String(view.summary.activePositions)} position(s)`,
+    `Unclaimed fees ${view.summary.unclaimedFeesUsd} USD · ${String(view.summary.requiresAttention)} need attention`,
+    `Automation ${view.automation.enabled ? 'on' : 'off'}${view.automation.nextRunAt ? ` · next ${view.automation.nextRunAt}` : ''}`,
+  ];
+  for (const position of view.positions.slice(0, 5)) {
+    lines.push(`${position.chain} ${position.pool}: ${position.valueUsd} USD (${position.status})`);
+  }
+  return lines.join('\n');
 }
 
 /**
@@ -290,11 +378,31 @@ export async function startBackgroundServices(services: Services): Promise<void>
     });
   }
   services.scheduler.start();
+
+  const lp = await services.liquidity.start();
+  if (lp.checked > 0) {
+    log.warn(lp, 'reconciled in-flight LP actions from a previous run');
+  }
+
+  await services.telegram.start();
+}
+
+/**
+ * Stop the background work that needs to finish cleanly: the Telegram
+ * transport gets a moment to send its offline notice before the database
+ * closes. Called from the signal handler, not from {@link shutdownServices},
+ * which stays synchronous for the tests that tear a runtime down in place.
+ */
+export async function stopBackgroundServices(services: Services): Promise<void> {
+  await services.telegram.stop();
+  services.liquidity.stop();
+  services.scheduler.stop();
 }
 
 /** Release everything. Safe to call more than once. */
 export function shutdownServices(services: Services): void {
   services.scheduler.stop();
+  services.liquidity.stop();
   services.vault.lock();
   closeDatabase(services.db);
 }

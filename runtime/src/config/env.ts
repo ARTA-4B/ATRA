@@ -77,6 +77,26 @@ const envSchema = z.object({
   ATRA_LLM_MODEL: z.string().min(1).optional(),
   /** Name of the environment variable holding the LLM key, never the key. */
   ATRA_LLM_API_KEY_ENV: z.string().min(1).optional(),
+
+  /**
+   * Telegram, transport A: the official ATRA gateway. The runtime dials out
+   * to the gateway over WebSocket with the installation token; the project's
+   * bot token stays on the gateway and never reaches an installation.
+   */
+  ATRA_GATEWAY_URL: z.url().optional(),
+  ATRA_GATEWAY_TOKEN: z.string().min(1).max(512).optional(),
+
+  /**
+   * Telegram, transport B: the operator's own bot, long-polled directly. Used
+   * only when no gateway URL is set. The token is read here, handed to the
+   * transport, and never written to the database, a log line or a message.
+   */
+  ATRA_TELEGRAM_BOT_TOKEN: z.string().min(1).max(512).optional(),
+  /** The bot's @username, for the dashboard's "open the bot" link. */
+  ATRA_TELEGRAM_BOT_USERNAME: z
+    .string()
+    .regex(/^@?[A-Za-z][A-Za-z0-9_]{3,31}$/, 'must be a Telegram bot username')
+    .optional(),
 });
 
 export type RawEnv = z.infer<typeof envSchema>;
@@ -105,6 +125,41 @@ export interface RuntimeConfig {
     url: string | undefined;
     model: string | undefined;
     apiKeyEnv: string | undefined;
+  };
+  /**
+   * Telegram transport selection. The tokens themselves are deliberately not
+   * on this object: a config object gets logged and passed around, and the
+   * secrets are read from the environment by {@link readTelegramSecrets} at
+   * the one place that constructs the transport.
+   */
+  telegram: {
+    transport: 'gateway' | 'direct' | 'none';
+    gatewayUrl: string | undefined;
+    gatewayTokenConfigured: boolean;
+    botTokenConfigured: boolean;
+    /** Without the leading @. */
+    botUsername: string | undefined;
+  };
+}
+
+export interface TelegramSecrets {
+  gatewayToken: string | undefined;
+  botToken: string | undefined;
+}
+
+/**
+ * The Telegram secrets, read straight from the environment.
+ *
+ * Kept separate from {@link RuntimeConfig} so the config object can be logged
+ * without a redaction step ever being the only thing between a token and a
+ * log line. Called once, by the composition root, when the transport is built.
+ */
+export function readTelegramSecrets(env: NodeJS.ProcessEnv = process.env): TelegramSecrets {
+  const gatewayToken = env['ATRA_GATEWAY_TOKEN']?.trim();
+  const botToken = env['ATRA_TELEGRAM_BOT_TOKEN']?.trim();
+  return {
+    gatewayToken: gatewayToken ? gatewayToken : undefined,
+    botToken: botToken ? botToken : undefined,
   };
 }
 
@@ -142,6 +197,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig 
 
   const raw = parsed.data;
   const isProd = raw.NODE_ENV === 'production';
+
+  // A gateway URL without its token can only produce a loop of refused
+  // connections; fail at boot instead, where the operator is watching.
+  if (raw.ATRA_GATEWAY_URL !== undefined && raw.ATRA_GATEWAY_TOKEN === undefined) {
+    throw new AppError(ErrorCode.SCHEMA_INVALID, 'Invalid environment configuration', {
+      errors: [{ path: 'ATRA_GATEWAY_TOKEN', message: 'required when ATRA_GATEWAY_URL is set' }],
+    });
+  }
+  if (
+    raw.ATRA_GATEWAY_URL !== undefined &&
+    !/^(https?|wss?):$/.test(new URL(raw.ATRA_GATEWAY_URL).protocol)
+  ) {
+    throw new AppError(ErrorCode.SCHEMA_INVALID, 'Invalid environment configuration', {
+      errors: [{ path: 'ATRA_GATEWAY_URL', message: 'must be an http(s) or ws(s) URL' }],
+    });
+  }
   const dataDir = raw.ATRA_DATA_DIR
     ? isAbsolute(raw.ATRA_DATA_DIR)
       ? raw.ATRA_DATA_DIR
@@ -177,6 +248,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig 
       url: raw.ATRA_LLM_URL,
       model: raw.ATRA_LLM_MODEL,
       apiKeyEnv: raw.ATRA_LLM_API_KEY_ENV,
+    },
+    telegram: {
+      // Gateway wins when both are configured: the official bot is the
+      // supported path and the direct bot is the self-hosted fallback. CI mode
+      // never opens a transport.
+      transport:
+        raw.ATRA_MODE === 'ci'
+          ? 'none'
+          : raw.ATRA_GATEWAY_URL !== undefined
+            ? 'gateway'
+            : raw.ATRA_TELEGRAM_BOT_TOKEN !== undefined
+              ? 'direct'
+              : 'none',
+      gatewayUrl: raw.ATRA_GATEWAY_URL,
+      gatewayTokenConfigured: raw.ATRA_GATEWAY_TOKEN !== undefined,
+      botTokenConfigured: raw.ATRA_TELEGRAM_BOT_TOKEN !== undefined,
+      botUsername: raw.ATRA_TELEGRAM_BOT_USERNAME?.replace(/^@/, ''),
     },
   };
 }

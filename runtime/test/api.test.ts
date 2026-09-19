@@ -930,6 +930,25 @@ describe('Phase 3 routes', () => {
     expect(submit.body.code).toBe('REAUTH_REQUIRED');
   });
 
+  it('mounts the liquidity and telegram routers on the app', async () => {
+    // The routers are unit-tested on their own; this proves createApp wires
+    // them, which a mounting mistake would otherwise hide until runtime.
+    const liquidity = await client.get('/api/v1/liquidity');
+    expect(liquidity.status).toBe(200);
+    expect(liquidity.body.data.positions).toEqual([]);
+    expect(liquidity.body.data.automation.enabled).toBe(false);
+
+    const telegram = await client.get('/api/v1/telegram');
+    expect(telegram.status).toBe(200);
+    expect(telegram.body.data.configured).toBe(false);
+    expect(telegram.body.data.paired).toBe(false);
+
+    // Pairing is refused while no transport is configured, rather than
+    // handing out a code that could never be redeemed.
+    const pair = await client.post('/api/v1/telegram/pair', {});
+    expect(pair.status).toBe(409);
+  });
+
   it('lists withdrawals as an empty history before any are made', async () => {
     const response = await client.get('/api/v1/wallet/transactions');
     expect(response.status).toBe(200);

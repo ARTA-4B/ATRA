@@ -20,6 +20,7 @@ import {
   PERMIT2,
   makeAction,
   makeInput,
+  makePolicy,
   makeSnapshot,
   makeSolanaAction,
   makeState,
@@ -118,18 +119,79 @@ describe('review: exit privileges belong to swaps only', () => {
   });
 });
 
-describe('review: LP kinds are refused until Phase 4 exists', () => {
+describe('review: LP kinds are never evaluated as swaps', () => {
+  // Phase 4 replaced the blanket "lp actions are not enabled" refusal with
+  // real LP checks. The invariant the review pinned down still holds: with
+  // the default policy (LP disabled: no pools, zero capital) every lp_* kind
+  // is rejected, and it is rejected by an LP check, not approved by the swap
+  // checks.
+  const AERODROME = '0xcf77a3ba9a5ca399b7c97c74d54e5b1beb874e43';
+  const POOL = '0xcdac0d6c6c59727a65f871236188350531885c43';
+
+  function lpAction(kind: 'lp_add' | 'lp_remove' | 'lp_rebalance' | 'lp_claim') {
+    const base = {
+      kind,
+      protocol: 'aerodrome-v2',
+      contract: kind === 'lp_claim' ? POOL : AERODROME,
+      quote:
+        kind === 'lp_claim'
+          ? null
+          : {
+              expectedAmountOut: '1000000000000',
+              minAmountOut: '995000000000',
+              slippageBps: 50,
+              priceImpactBps: 0,
+              quotedAt: NOW - 2_000,
+              source: 'test',
+              marketId: POOL,
+            },
+      amountIn: kind === 'lp_claim' ? '0' : '10000000',
+      lp: {
+        poolId: POOL,
+        capitalUsd: '20',
+        rebalanceIndexToday: 0,
+        claimableFeesUsd: '0',
+        ...(kind === 'lp_add' || kind === 'lp_rebalance' ? { amountB: '4000000000000000' } : {}),
+        ...(kind === 'lp_remove' ? { lpTokens: '1000000000000' } : {}),
+        ...(kind === 'lp_claim' ? { claimable: { amountA: '1000000', amountB: '0' } } : {}),
+      },
+    };
+    return makeAction(base);
+  }
+
   it.each(['lp_add', 'lp_remove', 'lp_rebalance', 'lp_claim'] as const)(
-    'refuses %s rather than evaluating it as a swap',
+    'rejects %s under the default policy with POOL_NOT_ALLOWLISTED',
     (kind) => {
-      const decision = evaluate(makeInput({ action: makeAction({ kind }) }));
+      const decision = evaluate(makeInput({ action: lpAction(kind) }));
       expect(decision.allowed).toBe(false);
-      expect(decision.code).toBe('SCHEMA_INVALID');
-      expect(decision.checks.find((c) => c.name === 'schema.action')?.detail).toContain(
-        'lp actions are not enabled',
+      expect(decision.code).toBe('POOL_NOT_ALLOWLISTED');
+      expect(decision.checks.find((c) => c.name === 'schema.action')?.passed).toBe(true);
+      // The swap-only exposure checks were not what decided this.
+      expect(decision.checks.find((c) => c.name === 'size.amountInUsd')?.skipped).toBe(
+        'not-applicable',
       );
     },
   );
+
+  it('still refuses an lp_* kind that carries no lp leg', () => {
+    const decision = evaluate(makeInput({ action: makeAction({ kind: 'lp_add' }) }));
+    expect(decision.code).toBe('SCHEMA_INVALID');
+    expect(decision.checks.find((c) => c.name === 'schema.action')?.detail).toContain(
+      'requires the lp leg',
+    );
+  });
+
+  it('rejects an entry with LP_CAPITAL_EXCEEDS_MAX once the pool is listed but capital is zero', () => {
+    const policy = makePolicy();
+    policy.lp = {
+      ...policy.lp,
+      allowedPools: [{ chain: 'base', protocol: 'aerodrome-v2', poolId: POOL }],
+      allowedProtocols: { base: ['aerodrome-v2'] },
+    };
+    const decision = evaluate(makeInput({ policy, action: lpAction('lp_add') }));
+    expect(decision.allowed).toBe(false);
+    expect(decision.code).toBe('LP_CAPITAL_EXCEEDS_MAX');
+  });
 });
 
 describe('review: prototype-named protocols and Solana program lists', () => {

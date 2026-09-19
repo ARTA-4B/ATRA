@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
-import { SOLANA_SYSTEM_PROGRAMS, isNativeToken } from '../chains/registry.js';
+import { SOLANA_SYSTEM_PROGRAMS, canonicalizeAddress, isNativeToken } from '../chains/registry.js';
 import type { ChainId } from '../chains/registry.js';
+import type { RiskPolicy } from './policy.js';
 import {
   amountToBigint,
   bpsOf,
@@ -12,7 +13,7 @@ import {
   priceToAtto,
   usdToMicros,
 } from './money.js';
-import { proposedActionSchema } from './types.js';
+import { isLpKind, proposedActionSchema } from './types.js';
 import type {
   FeeDetail,
   ProposedAction,
@@ -23,7 +24,7 @@ import type {
   RiskInput,
   Stamped,
 } from './types.js';
-import { balanceKey, liquidityKey, marketKey, priceKey } from './types.js';
+import { balanceKey, liquidityKey, lpPoolKey, marketKey, priceKey } from './types.js';
 
 /**
  * The deterministic risk engine.
@@ -156,7 +157,7 @@ function runTier0(ctx: EvaluationContext): boolean {
 
   const failed = checksFailed(ctx.checks);
   if (failed) {
-    for (const name of REMAINING_CHECK_NAMES) {
+    for (const name of remainingCheckNames(action)) {
       ctx.skip(name.name, name.code, 'short-circuit');
     }
   }
@@ -166,6 +167,45 @@ function runTier0(ctx: EvaluationContext): boolean {
 interface CheckName {
   name: string;
   code: RejectionCode;
+}
+
+/**
+ * LP checks (Phase 4). `lp.pool` and, for an entry, `lp.capital` run right
+ * after `chain.enabled`: whether the operator allowed the pool at all is a
+ * structural question, like whether the chain is enabled, and it must decide
+ * the rejection code before any data-freshness problem does. The rest run
+ * after the shared checks. None of these names appear on a swap or a plain
+ * approve, so those decisions are unchanged byte for byte.
+ */
+const LP_POOL_CHECK: CheckName = { name: 'lp.pool', code: 'POOL_NOT_ALLOWLISTED' };
+const LP_CAPITAL_CHECK: CheckName = { name: 'lp.capital', code: 'LP_CAPITAL_EXCEEDS_MAX' };
+const LP_LATE_CHECK_NAMES: CheckName[] = [
+  { name: 'lp.position', code: 'REDUCE_ONLY_MISMATCH' },
+  { name: 'lp.poolLiquidity', code: 'POOL_LIQUIDITY_BELOW_MIN' },
+  { name: 'lp.rebalanceCount', code: 'REBALANCE_LIMIT_REACHED' },
+  { name: 'lp.rebalanceSlippage', code: 'SLIPPAGE_EXCEEDS_MAX' },
+  { name: 'lp.gas', code: 'FEE_EXCEEDS_MAX' },
+  { name: 'lp.claimThreshold', code: 'FEE_BELOW_CLAIM_THRESHOLD' },
+  { name: 'lp.freshness.balance.tokenB', code: 'DATA_STALE' },
+  { name: 'lp.balance.tokenB', code: 'BALANCE_INSUFFICIENT' },
+];
+
+/** The canonical check order for this action's kind. */
+function remainingCheckNames(action: ProposedAction): CheckName[] {
+  const kind = typeof action.kind === 'string' ? action.kind : '';
+  const isLp = isLpKind(kind);
+  const isLpApprove = kind === 'approve' && action.lp !== undefined;
+  if (!isLp && !isLpApprove) return REMAINING_CHECK_NAMES;
+
+  const [chainEnabled, ...rest] = REMAINING_CHECK_NAMES;
+  const isEntry = kind === 'lp_add' || kind === 'lp_rebalance';
+  return [
+    chainEnabled!,
+    LP_POOL_CHECK,
+    ...(isEntry ? [LP_CAPITAL_CHECK] : []),
+    ...rest,
+    ...(isLp ? LP_LATE_CHECK_NAMES : []),
+  ];
 }
 
 /** Canonical order of everything after tier 0, used when short-circuiting. */
@@ -209,6 +249,19 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
   // loosened later.
   const isExit = action.reduceOnly && action.kind === 'swap';
 
+  // --- LP kinds (Phase 4) ---------------------------------------------------
+  // An entry commits capital; a removal is a privileged exit in the spirit of
+  // reduceOnly (it can only lower exposure, and is verified against the LP
+  // ledger); a claim moves nothing in. An approve that carries an lp leg is
+  // the LP-token approval ahead of a removal.
+  const lp = action.lp;
+  const isLp = isLpKind(action.kind);
+  const isLpEntry = action.kind === 'lp_add' || action.kind === 'lp_rebalance';
+  const isLpExit = action.kind === 'lp_remove';
+  const isLpClaim = action.kind === 'lp_claim';
+  const isLpApprove = isApprove && lp !== undefined;
+  const poolKey = lp === undefined ? undefined : lpPoolKey(chain, lp.poolId);
+
   ctx.check({
     name: 'chain.enabled',
     code: 'CHAIN_UNSUPPORTED',
@@ -216,6 +269,42 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
     observed: chain,
     limit: policy.enabledChains.join(','),
   });
+
+  const nativeToken = nativeTokenRef(chain);
+  const priceIn = snapshot.prices[priceKey(chain, action.tokenIn.address)];
+  const priceOut = snapshot.prices[priceKey(chain, action.tokenOut.address)];
+  const priceNative = snapshot.prices[priceKey(chain, nativeToken.address)];
+
+  let poolAllowed = false;
+  if (lp !== undefined && (isLp || isLpApprove)) {
+    const check = poolAllowlistCheck(policy, chain, action.protocol, lp.poolId);
+    poolAllowed = check.passed;
+    ctx.check(check);
+  }
+
+  // Capital an entry commits: both legs valued at the snapshot prices, each
+  // rounded up. Recomputed here; the proposal's capitalUsd is only a hint.
+  const lpEntryCapital =
+    isLpEntry && lp?.amountB !== undefined
+      ? lpCapitalMicros(action, lp.amountB, usablePrice(priceIn), usablePrice(priceOut))
+      : undefined;
+
+  if (isLpEntry && lp !== undefined && poolKey !== undefined) {
+    const existing = snapshot.lp?.positions[poolKey];
+    const existingCapital = existing ? usdToMicros(existing.capitalUsd) : 0n;
+    const total = lpEntryCapital === undefined ? undefined : existingCapital + lpEntryCapital;
+    const maxCapital = usdToMicros(policy.lp.maxCapitalPerLpUsd);
+    ctx.check({
+      name: 'lp.capital',
+      code: 'LP_CAPITAL_EXCEEDS_MAX',
+      passed: total !== undefined && total <= maxCapital,
+      observed: total === undefined ? NOT_EVALUATED : microsToUsd(total),
+      limit: microsToUsd(maxCapital),
+      detail: `existing ${microsToUsd(existingCapital)} plus new ${
+        lpEntryCapital === undefined ? NOT_EVALUATED : microsToUsd(lpEntryCapital)
+      }`,
+    });
+  }
 
   // --- freshness -----------------------------------------------------------
   const skew = policy.freshness.maxClockSkewMs;
@@ -241,11 +330,6 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
       ? {}
       : { detail: 'ledger snapshot belongs to a different UTC day' }),
   });
-
-  const nativeToken = nativeTokenRef(chain);
-  const priceIn = snapshot.prices[priceKey(chain, action.tokenIn.address)];
-  const priceOut = snapshot.prices[priceKey(chain, action.tokenOut.address)];
-  const priceNative = snapshot.prices[priceKey(chain, nativeToken.address)];
 
   ctx.check(
     priceCheck('freshness.price.tokenIn', priceIn, now, policy.freshness.priceMaxAgeMs, skew),
@@ -290,15 +374,20 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
   const balanceIn = snapshot.balances[balanceKey(chain, action.tokenIn.address)];
   const balanceNative = snapshot.balances[balanceKey(chain, nativeToken.address)];
 
-  ctx.check(
-    freshnessCheck(
-      'freshness.balance.tokenIn',
-      balanceIn,
-      now,
-      policy.freshness.balanceMaxAgeMs,
-      skew,
-    ),
-  );
+  // A removal or claim spends no tokenIn; the LP position is checked instead.
+  if (isLpExit || isLpClaim) {
+    ctx.skip('freshness.balance.tokenIn', 'DATA_STALE', 'not-applicable');
+  } else {
+    ctx.check(
+      freshnessCheck(
+        'freshness.balance.tokenIn',
+        balanceIn,
+        now,
+        policy.freshness.balanceMaxAgeMs,
+        skew,
+      ),
+    );
+  }
   ctx.check(
     freshnessCheck(
       'freshness.balance.native',
@@ -309,11 +398,17 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
     ),
   );
 
-  const liquidity = action.quote
-    ? snapshot.liquidity[liquidityKey(chain, action.quote.marketId)]
-    : undefined;
+  // Swaps read the market's liquidity for the quoted pair; LP entries read
+  // the pool's own TVL, which the pipeline derives from reserves and prices.
+  const liquidity = isLp
+    ? lp !== undefined && isLpEntry
+      ? snapshot.poolLiquidity?.[liquidityKey(chain, lp.poolId)]
+      : undefined
+    : action.quote
+      ? snapshot.liquidity[liquidityKey(chain, action.quote.marketId)]
+      : undefined;
 
-  if (isApprove || !action.quote) {
+  if (isApprove || !action.quote || isLpExit) {
     ctx.skip('freshness.liquidity', 'DATA_STALE', 'not-applicable');
   } else {
     ctx.check(
@@ -331,12 +426,16 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
   const tokens = policy.tokenAllowlist[chain] ?? [];
   const allowedTokens = new Set(tokens.map((token) => token.address));
 
+  // The LP token approved ahead of a removal is not an allowlisted asset; it
+  // is allowed exactly when the pool it belongs to is (lp.pool above).
+  const tokenInViaPool = isLpApprove && poolAllowed;
   ctx.check({
     name: 'allowlist.tokenIn',
     code: 'TOKEN_NOT_ALLOWLISTED',
-    passed: allowedTokens.has(action.tokenIn.address),
+    passed: allowedTokens.has(action.tokenIn.address) || tokenInViaPool,
     observed: action.tokenIn.address,
     limit: 'n/a',
+    ...(tokenInViaPool ? { detail: 'LP token of an allowlisted pool' } : {}),
   });
 
   if (isApprove) {
@@ -415,8 +514,10 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
       : nativeToUsdMicros(feeNative, nativeToken.decimals, priceNativeAtto, 'ceil');
 
   // --- size ----------------------------------------------------------------
+  // LP kinds are sized by lp.capital instead; the LP-token approval ahead of
+  // a removal only enables burning the wallet's own LP tokens.
   const maxTrade = usdToMicros(policy.maxAmountPerTradeUsd);
-  if (isExit) {
+  if (isExit || isLp || isLpApprove) {
     ctx.skip('size.amountInUsd', 'SIZE_EXCEEDS_MAX_TRADE', 'not-applicable');
   } else {
     ctx.check({
@@ -430,8 +531,13 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
 
   // --- daily loss ----------------------------------------------------------
   const dailyLoss = computeDailyLoss(input);
-  const worstCase =
-    amountInUsd !== undefined && feeUsd !== undefined
+  const worstCase = isLp
+    ? isLpEntry
+      ? lpEntryCapital !== undefined && feeUsd !== undefined
+        ? feeUsd + bpsOf(lpEntryCapital, policy.lp.maxRebalanceSlippageBps)
+        : undefined
+      : feeUsd
+    : amountInUsd !== undefined && feeUsd !== undefined
       ? isApprove
         ? feeUsd
         : feeUsd + bpsOf(amountInUsd, policy.maxSlippageBps)
@@ -439,7 +545,7 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
   const maxDailyLoss = usdToMicros(policy.maxDailyLossUsd);
   const projectedLoss = worstCase === undefined ? undefined : dailyLoss + worstCase;
 
-  if (isExit) {
+  if (isExit || isLpExit) {
     ctx.skip('loss.daily', 'DAILY_LOSS_BREACHED', 'not-applicable');
   } else {
     ctx.check({
@@ -455,11 +561,20 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
   }
 
   // --- total deployed ------------------------------------------------------
+  // Trading capital comes from the ledger; LP capital from the LP snapshot
+  // (absent on a swap built by the trading pipeline, so nothing changes there).
   const deployed = usdToMicros(state.ledger.deployedUsd);
+  const lpDeployed = snapshot.lp === undefined ? 0n : usdToMicros(snapshot.lp.deployedUsd);
   const maxDeployed = usdToMicros(policy.maxTotalDeployedUsd);
-  const projectedDeployed = amountInUsd === undefined ? undefined : deployed + amountInUsd;
+  const projectedDeployed = isLp
+    ? isLpEntry && lpEntryCapital !== undefined
+      ? deployed + lpDeployed + lpEntryCapital
+      : undefined
+    : amountInUsd === undefined
+      ? undefined
+      : deployed + lpDeployed + amountInUsd;
 
-  if (isExit || isApprove) {
+  if (isExit || isApprove || isLpExit || isLpClaim) {
     ctx.skip('deployed.total', 'TOTAL_DEPLOYED_BREACHED', 'not-applicable');
   } else {
     ctx.check({
@@ -468,12 +583,21 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
       passed: projectedDeployed !== undefined && projectedDeployed <= maxDeployed,
       observed: projectedDeployed === undefined ? NOT_EVALUATED : microsToUsd(projectedDeployed),
       limit: microsToUsd(maxDeployed),
+      ...(isLp
+        ? {
+            detail: `trading ${microsToUsd(deployed)} plus LP ${microsToUsd(lpDeployed)} plus new ${
+              lpEntryCapital === undefined ? NOT_EVALUATED : microsToUsd(lpEntryCapital)
+            }`,
+          }
+        : {}),
     });
   }
 
   // --- execution quality ---------------------------------------------------
+  // LP quotes are LP tokens or pool assets, not a swap output; their slippage
+  // is judged by lp.rebalanceSlippage against the LP-specific limit.
   let impliedBps = 0n;
-  if (isApprove || !action.quote) {
+  if (isApprove || !action.quote || isLp) {
     ctx.skip('slippage.implied', 'SLIPPAGE_EXCEEDS_MAX', 'not-applicable');
     ctx.skip('slippage.priceImpact', 'SLIPPAGE_EXCEEDS_MAX', 'not-applicable');
   } else {
@@ -510,7 +634,7 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
 
   // --- liquidity -----------------------------------------------------------
   const minLiquidity = usdToMicros(policy.minLiquidityUsd);
-  if (isApprove || !action.quote) {
+  if (isApprove || !action.quote || isLp) {
     ctx.skip('liquidity.market', 'LIQUIDITY_BELOW_MIN', 'not-applicable');
   } else {
     const observed = liquidity ? usdToMicros(liquidity.value) : undefined;
@@ -527,7 +651,7 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
   const key = marketKey(chain, action.tokenIn.address, action.tokenOut.address);
   const lastMarketAction = state.cooldowns[key];
 
-  if (isExit || isApprove) {
+  if (isExit || isApprove || isLpExit) {
     ctx.skip('cooldown.market', 'COOLDOWN_ACTIVE', 'not-applicable');
   } else {
     const elapsedMs =
@@ -541,7 +665,9 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
     });
   }
 
-  if (isExit) {
+  // The LP-token approval exists only to enable the removal that follows it;
+  // pacing it would trap the exit it belongs to.
+  if (isExit || isLpExit || isLpApprove) {
     ctx.skip('cooldown.global', 'COOLDOWN_ACTIVE', 'not-applicable');
   } else {
     const elapsedMs =
@@ -558,7 +684,7 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
   // --- balances ------------------------------------------------------------
   const tokenInIsNative = isNativeToken(chain, action.tokenIn.address);
 
-  if (isApprove) {
+  if (isApprove || isLpExit || isLpClaim) {
     ctx.skip('balance.tokenIn', 'BALANCE_INSUFFICIENT', 'not-applicable');
   } else {
     const held = balanceIn ? amountToBigint(balanceIn.value) : undefined;
@@ -582,6 +708,21 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
     limit: feeNative.toString(),
   });
 
+  // --- LP-specific checks (Phase 4) ----------------------------------------
+  if (isLp && lp !== undefined && poolKey !== undefined) {
+    runLpChecks(ctx, {
+      lp,
+      poolKey,
+      isLpEntry,
+      isLpExit,
+      isLpClaim,
+      liquidity,
+      feeUsd,
+      priceIn: usablePrice(priceIn),
+      priceOut: usablePrice(priceOut),
+    });
+  }
+
   return {
     amountInUsd: amountInUsd === undefined ? NOT_EVALUATED : microsToUsd(amountInUsd),
     feeUsd: feeUsd === undefined ? NOT_EVALUATED : microsToUsd(feeUsd),
@@ -590,6 +731,216 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
     projectedDeployedUsd:
       projectedDeployed === undefined ? NOT_EVALUATED : microsToUsd(projectedDeployed),
   };
+}
+
+interface LpCheckContext {
+  lp: NonNullable<ProposedAction['lp']>;
+  poolKey: string;
+  isLpEntry: boolean;
+  isLpExit: boolean;
+  isLpClaim: boolean;
+  liquidity: Stamped<string> | undefined;
+  feeUsd: bigint | undefined;
+  priceIn: bigint | undefined;
+  priceOut: bigint | undefined;
+}
+
+/**
+ * The LP checks that follow the shared ones (spec section 12).
+ *
+ * Every USD figure is recomputed from base-unit amounts and snapshot prices;
+ * `lp.capitalUsd` and `lp.claimableFeesUsd` on the proposal are hints the
+ * engine does not read. Checks that do not apply to the kind are emitted as
+ * not-applicable so the dashboard sees the whole list every time.
+ */
+function runLpChecks(ctx: EvaluationContext, c: LpCheckContext): void {
+  const { input } = ctx;
+  const { action, policy, state, snapshot, now } = input;
+  const { lp, poolKey, isLpEntry, isLpExit, isLpClaim } = c;
+  const chain = action.chain;
+
+  // Exits and claims act on a position the ledger must know about, in the
+  // same spirit as position.reduceOnly for a swap.
+  if (isLpExit || isLpClaim) {
+    const held = snapshot.lp?.positions[poolKey];
+    const heldTokens = held ? amountToBigint(held.lpTokens) : 0n;
+    const wanted = isLpExit ? amountToBigint(lp.lpTokens ?? '0') : 0n;
+    const passed = isLpExit ? heldTokens > 0n && wanted <= heldTokens : heldTokens > 0n;
+    ctx.check({
+      name: 'lp.position',
+      code: 'REDUCE_ONLY_MISMATCH',
+      passed,
+      observed: isLpExit ? wanted.toString() : heldTokens.toString(),
+      limit: heldTokens.toString(),
+      ...(heldTokens === 0n ? { detail: 'no open LP position in this pool' } : {}),
+    });
+  } else {
+    ctx.skip('lp.position', 'REDUCE_ONLY_MISMATCH', 'not-applicable');
+  }
+
+  const minPoolLiquidity = usdToMicros(policy.lp.minPoolLiquidityUsd);
+  if (isLpEntry) {
+    const observed = c.liquidity ? usdToMicros(c.liquidity.value) : undefined;
+    ctx.check({
+      name: 'lp.poolLiquidity',
+      code: 'POOL_LIQUIDITY_BELOW_MIN',
+      passed: observed !== undefined && observed >= minPoolLiquidity,
+      observed: observed === undefined ? 'missing' : microsToUsd(observed),
+      limit: microsToUsd(minPoolLiquidity),
+    });
+  } else {
+    ctx.skip('lp.poolLiquidity', 'POOL_LIQUIDITY_BELOW_MIN', 'not-applicable');
+  }
+
+  if (action.kind === 'lp_rebalance') {
+    // Whichever store reports more counts: the ledger slice or the LP
+    // snapshot. Both are zero when nothing rebalanced today.
+    const fromLedger = state.ledger.lpRebalancesToday[poolKey] ?? 0;
+    const fromSnapshot = snapshot.lp?.rebalancesToday[poolKey] ?? 0;
+    const count = Math.max(fromLedger, fromSnapshot);
+    ctx.check({
+      name: 'lp.rebalanceCount',
+      code: 'REBALANCE_LIMIT_REACHED',
+      passed: count < policy.lp.maxRebalancePerDay,
+      observed: String(count),
+      limit: String(policy.lp.maxRebalancePerDay),
+    });
+  } else {
+    ctx.skip('lp.rebalanceCount', 'REBALANCE_LIMIT_REACHED', 'not-applicable');
+  }
+
+  if (action.quote && !isLpClaim) {
+    const expectedOut = amountToBigint(action.quote.expectedAmountOut);
+    const minOut = amountToBigint(action.quote.minAmountOut);
+    const implied = maxBigint(
+      BigInt(action.quote.slippageBps),
+      expectedOut > 0n && minOut <= expectedOut ? impliedSlippageBps(expectedOut, minOut) : 0n,
+    );
+    ctx.check({
+      name: 'lp.rebalanceSlippage',
+      code: 'SLIPPAGE_EXCEEDS_MAX',
+      passed: implied <= BigInt(policy.lp.maxRebalanceSlippageBps),
+      observed: implied.toString(),
+      limit: String(policy.lp.maxRebalanceSlippageBps),
+    });
+  } else {
+    ctx.skip('lp.rebalanceSlippage', 'SLIPPAGE_EXCEEDS_MAX', 'not-applicable');
+  }
+
+  const maxLpGas = usdToMicros(policy.lp.maxLpGasUsd);
+  ctx.check({
+    name: 'lp.gas',
+    code: 'FEE_EXCEEDS_MAX',
+    passed: c.feeUsd !== undefined && c.feeUsd <= maxLpGas,
+    observed: c.feeUsd === undefined ? NOT_EVALUATED : microsToUsd(c.feeUsd),
+    limit: microsToUsd(maxLpGas),
+  });
+
+  if (isLpClaim) {
+    // Claimable fees valued at the snapshot prices, rounded down: a claim
+    // that only just clears the threshold is treated as not clearing it.
+    const claimable = lp.claimable;
+    const value =
+      claimable !== undefined && c.priceIn !== undefined && c.priceOut !== undefined
+        ? nativeToUsdMicros(
+            amountToBigint(claimable.amountA),
+            action.tokenIn.decimals,
+            c.priceIn,
+            'floor',
+          ) +
+          nativeToUsdMicros(
+            amountToBigint(claimable.amountB),
+            action.tokenOut.decimals,
+            c.priceOut,
+            'floor',
+          )
+        : undefined;
+    const threshold = usdToMicros(policy.lp.minFeeThresholdUsd);
+    ctx.check({
+      name: 'lp.claimThreshold',
+      code: 'FEE_BELOW_CLAIM_THRESHOLD',
+      passed: value !== undefined && value >= threshold,
+      observed: value === undefined ? NOT_EVALUATED : microsToUsd(value),
+      limit: microsToUsd(threshold),
+    });
+  } else {
+    ctx.skip('lp.claimThreshold', 'FEE_BELOW_CLAIM_THRESHOLD', 'not-applicable');
+  }
+
+  // An entry spends the second pool asset too, so it gets the same freshness
+  // and sufficiency treatment as tokenIn.
+  if (isLpEntry && lp.amountB !== undefined) {
+    const balanceB = snapshot.balances[balanceKey(chain, action.tokenOut.address)];
+    ctx.check(
+      freshnessCheck(
+        'lp.freshness.balance.tokenB',
+        balanceB,
+        now,
+        policy.freshness.balanceMaxAgeMs,
+        policy.freshness.maxClockSkewMs,
+      ),
+    );
+    const held = balanceB ? amountToBigint(balanceB.value) : undefined;
+    const needed = amountToBigint(lp.amountB);
+    ctx.check({
+      name: 'lp.balance.tokenB',
+      code: 'BALANCE_INSUFFICIENT',
+      passed: held !== undefined && held >= needed,
+      observed: held === undefined ? 'missing' : held.toString(),
+      limit: needed.toString(),
+    });
+  } else {
+    ctx.skip('lp.freshness.balance.tokenB', 'DATA_STALE', 'not-applicable');
+    ctx.skip('lp.balance.tokenB', 'BALANCE_INSUFFICIENT', 'not-applicable');
+  }
+}
+
+/**
+ * `(chain, protocol, poolId)` must be in `lp.allowedPools` and the protocol in
+ * `lp.allowedProtocols[chain]`. Pool ids are compared canonically (lowercase
+ * on EVM chains) because the operator types the policy side by hand.
+ */
+function poolAllowlistCheck(
+  policy: RiskPolicy,
+  chain: ChainId,
+  protocol: string,
+  poolId: string,
+): RiskCheck {
+  const protocols = policy.lp.allowedProtocols[chain] ?? [];
+  const protocolOk = protocols.includes(protocol);
+  const canonicalPool = canonicalizeAddress(chain, poolId);
+  const poolOk = policy.lp.allowedPools.some(
+    (entry) =>
+      entry.chain === chain &&
+      entry.protocol === protocol &&
+      canonicalizeAddress(chain, entry.poolId) === canonicalPool,
+  );
+  return {
+    name: 'lp.pool',
+    code: 'POOL_NOT_ALLOWLISTED',
+    passed: protocolOk && poolOk,
+    observed: `${protocol}:${poolId}`,
+    limit: 'lp.allowedPools',
+    ...(protocolOk
+      ? poolOk
+        ? {}
+        : { detail: 'pool is not in lp.allowedPools' }
+      : { detail: `protocol ${protocol} is not in lp.allowedProtocols[${chain}]` }),
+  };
+}
+
+/** Both legs of an LP entry valued in micro-USD, each rounded up. */
+function lpCapitalMicros(
+  action: ProposedAction,
+  amountB: string,
+  priceIn: bigint | undefined,
+  priceOut: bigint | undefined,
+): bigint | undefined {
+  if (priceIn === undefined || priceOut === undefined) return undefined;
+  return (
+    nativeToUsdMicros(amountToBigint(action.amountIn), action.tokenIn.decimals, priceIn, 'ceil') +
+    nativeToUsdMicros(amountToBigint(amountB), action.tokenOut.decimals, priceOut, 'ceil')
+  );
 }
 
 /**
@@ -637,10 +988,14 @@ function contractCheck(
     };
   }
 
+  // A fee claim is a call on the pool itself, never on the router; lp.pool
+  // separately verifies that the pool is one the operator allowed.
   const allowed =
     action.kind === 'approve'
       ? entry.approveSpenders.includes(action.contract)
-      : entry.contracts.includes(action.contract);
+      : action.kind === 'lp_claim'
+        ? action.lp !== undefined && action.contract === action.lp.poolId
+        : entry.contracts.includes(action.contract);
 
   if (!allowed) {
     return {
@@ -649,7 +1004,11 @@ function contractCheck(
       passed: false,
       observed: action.contract,
       limit: 'n/a',
-      ...(action.kind === 'approve' ? { detail: 'not an approved spender' } : {}),
+      ...(action.kind === 'approve'
+        ? { detail: 'not an approved spender' }
+        : action.kind === 'lp_claim'
+          ? { detail: 'a claim must target the pool named in the lp leg' }
+          : {}),
     };
   }
 

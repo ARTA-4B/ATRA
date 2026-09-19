@@ -1,0 +1,102 @@
+// ATRA hosted gateway: one Worker, one Hub Durable Object, one D1 database per
+// environment. Deploy ONLY with `--env staging` or `--env production`; the
+// top-level (no env) block exists for `wrangler dev` and the test suite, and
+// its D1 id is a local placeholder.
+//
+// Secrets (never in this file; set with `wrangler secret put <NAME> --env <env>`):
+//   TELEGRAM_BOT_TOKEN        the bot token from @BotFather
+//   TELEGRAM_WEBHOOK_SECRET   random string passed to setWebhook(secret_token)
+//   TOKEN_PEPPER              HMAC key for installation tokens (32+ random bytes)
+//   ADMIN_TOKEN               bearer token for POST /v1/admin/installs
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "atra-gateway",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-07",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "limits": {
+    "cpu_ms": 10,
+    "subrequests": 25,
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.2,
+  },
+  "triggers": {
+    // Purges tg_updates rows older than 24 h and stale pair codes.
+    "crons": ["*/5 * * * *"],
+  },
+  // Legacy `migrations` form on purpose: the local wrangler (4.110) predates
+  // the `exports` form. A single SQLite-backed class works on the Free plan.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Hub"] }],
+
+  // ---- local dev / tests (no env) --------------------------------------
+  "vars": {
+    "GATEWAY_ENV": "dev",
+    "BOT_USERNAME": "",
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "HUB", "class_name": "Hub" }],
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "atra-gateway-local",
+      "database_id": "atra-gateway-local",
+      "migrations_dir": "migrations",
+    },
+  ],
+
+  "env": {
+    "staging": {
+      "vars": {
+        "GATEWAY_ENV": "staging",
+        // Username of the STAGING bot (without @); shown to runtimes in `welcome`.
+        "BOT_USERNAME": "",
+      },
+      "durable_objects": {
+        "bindings": [{ "name": "HUB", "class_name": "Hub" }],
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "atra-gateway-staging",
+          // Fill in from `wrangler d1 create atra-gateway-staging`.
+          "database_id": "REPLACE_WITH_STAGING_D1_ID",
+          "migrations_dir": "migrations",
+        },
+      ],
+      // Namespace ids 2101-2103. Ids 1001-1004 belong to another Worker on
+      // this account and would share counters: never use them.
+      "ratelimits": [
+        { "name": "RL_WEBHOOK", "namespace_id": "2101", "simple": { "limit": 20, "period": 60 } },
+        { "name": "RL_WS", "namespace_id": "2102", "simple": { "limit": 10, "period": 60 } },
+        { "name": "RL_UNPAIRED", "namespace_id": "2103", "simple": { "limit": 5, "period": 60 } },
+      ],
+    },
+    "production": {
+      "vars": {
+        "GATEWAY_ENV": "production",
+        "BOT_USERNAME": "",
+      },
+      "durable_objects": {
+        "bindings": [{ "name": "HUB", "class_name": "Hub" }],
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "atra-gateway-production",
+          // Fill in from `wrangler d1 create atra-gateway-production`.
+          "database_id": "REPLACE_WITH_PRODUCTION_D1_ID",
+          "migrations_dir": "migrations",
+        },
+      ],
+      "ratelimits": [
+        { "name": "RL_WEBHOOK", "namespace_id": "2001", "simple": { "limit": 20, "period": 60 } },
+        { "name": "RL_WS", "namespace_id": "2002", "simple": { "limit": 10, "period": 60 } },
+        { "name": "RL_UNPAIRED", "namespace_id": "2003", "simple": { "limit": 5, "period": 60 } },
+      ],
+    },
+  },
+}

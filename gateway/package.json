@@ -1,0 +1,39 @@
+{
+  "name": "@atra/gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ATRA hosted Telegram gateway: one Cloudflare Worker, a hibernating-WebSocket Hub Durable Object and D1",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p test/tsconfig.json && tsc --noEmit -p tsconfig.node.json",
+    "lint": "eslint src test",
+    "lint:fix": "eslint src test --fix",
+    "format": "prettier --write \"{src,test}/**/*.ts\" \"*.{ts,jsonc,md}\"",
+    "format:check": "prettier --check \"{src,test}/**/*.ts\" \"*.{ts,jsonc,md}\"",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "deploy:staging": "wrangler deploy --env staging",
+    "deploy:production": "wrangler deploy --env production"
+  },
+  "dependencies": {
+    "hono": "4.13.8",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.1.13",
+    "@cloudflare/workers-types": "5.20260919.1",
+    "@eslint/js": "10.0.1",
+    "@types/node": "26.6.2",
+    "eslint": "10.11.0",
+    "prettier": "3.9.8",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.70.0",
+    "vitest": "4.1.11",
+    "wrangler": "4.135.0"
+  }
+}

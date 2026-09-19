@@ -89,6 +89,7 @@ export class AutoTradePipeline {
   readonly #deps: PipelineDeps;
   readonly #now: () => number;
   readonly #log = childLogger('pipeline');
+  readonly #cycleHandlers: Array<(report: CycleReport) => void> = [];
   #running = false;
 
   constructor(deps: PipelineDeps) {
@@ -98,6 +99,17 @@ export class AutoTradePipeline {
 
   get running(): boolean {
     return this.#running;
+  }
+
+  /**
+   * Observe finished cycles.
+   *
+   * Notifications hang off this rather than off the executors: a subscriber
+   * sees the whole cycle — what was decided, what the engine said, what the
+   * execution did — and a throwing subscriber can never affect the trade.
+   */
+  onCycle(handler: (report: CycleReport) => void): void {
+    this.#cycleHandlers.push(handler);
   }
 
   async runCycle(request: CycleRequest): Promise<CycleReport> {
@@ -573,6 +585,15 @@ export class AutoTradePipeline {
       { cycleId: base.cycleId, chain: request.chain, outcome, reason },
       'cycle finished',
     );
+
+    for (const handler of this.#cycleHandlers) {
+      try {
+        handler(report);
+      } catch (error) {
+        this.#log.error({ err: error }, 'cycle subscriber failed');
+      }
+    }
+
     return report;
   }
 

@@ -102,6 +102,8 @@ export class StateStore {
   readonly #log = childLogger('state');
 
   readonly #emergencyHandlers: Array<(active: boolean, reason: string | null) => void> = [];
+  readonly #pauseHandlers: Array<(paused: boolean, reason: string | null, actor: string) => void> =
+    [];
 
   constructor(db: Db, audit: AuditLog) {
     this.#db = db;
@@ -259,6 +261,19 @@ export class StateStore {
       mode: this.getMode(),
     });
     this.#log.warn({ paused, actor }, 'global pause changed');
+
+    for (const handler of this.#pauseHandlers) {
+      try {
+        handler(paused, reason, actor);
+      } catch (error) {
+        this.#log.error({ err: error }, 'pause hook failed');
+      }
+    }
+  }
+
+  /** Register a hook that runs when the global pause changes (notifications). */
+  onPauseChanged(handler: (paused: boolean, reason: string | null, actor: string) => void): void {
+    this.#pauseHandlers.push(handler);
   }
 
   /**

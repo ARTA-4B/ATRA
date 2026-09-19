@@ -1,0 +1,11 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    // The vitest plugin resolves `cloudflare:test` and the `?raw` style Vite
+    // imports with bundler semantics.
+    "moduleResolution": "bundler",
+    "module": "ESNext",
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-plugin/types"]
+  },
+  "include": ["./**/*.ts", "../src/bindings.d.ts"]
+}

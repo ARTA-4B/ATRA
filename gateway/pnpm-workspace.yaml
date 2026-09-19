@@ -1,0 +1,17 @@
+# This directory is a standalone pnpm project (the repo root is the frontend's
+# npm project; runtime/ is its own pnpm project). Keeping this file here stops
+# pnpm from looking further up the tree for a workspace root.
+
+# pnpm 11 refuses packages published within its minimum release age unless they
+# are listed here. Current when the lockfile was written.
+minimumReleaseAgeExclude:
+  - '@cloudflare/workers-types@5.20260919.1'
+  - '@types/node@26.6.2'
+
+# esbuild and workerd ship prebuilt binaries unpacked by their postinstall
+# scripts. workerd is the local Workers runtime that the tests run inside;
+# esbuild bundles the Worker for wrangler and the tests. Both are build-time
+# only: nothing native is deployed.
+allowBuilds:
+  esbuild: true
+  workerd: true

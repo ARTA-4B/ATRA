@@ -1,6 +1,11 @@
 import { loadConfig } from './config/env.js';
 import { createLogger, setRootLogger, childLogger } from './logging/logger.js';
-import { buildServices, shutdownServices, startBackgroundServices } from './core/services.js';
+import {
+  buildServices,
+  shutdownServices,
+  startBackgroundServices,
+  stopBackgroundServices,
+} from './core/services.js';
 import { startServer } from './http/server.js';
 import { isAppError } from './util/errors.js';
 import type { StartedServer } from './http/server.js';
@@ -91,6 +96,12 @@ function installShutdownHandlers(
     // The vault is locked first: if anything below hangs, the key is already
     // out of memory.
     services.vault.lock();
+
+    // Best effort, bounded by the shutdown timer below: let the Telegram
+    // transport say the runtime went offline before the database closes.
+    void stopBackgroundServices(services).catch((error: unknown) => {
+      log.warn({ err: error }, 'background services did not stop cleanly');
+    });
 
     const finish = (code: number): void => {
       try {

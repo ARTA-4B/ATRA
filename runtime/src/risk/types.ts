@@ -98,6 +98,44 @@ export const quoteSchema = z.object({
   marketId: z.string().min(1).max(128),
 });
 
+/**
+ * The LP leg of a proposal (Phase 4).
+ *
+ * The first four fields are the Phase 1 shape. The rest describe what the LP
+ * transaction actually does, so the engine can recompute every USD figure
+ * from base-unit amounts and the market snapshot rather than trust the
+ * `capitalUsd` / `claimableFeesUsd` hints:
+ *
+ *  - `lp_add`: `tokenIn`/`amountIn` is pool asset A, `tokenOut`/`amountB` is
+ *    pool asset B, `minAmountA`/`minAmountB` are the floors the router
+ *    enforces, and the quote's expected/min amounts are LP tokens.
+ *  - `lp_remove`: `lpTokens` are burned; `tokenIn`/`amountIn` is the expected
+ *    asset A returned, the quote's expected/min amounts are asset B.
+ *  - `lp_claim`: the pool itself is the contract, `claimable` carries the
+ *    fee amounts the pool reports; nothing goes in, so `amountIn` is "0" and
+ *    there is no quote.
+ *  - `approve` with an `lp` object: an approval of the pool's LP token to the
+ *    router ahead of an `lp_remove`.
+ */
+export const lpLegSchema = z.object({
+  poolId: z.string().min(1).max(128),
+  capitalUsd: usdString,
+  rebalanceIndexToday: z.number().int().min(0),
+  claimableFeesUsd: usdString,
+  amountB: amountString.optional(),
+  minAmountA: amountString.optional(),
+  minAmountB: amountString.optional(),
+  lpTokens: amountString.optional(),
+  claimable: z.object({ amountA: amountString, amountB: amountString }).optional(),
+});
+
+export const LP_ACTION_KINDS = ['lp_add', 'lp_remove', 'lp_rebalance', 'lp_claim'] as const;
+export type LpActionKind = (typeof LP_ACTION_KINDS)[number];
+
+export function isLpKind(kind: string): kind is LpActionKind {
+  return (LP_ACTION_KINDS as readonly string[]).includes(kind);
+}
+
 export const proposedActionSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -118,23 +156,22 @@ export const proposedActionSchema = z
     amountIn: amountString,
     quote: quoteSchema.nullable(),
     feeEstimate: z.object({ estimatedAt: epochMs, detail: feeDetailSchema }),
-    lp: z
-      .object({
-        poolId: z.string().min(1).max(128),
-        capitalUsd: usdString,
-        rebalanceIndexToday: z.number().int().min(0),
-        claimableFeesUsd: usdString,
-      })
-      .optional(),
+    lp: lpLegSchema.optional(),
     rationale: z.string().max(2_000).optional(),
   })
   .superRefine((action, ctx) => {
-    if (action.amountIn === '0') {
+    const isLp = isLpKind(action.kind);
+    const isLpClaim = action.kind === 'lp_claim';
+
+    // A claim moves nothing into the pool, so it is the one kind allowed to
+    // carry a zero input.
+    if (action.amountIn === '0' && !isLpClaim) {
       ctx.addIssue({ code: 'custom', path: ['amountIn'], message: 'must be greater than zero' });
     }
 
     // Exit privileges (skipping the exposure caps) belong to swaps only. An
-    // approve or LP action flagged reduceOnly would inherit them for nothing.
+    // approve or LP action flagged reduceOnly would inherit them for nothing;
+    // lp_remove gets its own, narrower exit treatment inside the engine.
     if (action.reduceOnly && action.kind !== 'swap') {
       ctx.addIssue({
         code: 'custom',
@@ -143,16 +180,61 @@ export const proposedActionSchema = z
       });
     }
 
-    // LP execution is Phase 4. Until its checks exist the engine must refuse
-    // these kinds outright rather than evaluate them as swaps — which is what
-    // happened before this guard: an lp_add against a policy with LP disabled
-    // was approved using the swap checks.
-    if (action.kind.startsWith('lp_')) {
+    // Every LP kind must describe its LP leg; the engine cannot check a pool
+    // it is not told about, and it must never fall back to the swap checks.
+    if (isLp && action.lp === undefined) {
       ctx.addIssue({
         code: 'custom',
-        path: ['kind'],
-        message: 'lp actions are not enabled in this build',
+        path: ['lp'],
+        message: `${action.kind} requires the lp leg`,
       });
+    }
+    if (action.kind === 'swap' && action.lp !== undefined) {
+      ctx.addIssue({ code: 'custom', path: ['lp'], message: 'a swap cannot carry an lp leg' });
+    }
+    if (action.lp !== undefined) {
+      if ((action.kind === 'lp_add' || action.kind === 'lp_rebalance') && !action.lp.amountB) {
+        ctx.addIssue({ code: 'custom', path: ['lp', 'amountB'], message: 'lp_add needs amountB' });
+      }
+      if (action.lp.amountB === '0') {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['lp', 'amountB'],
+          message: 'must be greater than zero',
+        });
+      }
+      if (action.kind === 'lp_remove' && (!action.lp.lpTokens || action.lp.lpTokens === '0')) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['lp', 'lpTokens'],
+          message: 'lp_remove needs a positive lpTokens amount',
+        });
+      }
+      if (isLpClaim) {
+        if (!action.lp.claimable) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['lp', 'claimable'],
+            message: 'lp_claim needs the claimable amounts',
+          });
+        }
+        if (action.contract !== action.lp.poolId) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['contract'],
+            message: 'lp_claim must target the pool itself',
+          });
+        }
+      }
+      // An approval that carries an lp leg is the LP-token approval ahead of
+      // a removal, and it must name that pool's LP token, nothing else.
+      if (action.kind === 'approve' && action.tokenIn.address !== action.lp.poolId) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['lp', 'poolId'],
+          message: 'an approve with an lp leg must approve the pool LP token',
+        });
+      }
     }
 
     if (action.kind === 'approve') {
@@ -171,8 +253,11 @@ export const proposedActionSchema = z
         });
       }
     } else {
-      if (action.quote === null) {
+      if (action.quote === null && !isLpClaim) {
         ctx.addIssue({ code: 'custom', path: ['quote'], message: 'a quote is required' });
+      }
+      if (action.quote !== null && isLpClaim) {
+        ctx.addIssue({ code: 'custom', path: ['quote'], message: 'lp_claim has no quote' });
       }
       if (action.tokenIn.address === action.tokenOut.address) {
         ctx.addIssue({
@@ -275,11 +360,30 @@ export interface Stamped<T> {
   source: string;
 }
 
+/**
+ * The LP ledger slice the engine reads (Phase 4).
+ *
+ * Assembled by the liquidity pipeline from its own tables and handed in with
+ * the market snapshot, so it is persisted next to the decision and a rejection
+ * can be re-derived from the row. Keys are {@link lpPoolKey}.
+ */
+export interface LpSnapshot {
+  /** Cost basis of every open LP position in the action's mode, USD string. */
+  deployedUsd: string;
+  /** Rebalances already executed this UTC day, per pool. */
+  rebalancesToday: Record<string, number>;
+  /** Open LP positions, per pool. */
+  positions: Record<string, { lpTokens: string; capitalUsd: string }>;
+}
+
 export interface MarketSnapshot {
   prices: Record<string, Stamped<string>>;
   liquidity: Record<string, Stamped<string>>;
   balances: Record<string, Stamped<string>>;
+  /** Pool TVL in USD, keyed by {@link liquidityKey}(chain, poolId). LP actions only. */
   poolLiquidity?: Record<string, Stamped<string>>;
+  /** LP ledger state. Absent on swaps built by the trading pipeline. */
+  lp?: LpSnapshot;
 }
 
 export interface RiskInput {
@@ -342,6 +446,11 @@ export function balanceKey(chain: ChainId, token: string): string {
 
 export function liquidityKey(chain: ChainId, market: string): string {
   return `${chain}:${market}`;
+}
+
+/** Key for per-pool LP state (positions, rebalance counts). */
+export function lpPoolKey(chain: ChainId, poolId: string): string {
+  return `${chain}:${poolId}`;
 }
 
 export type { ChainId };
