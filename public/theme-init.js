@@ -1,0 +1,1 @@
+(function(){try{var t=localStorage.getItem("atra.theme");if(t!=="light"&&t!=="dark")t=matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light";document.documentElement.dataset.theme=t;if(t==="dark")document.querySelector('meta[name="theme-color"]').content="#0b1220";}catch(e){}})();
