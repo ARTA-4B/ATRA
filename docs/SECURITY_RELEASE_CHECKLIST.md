@@ -19,8 +19,10 @@ work: the encrypted probe vault committed in `9a44c3b` is still in the
 public history. Either rewrite history before tagging V1 or accept it and
 document the two probe wallets as burned. That decision is the owner's.
 
-Last run: 2026-09-20, this checkout (Phase 5 wired: runtime 545 tests in
-21 files, gateway 95, model 35), Windows 11, Node 24.17.0, pnpm 11.9.0.
+Last run: 2026-09-21, this checkout (runtime 705 tests in 27 files, gateway
+112, frontend 16 Playwright), Windows 11, Node 24.17.0, pnpm 11.9.0. The
+public site and the gateway are deployed, so the rows below that used to say
+"claimed by its owner" are now checked against the running service.
 
 | Gate line | Result | Evidence |
 |---|---|---|
@@ -55,22 +57,25 @@ Not on the spec's list, verified the same way.
 | The LIVE checklist is consumed, expires, and resets | PASS | `review-regressions.test.ts` "the LIVE checklist is consumed and reset" (5 tests); `risk-engine.test.ts` "rejects LIVE when the activation session has expired" |
 | The model status is truthful | PASS | `api.test.ts` "reports the model as UNTRAINED"; `research.test.ts` "never claims the model is trained"; CI "Model status must stay honest" fails if `UNTRAINED` leaves `MODEL_CARD.md` or `README.md` while no manifest is committed |
 | Money is never a float | PASS | `money.test.ts`; `review-regressions.test.ts` "a zero price is unknown data, not a number"; all amounts are base-unit strings or micro-USD decimals in every schema |
-| Treasury never touches user funds | PASS by construction, pending commit | `runtime/src/db/migrations/005_treasury.sql` references no `vault_secrets`, `wallets`, `positions`, `fills` or `lp_*` table; the treasury wallet is watch-only. **Re-verify the treasury service and routes when they are committed** (another owner's Phase 5 work, in this tree but untracked as this is written) |
-| Frontend bundle carries no secret | NOT VERIFIED | The frontend is another owner's Vite project. `npm audit` is clean. A scan of `dist/` for the same key shapes after `npm run build` would prove it |
-| Gateway refuses broadcast methods | Claimed by its owner, NOT re-verified here | `gateway/README.md` states `eth_sendRawTransaction` and friends are refused by name with 403 `method_refused`; the untracked `gateway/src/rpc.ts` and `gateway/test/rpc.test.ts` are the evidence once committed |
+| Treasury never touches user funds | **PASS** | Committed in `de12997`. `runtime/src/db/migrations/005_treasury.sql` references no `vault_secrets`, `wallets`, `positions`, `fills` or `lp_*` table; the treasury wallet is watch-only. `TreasuryService` is constructed from the database, the audit log, the read-only adapters, the market and the model only — it is never handed a wallet, a vault, a ledger or the state store, and `test/treasury.test.ts` asserts the deps type rejects them, so it cannot sign or broadcast |
+| Frontend bundle carries no secret | **PASS** | `npm run build`, then `dist/` scanned for the same shapes the secret scan uses — 0x+64 hex, bare 64 hex, 86-88 char base58, Telegram bot tokens, `sk/pk/rk/api/key`-prefixed keys, and `cfut_` Cloudflare tokens: zero hits. The only outbound hosts in the bundle are DexScreener and github.com. The build has no `VITE_*` secret to inline, and the deployed site holds no key of any kind: it talks to a public price API and nothing else |
+| Gateway refuses broadcast methods | **PASS, verified against the deployment** | `gateway/src/rpc.ts` checks an allowlist first, so `eth_sendRawTransaction`, `eth_sign`, `personal_sign`, `wallet_*` and Solana `signTransaction`/`sendTransaction` are refused, including case variants, and a batch is validated item by item. Checked live at `https://gw.artallm.org` on 2026-09-21: `/health` answers, and an unauthorised `eth_sendRawTransaction` is refused. The webhook answers 401 with no secret header and with a wrong one, and `/v1/admin/*` answers 401 without the admin token. Covered by 112 gateway tests |
 
 ## Known open defects at the gate
 
-From the Phase 4 report, unchanged on 2026-09-20; none of them lets a key
-out or lets a model sign, which is why they do not block, but they are
-listed so nobody discovers them in production:
+From the Phase 4 report, revised on 2026-09-21 after the audit round. None
+of them lets a key out or lets a model sign, which is why they never
+blocked, but they are listed so nobody discovers them in production. Most
+are now struck through; what remains is what is genuinely still open:
 
 1. ~~Boot order defeats the LP reconcile~~ — fixed on 2026-09-20, see the restart row.
-2. Both schedulers map intervals other than whole minutes between 60 and
-   3,600 s to `*/59 * * * * *`, which fires every 59 seconds. An operator
-   asking for a daily pass gets one every minute.
-3. The LIVE LP executor has no simulation step before signing; a revert
-   costs gas.
+2. ~~Both schedulers map intervals other than whole minutes to a 59-second
+   cron step~~ — fixed on 2026-09-20. Both now arm a plain period, croner is
+   gone as a dependency, and `test/scheduler.test.ts` measures the firing
+   rate for 90 s, 7 min and 24 h rather than asserting a pattern.
+3. ~~The LIVE LP executor has no simulation step before signing~~ — fixed on
+   2026-09-21: it builds, simulates what it built, then signs, so a revert
+   no longer costs gas and a cooldown.
 4. LP outcomes raise no Telegram notification.
 5. `mainnet.base.org` rate-limits the LP adapter's pool read; a keyed Base
    RPC is needed for auto-LP there.
