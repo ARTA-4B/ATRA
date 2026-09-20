@@ -104,6 +104,57 @@ export interface JupiterAdapterOptions {
   fetchImpl?: typeof fetch;
 }
 
+/**
+ * Refuse a quote that does not answer the question that was asked.
+ *
+ * Jupiter is a third party reached over the public internet without a key.
+ * The mints, the input amount and the slippage in the reply are compared with
+ * the request, and the threshold the router will enforce is checked against
+ * the output it reported: those five numbers are what the engine's decision
+ * and the resulting transaction rest on.
+ */
+function assertQuoteMatchesRequest(
+  quote: {
+    inputMint: string;
+    outputMint: string;
+    inAmount: string;
+    outAmount: string;
+    otherAmountThreshold: string;
+    slippageBps: number;
+  },
+  request: QuoteRequest,
+): void {
+  const mismatch = (field: string, got: string, wanted: string): never => {
+    throw new AppError(
+      ErrorCode.UPSTREAM_UNAVAILABLE,
+      `Jupiter answered with a different ${field}`,
+      { details: { field, got, wanted } },
+    );
+  };
+
+  if (quote.inputMint !== request.tokenIn.address) {
+    mismatch('input mint', quote.inputMint, request.tokenIn.address);
+  }
+  if (quote.outputMint !== request.tokenOut.address) {
+    mismatch('output mint', quote.outputMint, request.tokenOut.address);
+  }
+  if (quote.inAmount !== request.amountIn) {
+    mismatch('input amount', quote.inAmount, request.amountIn);
+  }
+  if (quote.slippageBps !== request.slippageBps) {
+    mismatch('slippage', String(quote.slippageBps), String(request.slippageBps));
+  }
+
+  // The threshold is what the swap program enforces on chain. It must not be
+  // looser than the slippage the engine approved, or the minimum the trade
+  // was decided on is not the minimum that will be applied.
+  const out = BigInt(quote.outAmount);
+  const floor = out - (out * BigInt(request.slippageBps)) / 10_000n;
+  if (BigInt(quote.otherAmountThreshold) < floor) {
+    mismatch('minimum output', quote.otherAmountThreshold, `at least ${floor.toString()}`);
+  }
+}
+
 export class JupiterAdapter implements ExecutionAdapter {
   readonly chain = 'solana' as const;
   readonly protocol = 'jupiter-v6' as const;
@@ -157,6 +208,13 @@ export class JupiterAdapter implements ExecutionAdapter {
       });
     }
     const quote = parsed.data;
+
+    // The response is checked against the request before anything downstream
+    // trusts it. The ExecutionQuote below labels the trade with the tokens we
+    // asked for while its amounts come from Jupiter, and `quoteResponse` is
+    // echoed verbatim to /swap, so a reply that quietly names another mint or
+    // another amount would move something other than what was decided.
+    assertQuoteMatchesRequest(quote, request);
 
     // The instructions tell us which programs the transaction will invoke.
     const instructions = await this.#swapInstructions(quote, request.from);
@@ -216,15 +274,14 @@ export class JupiterAdapter implements ExecutionAdapter {
   /**
    * Simulate through the chain.
    *
-   * The serialized transaction from Jupiter is submitted to simulateTransaction
-   * with signature verification off. A failure here (most often: the wallet
-   * does not hold the input) is reported, not swallowed.
+   * The built transaction — the one that will be signed — is submitted to
+   * simulateTransaction with signature verification off. A failure here (most
+   * often: the wallet does not hold the input) is reported, not swallowed.
    */
-  async simulate(quote: ExecutionQuote): Promise<SimulationResult> {
+  async simulate(quote: ExecutionQuote, tx: UnsignedTransaction): Promise<SimulationResult> {
     const simulatedAt = Date.now();
     try {
-      const built = await this.build(quote);
-      const payload = built.payload as { transactionBase64: string };
+      const payload = tx.payload as { transactionBase64: string };
 
       const result = await this.#rpc<{
         value: { err: unknown; unitsConsumed?: number; logs?: string[] };

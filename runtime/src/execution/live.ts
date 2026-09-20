@@ -123,7 +123,16 @@ export class LiveExecutor {
     this.#trades.markDispatched(tradeId);
     this.#gate.markDispatched(action);
 
-    const simulation = await adapter.simulate(quote);
+    // Build first, then simulate what was built: simulating a separately
+    // built transaction proves nothing about the one that gets signed.
+    let tx: UnsignedTransaction;
+    try {
+      tx = await adapter.build(quote);
+    } catch (error) {
+      return this.#fail(tradeId, action, `build failed: ${errorMessage(error)}`, startedAt);
+    }
+
+    const simulation = await adapter.simulate(quote, tx);
     if (!simulation.ok) {
       return this.#fail(
         tradeId,
@@ -131,13 +140,6 @@ export class LiveExecutor {
         `simulation failed: ${simulation.error ?? 'unknown'}`,
         startedAt,
       );
-    }
-
-    let tx: UnsignedTransaction;
-    try {
-      tx = await adapter.build(quote);
-    } catch (error) {
-      return this.#fail(tradeId, action, `build failed: ${errorMessage(error)}`, startedAt);
     }
 
     return this.#signAndSend(tradeId, action, adapter, tx, {

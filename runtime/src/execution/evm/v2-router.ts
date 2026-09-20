@@ -251,11 +251,10 @@ export class V2RouterAdapter implements ExecutionAdapter, Erc20ApprovalCapable {
    * allowance — are exactly the things that would fail on-chain, which is why
    * simulation exists.
    */
-  async simulate(quote: ExecutionQuote): Promise<SimulationResult> {
+  async simulate(quote: ExecutionQuote, tx: UnsignedTransaction): Promise<SimulationResult> {
     const simulatedAt = Date.now();
     try {
-      const built = await this.build(quote);
-      const payload = built.payload as EvmPayload;
+      const payload = tx.payload as EvmPayload;
 
       const gas = await this.#client.estimateGas({
         account: payload.from,

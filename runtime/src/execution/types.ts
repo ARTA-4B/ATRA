@@ -109,7 +109,14 @@ export interface ExecutionAdapter {
    * real output before anything is committed; PAPER mode uses the result as
    * the fill it pretends happened.
    */
-  simulate(quote: ExecutionQuote): Promise<SimulationResult>;
+  /**
+   * Simulate the transaction that is about to be signed.
+   *
+   * `tx` is the built transaction, not a fresh one: an adapter that built its
+   * own would be simulating a different set of bytes, which on a keyless
+   * public endpoint is a different answer from a different party.
+   */
+  simulate(quote: ExecutionQuote, tx: UnsignedTransaction): Promise<SimulationResult>;
 
   /** Build the unsigned transaction. LIVE only. */
   build(quote: ExecutionQuote): Promise<UnsignedTransaction>;

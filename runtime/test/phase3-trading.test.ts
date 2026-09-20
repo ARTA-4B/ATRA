@@ -193,6 +193,8 @@ class FakeExecutionAdapter implements ExecutionAdapter, Erc20ApprovalCapable {
   readonly contracts: readonly string[];
   readonly broadcasts: SignedTransaction[] = [];
   readonly signingContexts: SigningContext[] = [];
+  readonly simulated: UnsignedTransaction[] = [];
+  readonly builds: UnsignedTransaction[] = [];
   #options: FakeExecutionOptions;
   #lastQuote: ExecutionQuote | null = null;
 
@@ -246,7 +248,9 @@ class FakeExecutionAdapter implements ExecutionAdapter, Erc20ApprovalCapable {
     return Promise.resolve(quote);
   }
 
-  simulate(quote: ExecutionQuote): Promise<SimulationResult> {
+  simulate(quote: ExecutionQuote, tx: UnsignedTransaction): Promise<SimulationResult> {
+    // The executor must hand over the transaction it built, not build again.
+    this.simulated.push(tx);
     const ok = this.#options.simulateOk ?? true;
     return Promise.resolve({
       ok,
@@ -258,7 +262,13 @@ class FakeExecutionAdapter implements ExecutionAdapter, Erc20ApprovalCapable {
   }
 
   build(quote: ExecutionQuote): Promise<UnsignedTransaction> {
-    return Promise.resolve({
+    const tx = this.#build(quote);
+    this.builds.push(tx);
+    return Promise.resolve(tx);
+  }
+
+  #build(quote: ExecutionQuote): UnsignedTransaction {
+    return {
       chain: this.chain,
       payload: {
         to: this.#options.contract,
@@ -268,7 +278,7 @@ class FakeExecutionAdapter implements ExecutionAdapter, Erc20ApprovalCapable {
         gas: '250000',
       },
       summary: 'fake swap',
-    });
+    };
   }
 
   prepareSigning(tx: UnsignedTransaction, from: string): Promise<SigningContext> {
@@ -1150,9 +1160,9 @@ describe('Phase 3: LIVE executor', () => {
     // switches and before the key is used. Every await in between is a window
     // the operator expects the stop to close.
     const simulate = h.execution.simulate.bind(h.execution);
-    h.execution.simulate = async (quote) => {
+    h.execution.simulate = async (quote, tx) => {
       h.services.state.setEmergencyStop(true, 'operator pulled the switch', 'operator');
-      return simulate(quote);
+      return simulate(quote, tx);
     };
 
     const report = await h.services.pipeline.runCycle({
@@ -1279,6 +1289,30 @@ describe('Phase 3: LIVE executor', () => {
     expect(outcome.status).toBe('filled');
     expect(h.execution.broadcasts).toHaveLength(1);
     expect(h.services.trades.get(row.id)?.txHash).toMatch(/^[1-9A-HJ-NP-Za-km-z]+$/);
+  });
+
+  it('simulates the transaction it is about to sign, not another build of it', async () => {
+    // Both adapters used to build inside simulate() and the executor built
+    // again afterwards, so the bytes that passed simulation were a different
+    // network response from the bytes that were signed. On Solana that is two
+    // separate POST /swap calls to a keyless public endpoint.
+    h = await harness({
+      trader: openWeth('10'),
+      execution: { allowance: 10n ** 30n },
+      chains: { base: { tokens: new Map([[USDC_BASE, 1_000_000_000n]]) } },
+    });
+    await activateLive(h.services);
+
+    const report = await h.services.pipeline.runCycle({
+      chain: 'base',
+      token: WETH_BASE,
+      source: 'operator',
+    });
+
+    expect(report.outcome).toBe('filled');
+    expect(h.execution.simulated).toHaveLength(1);
+    expect(h.execution.builds).toHaveLength(1);
+    expect(h.execution.simulated[0]).toBe(h.execution.builds[0]);
   });
 
   it('reconciles in-flight rows on restart by hash and never re-signs', async () => {
