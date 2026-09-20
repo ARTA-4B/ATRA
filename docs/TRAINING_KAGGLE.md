@@ -140,6 +140,49 @@ sha256 together, update `MODEL_CARD.md`, and change the status label. Until
 then the model is **UNTRAINED** everywhere the runtime reports it, and that is
 correct.
 
+## Run log
+
+Six attempts. The first five died in under three and a half minutes each; the
+sixth trained for four hours and then failed in the export. Recorded because
+every one of them was a real environment fact, not a mistake in the method.
+
+| # | Ended in | Cause | Fix |
+|---|---|---|---|
+| 1 | 2 min | `transformers==4.62.1` and `huggingface_hub==0.38.2` had never been published | pinned 4.57.6 / 0.36.2, verified against PyPI |
+| 2 | 3 min | HF Trainer used DataParallel across both T4s; `tee` hid the exit code; llama.cpp's requirements replaced Kaggle's CUDA torch with a CPU build | `CUDA_VISIBLE_DEVICES=0`, `set -o pipefail`, `pip install --no-deps gguf` |
+| 3 | 3 min | bf16 unscale error: the model loaded in one dtype, the scaler expected another | load the model in the compute dtype |
+| 4 | 3 min | same, because `dtype` and `torch_dtype` disagreed across versions | pick the keyword from `inspect.signature`, cast trainable params to fp32 |
+| 5 | 3 min | same again: accelerate owns AMP, not the Trainer argument | export `ACCELERATE_MIXED_PRECISION`, add `ATRA_AMP` |
+| 6 | 4 h 03 m | **training succeeded**; `export.py` raised `ImportError: Found an incompatible version of torchao. Found version 0.10.0, but only versions above 0.16.0 are supported` | `pip uninstall -y torchao` before the merge |
+
+### Run 6, the one that trained
+
+200 steps, 2 epochs over 800 training examples, one Tesla T4, 4 h 03 m, peak
+GPU 4.77 GiB. Loss 2.38 → 0.046 (reported `train_loss` 0.206); mean token
+accuracy 0.67 → 0.985. Manifest `status: completed`, dataset hash
+`3e4faf65…632eb`, base `unsloth/Qwen3-4B-Instruct-2507-bnb-4bit` at revision
+`f12db89c`, `ATRA_AMP=off`.
+
+Why torchao ended it: peft's LoRA dispatcher calls `is_torchao_available()`
+for every module it injects, and that helper *raises* on a version below
+0.16.0 instead of returning False. Training never reaches it, because the
+bitsandbytes dispatcher matches first on a 4-bit base. The merge loads the
+base in fp16, so it does reach it. Neither path uses torchao.
+
+### Exporting without retraining
+
+A finished kernel's adapter is worth four hours, so it does not get thrown
+away when a later cell fails. The adapter is uploaded as a private dataset
+(`atra12/atra-4b-adapter-v0`, 66 MB) and a second kernel
+(`atra12/atra-4b-export`) merges from it. Three things that cost a run each:
+
+- `kernel_sources` is refused when the source kernel's last run ended in
+  ERROR, which is exactly the case here. Use `dataset_sources`.
+- The dataset's layout inside `/kaggle/input` is not the folder that was
+  uploaded. Find `adapter_config.json` and use its parent.
+- `/kaggle/temp` does not exist unless the notebook creates it; the training
+  notebook did, so the export notebook had to as well.
+
 ## Fallback: RunPod
 
 Same notebook logic as a shell script. Pick a *Community Cloud* RTX 3090 or

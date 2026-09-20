@@ -25,6 +25,14 @@ export interface SolanaMessageSummary {
   feePayer: string;
   /** Static account keys, in message order. */
   staticAccountKeys: string[];
+  /**
+   * Every program the message invokes at the top level, unique and sorted.
+   *
+   * A compiled instruction names its program by an index into the static
+   * keys; the runtime rejects a program id that resolves through an address
+   * lookup table, so this is the complete set regardless of message version.
+   */
+  programIds: string[];
 }
 
 export interface SignedSolanaTransaction {
@@ -138,12 +146,49 @@ function summarizeMessage(message: Uint8Array): SolanaMessageSummary {
     const start = offset + index * PUBKEY_BYTES;
     staticAccountKeys.push(base58.encode(message.subarray(start, start + PUBKEY_BYTES)));
   }
+  offset += keyCount * PUBKEY_BYTES;
+
+  // Recent blockhash, then the instruction list.
+  if (message.length < offset + PUBKEY_BYTES) {
+    throw new AppError(ErrorCode.SCHEMA_INVALID, 'Message blockhash is truncated');
+  }
+  offset += PUBKEY_BYTES;
+
+  const [instructionCount, afterInstructionCount] = readCompactU16(message, offset);
+  offset = afterInstructionCount;
+
+  const programIds = new Set<string>();
+  for (let index = 0; index < instructionCount; index += 1) {
+    const programIdIndex = message[offset];
+    if (programIdIndex === undefined) {
+      throw new AppError(ErrorCode.SCHEMA_INVALID, 'Instruction program index is truncated');
+    }
+    offset += 1;
+
+    const programId = staticAccountKeys[programIdIndex];
+    if (programId === undefined) {
+      throw new AppError(
+        ErrorCode.SCHEMA_INVALID,
+        `Instruction names account ${String(programIdIndex)}, which the message does not carry`,
+      );
+    }
+    programIds.add(programId);
+
+    const [accountCount, afterAccounts] = readCompactU16(message, offset);
+    offset = afterAccounts + accountCount;
+    const [dataLength, afterDataLength] = readCompactU16(message, offset);
+    offset = afterDataLength + dataLength;
+    if (message.length < offset) {
+      throw new AppError(ErrorCode.SCHEMA_INVALID, 'Instruction data is truncated');
+    }
+  }
 
   return {
     version,
     numRequiredSignatures,
     feePayer: staticAccountKeys[0]!,
     staticAccountKeys,
+    programIds: [...programIds].sort(),
   };
 }
 

@@ -15,8 +15,9 @@ import type { AuditLog } from '../audit/audit.js';
 import type { WalletService } from '../wallet/service.js';
 import type { StateStore } from '../core/state.js';
 import type { ExecutionRegistry } from './registry.js';
+import { SOLANA_SYSTEM_PROGRAMS } from '../chains/registry.js';
 import { signEvmTransaction } from './evm/signer.js';
-import { signSolanaTransaction } from './solana/signer.js';
+import { signSolanaTransaction, summarizeSolanaTransaction } from './solana/signer.js';
 import { microsToUsd, nativeToUsdMicros, priceToAtto } from '../risk/money.js';
 import { CHAINS } from '../chains/registry.js';
 import { childLogger } from '../logging/logger.js';
@@ -288,6 +289,34 @@ export class LiveExecutor {
     );
   }
 
+  /**
+   * Programs the signed message invokes that the engine never approved.
+   *
+   * Returns a refusal message, or null when every program is either one the
+   * engine approved for this action or one of the chain's own system programs
+   * (compute budget, token, associated-token, lookup tables), which any swap
+   * legitimately touches. The approved contract itself must also appear: a
+   * message that does not invoke the router is not the swap that was decided.
+   */
+  #unapprovedPrograms(action: ProposedAction, transactionBase64: string): string | null {
+    let programIds: string[];
+    try {
+      programIds = summarizeSolanaTransaction(transactionBase64).programIds;
+    } catch (error) {
+      return `built transaction could not be decoded: ${errorMessage(error)}`;
+    }
+
+    const approved = new Set([...(action.programIds ?? []), ...SOLANA_SYSTEM_PROGRAMS]);
+    const unapproved = programIds.filter((id) => !approved.has(id));
+    if (unapproved.length > 0) {
+      return `built transaction invokes ${unapproved.join(', ')}, which the engine did not approve`;
+    }
+    if (!programIds.includes(action.contract)) {
+      return `built transaction never invokes ${action.contract}, the approved program`;
+    }
+    return null;
+  }
+
   #refusal(action: ProposedAction): string | null {
     if (action.mode !== 'LIVE') return `action mode ${action.mode} is not LIVE`;
     if (this.#state.getMode() !== 'LIVE') return 'runtime is not in LIVE mode';
@@ -329,6 +358,17 @@ export class LiveExecutor {
     const feeOverrun = this.#feeOverrun(action, context);
     if (feeOverrun !== null) {
       return this.#fail(tradeId, action, feeOverrun, startedAt);
+    }
+
+    // On Solana the equivalent of "is this going where the engine allowed" is
+    // the set of programs the message invokes. The engine approved
+    // action.programIds, which the adapter read from one Jupiter endpoint; the
+    // bytes about to be signed came from another. Decode them and compare.
+    if (context.family === 'solana') {
+      const unapproved = this.#unapprovedPrograms(action, context.transactionBase64);
+      if (unapproved !== null) {
+        return this.#fail(tradeId, action, unapproved, startedAt);
+      }
     }
 
     // The adapter must be sending to the contract the engine approved.

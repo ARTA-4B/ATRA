@@ -43,6 +43,7 @@ import {
 import { parseDecimalAmount, validateDestination } from '../src/wallet/withdrawal.js';
 import { usdToTokenUnits } from '../src/trading/proposal.js';
 import { deriveIdempotencyKey } from '../src/risk/engine.js';
+import type { ProposedAction } from '../src/risk/types.js';
 
 /**
  * Phase 3: the trading pipeline, both executors, withdrawals and recovery.
@@ -182,6 +183,8 @@ interface FakeExecutionOptions {
   gasPriceWei?: bigint;
   allowance?: bigint;
   receiptAmountOut?: (quote: ExecutionQuote) => string | null;
+  /** Programs the built Solana message invokes. Default: a bare System transfer. */
+  signedPrograms?: string[];
 }
 
 class FakeExecutionAdapter implements ExecutionAdapter, Erc20ApprovalCapable {
@@ -276,9 +279,21 @@ class FakeExecutionAdapter implements ExecutionAdapter, Erc20ApprovalCapable {
             family: 'solana',
             feePayer: from,
             transactionBase64: unsignedTransactionBase64(
-              compileLegacyMessage(from, base58.encode(new Uint8Array(32).fill(9)), [
-                systemTransfer(from, base58.encode(new Uint8Array(32).fill(3)), 1n),
-              ]),
+              compileLegacyMessage(
+                from,
+                base58.encode(new Uint8Array(32).fill(9)),
+                // A real Jupiter message invokes the swap program. The
+                // executor compares the programs in the signed bytes with the
+                // ones the engine approved, so the double has to be able to
+                // build an honest message and a dishonest one.
+                this.#options.signedPrograms === undefined
+                  ? [systemTransfer(from, base58.encode(new Uint8Array(32).fill(3)), 1n)]
+                  : this.#options.signedPrograms.map((programId) => ({
+                      programId,
+                      accounts: [{ pubkey: from, isSigner: true, isWritable: true }],
+                      data: new Uint8Array([1]),
+                    })),
+              ),
             ),
             lastValidBlockHeight: 1,
           }
@@ -500,6 +515,10 @@ async function harness(options: {
 
   return { services, chains, execution, market };
 }
+
+const JUPITER_V6 = 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4';
+const SOLANA_USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const SOLANA_SOL = 'So11111111111111111111111111111111111111112';
 
 const openWeth = (usd: string) => ({
   action: 'OPEN',
@@ -1152,6 +1171,114 @@ describe('Phase 3: LIVE executor', () => {
     expect(h.execution.signingContexts).toHaveLength(1);
     expect(h.execution.broadcasts).toHaveLength(0);
     expect(h.services.trades.get(report.trade!.tradeId)?.txHash).toBeNull();
+  });
+
+  /**
+   * Drive one LIVE Solana action straight through the executor.
+   *
+   * The engine's decision is not what is under test here: the question is
+   * whether the bytes handed to the signing key are checked against it, so
+   * the row is allowed by hand and `execute` is called directly.
+   */
+  async function solanaAttempt(signedPrograms: string[]) {
+    h = await harness({
+      trader: openWeth('10'),
+      execution: {
+        chain: 'solana',
+        protocol: 'jupiter-v6',
+        contract: JUPITER_V6,
+        signedPrograms,
+        outPerIn: (amountIn) => amountIn * 10n ** 3n,
+      },
+    });
+    await activateLive(h.services);
+
+    const quote = await h.execution.quote({
+      chain: 'solana',
+      tokenIn: { address: SOLANA_USDC, decimals: 6 },
+      tokenOut: { address: SOLANA_SOL, decimals: 9 },
+      amountIn: '10000000',
+      slippageBps: 50,
+      from: h.services.wallets.depositAddress('solana'),
+    });
+
+    const action: ProposedAction = {
+      schemaVersion: 1,
+      actionId: randomUUID(),
+      decisionCycleId: randomUUID(),
+      idempotencyKey: 'd'.repeat(64),
+      proposedAt: Date.now(),
+      mode: 'LIVE',
+      source: 'test',
+      chain: 'solana',
+      kind: 'swap',
+      protocol: 'jupiter-v6',
+      contract: JUPITER_V6,
+      programIds: quote.programIds ?? [JUPITER_V6],
+      reduceOnly: false,
+      tokenIn: { address: SOLANA_USDC, decimals: 6 },
+      tokenOut: { address: SOLANA_SOL, decimals: 9 },
+      amountIn: '10000000',
+      quote: {
+        expectedAmountOut: quote.expectedAmountOut,
+        minAmountOut: quote.minAmountOut,
+        slippageBps: quote.slippageBps,
+        priceImpactBps: quote.priceImpactBps,
+        quotedAt: quote.quotedAt,
+        source: quote.source,
+        marketId: quote.marketId,
+      },
+      feeEstimate: quote.feeEstimate,
+    };
+
+    const row = h.services.trades.propose(action, 'open');
+    h.services.trades.decide(row.id, { allowed: true, code: 'OK' } as never);
+
+    const outcome = await h.services.live.execute(row.id, action, quote, {
+      tokenInUsd: '1',
+      tokenOutUsd: '100',
+      nativeUsd: '100',
+    });
+    return { outcome, row };
+  }
+
+  it('refuses to sign a Solana message that invokes a program the engine never approved', async () => {
+    // The engine approved the programs the adapter read from one Jupiter
+    // endpoint; the bytes to be signed come from another. An endpoint that
+    // answered differently to the two would otherwise get a transfer of the
+    // wallet's balance signed, and simulateTransaction has no objection to a
+    // valid transfer.
+    const rogue = base58.encode(new Uint8Array(32).fill(7));
+    const { outcome, row } = await solanaAttempt([JUPITER_V6, rogue]);
+
+    expect(outcome.status).toBe('failed');
+    expect(outcome.error).toContain(rogue);
+    expect(outcome.error).toMatch(/did not approve/);
+    expect(h.execution.broadcasts).toHaveLength(0);
+    expect(h.services.trades.get(row.id)?.txHash).toBeNull();
+  });
+
+  it('refuses to sign a Solana message that never invokes the approved program', async () => {
+    // Every program here is a system program, so the unapproved-program filter
+    // passes; a message that only moves lamports is still not the swap that
+    // was decided.
+    const { outcome } = await solanaAttempt(['11111111111111111111111111111111']);
+
+    expect(outcome.status).toBe('failed');
+    expect(outcome.error).toMatch(/never invokes .*, the approved program/);
+    expect(h.execution.broadcasts).toHaveLength(0);
+  });
+
+  it('signs a Solana message whose programs are the approved ones', async () => {
+    const { outcome, row } = await solanaAttempt([
+      JUPITER_V6,
+      'ComputeBudget111111111111111111111111111111',
+      '11111111111111111111111111111111',
+    ]);
+
+    expect(outcome.status).toBe('filled');
+    expect(h.execution.broadcasts).toHaveLength(1);
+    expect(h.services.trades.get(row.id)?.txHash).toMatch(/^[1-9A-HJ-NP-Za-km-z]+$/);
   });
 
   it('reconciles in-flight rows on restart by hash and never re-signs', async () => {
