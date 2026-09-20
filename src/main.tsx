@@ -8,4 +8,5 @@ import '@fontsource/dm-sans/latin-700.css';
 import '@fontsource/ibm-plex-mono/latin-400.css';
 import '@fontsource/libre-caslon-text/latin-700.css';
 import './styles.css';
+import './enhancements.css';
 ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>);

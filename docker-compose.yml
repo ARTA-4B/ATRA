@@ -22,6 +22,11 @@ services:
     ports:
       - "127.0.0.1:3000:3000"
 
+    # Its own bridge, with a pinned subnet, so the gateway address below is a
+    # fact rather than whatever Docker happened to allocate.
+    networks:
+      - atra
+
     # The encrypted vault and the SQLite database live here. Back this volume up
     # and you have backed up the wallet; lose it without an export and the funds
     # are unreachable.
@@ -38,12 +43,13 @@ services:
       ATRA_PORT: "3000"
       ATRA_DATA_DIR: /data
       ATRA_LOG_PRETTY: "0"
-      # Setup and key export are restricted to "local" clients. Inside the
-      # container the operator's browser arrives from the bridge gateway
-      # (172.17.0.1 or similar), not from 127.0.0.1, so the private ranges are
-      # listed. The real boundary is the port mapping above: only the host's
-      # loopback can reach this container at all.
-      ATRA_LOCAL_CLIENTS: "127.0.0.0/8,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+      # Setup, key export and treasury-admin setup are restricted to "local"
+      # clients. Inside the container the operator's browser arrives from the
+      # bridge gateway, not from 127.0.0.1, so that one address is listed —
+      # and only that one. Listing the whole RFC1918 space would mean that the
+      # day someone widens the port mapping above (as the header invites), the
+      # guard would admit every host on their LAN instead of stopping them.
+      ATRA_LOCAL_CLIENTS: "127.0.0.0/8,::1,172.28.0.1/32"
 
     healthcheck:
       # node, not wget: the slim base image has no wget, and a health check
@@ -75,6 +81,18 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
+networks:
+  # Pinned rather than left to Docker's allocator: ATRA_LOCAL_CLIENTS names the
+  # gateway of this subnet, and a guard that depends on an address must be able
+  # to name it. Change both together if 172.28.0.0/24 collides with something
+  # on your machine.
+  atra:
+    name: atra
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+          gateway: 172.28.0.1
 
 volumes:
   atra-data:

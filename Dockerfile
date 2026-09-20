@@ -82,8 +82,11 @@ USER node
 VOLUME ["/data"]
 EXPOSE 3000
 
+# node, not wget: the slim base image ships neither wget nor curl, and a health
+# check that cannot run marks a perfectly healthy container unhealthy. Same
+# command as docker-compose.yml, so the two cannot drift.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:3000/health || exit 1
+  CMD ["node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>r.json()).then(b=>process.exit(b.status==='ok'?0:1)).catch(()=>process.exit(1))"]
 
 # Node is PID 1 and handles SIGTERM itself: the runtime locks the vault and
 # checkpoints the database before exiting, so no init shim is needed.

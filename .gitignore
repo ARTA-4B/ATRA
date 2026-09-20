@@ -5,6 +5,9 @@ dist/
 test-results/
 playwright-report/
 artifacts/
+.wrangler/
+.dev.vars*
+.cloudflare/
 
 # Backend runtime
 runtime/node_modules/
