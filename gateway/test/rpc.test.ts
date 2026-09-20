@@ -4,6 +4,7 @@ import {
   CACHE_TTL_SECONDS,
   EVM_READ_METHODS,
   MAX_BATCH,
+  MAX_UPSTREAM_BODY_BYTES,
   REFUSED_METHODS,
   SOLANA_READ_METHODS,
   UPSTREAMS,
@@ -308,6 +309,107 @@ describe('POST /v1/rpc/{chain}', () => {
     expect(points[1].blobs).toEqual(['rpc', 'base', 'refused', 'miss', 'dev']);
     // No bodies, no params, no tokens.
     expect(JSON.stringify(points)).not.toContain(token);
+  });
+
+  it('refuses signing, broadcasting and wallet methods, and case variants of them', async () => {
+    upstream = evmUpstream();
+    // The refusal list is matched exactly, so a case variant is not refused by
+    // name; it is not on the read allowlist either, which is what rejects it.
+    const cases = [
+      { chain: 'base', method: 'eth_sign', code: 'method_refused' },
+      { chain: 'base', method: 'personal_sign', code: 'method_refused' },
+      { chain: 'base', method: 'eth_signTypedData_v4', code: 'method_refused' },
+      { chain: 'solana', method: 'sendTransaction', code: 'method_refused' },
+      { chain: 'base', method: 'ETH_SENDRAWTRANSACTION', code: 'method_not_allowed' },
+      { chain: 'base', method: 'Eth_SendRawTransaction', code: 'method_not_allowed' },
+      { chain: 'base', method: 'wallet_sendCalls', code: 'method_not_allowed' },
+      { chain: 'base', method: 'wallet_requestPermissions', code: 'method_not_allowed' },
+      { chain: 'solana', method: 'signTransaction', code: 'method_not_allowed' },
+      { chain: 'solana', method: 'signAllTransactions', code: 'method_not_allowed' },
+    ];
+    for (const { chain, method, code } of cases) {
+      const { response, body } = await postJson(`/v1/rpc/${chain}`, token, rpc(method));
+      expect(response.status, method).toBe(403);
+      expect(response.headers.get('content-type')).toContain('application/problem+json');
+      expect(body).toMatchObject({ code, method, chain });
+    }
+    expect(upstream.calls).toHaveLength(0);
+  });
+
+  it('refuses a nested array and a non-object item inside a batch', async () => {
+    upstream = evmUpstream();
+    const nested = await postJson('/v1/rpc/base', token, [
+      rpc('eth_blockNumber', [], 1),
+      [rpc('eth_call', [], 2)],
+    ]);
+    expect(nested.response.status).toBe(400);
+    expect(nested.body).toMatchObject({ code: 'invalid_request', index: 1 });
+
+    for (const item of ['eth_blockNumber', 7, null, true]) {
+      const { response, body } = await postJson('/v1/rpc/base', token, [item]);
+      expect(response.status).toBe(400);
+      expect(body).toMatchObject({ code: 'invalid_request', index: 0 });
+    }
+    expect(upstream.calls).toHaveLength(0);
+  });
+
+  it('refuses an upstream that declares a body over the cap, without parsing it', async () => {
+    // A cap that drifts upward is a cap that no longer protects the isolate's
+    // memory, so the bound itself is pinned and not only the behaviour.
+    expect(MAX_UPSTREAM_BODY_BYTES).toBeLessThanOrEqual(4 * 1024 * 1024);
+    // A valid, small reply behind a lying Content-Length: a 200 here would
+    // mean the header was ignored and the body parsed anyway.
+    upstream = stubUpstreams({
+      [BASE_RPC]: () =>
+        jsonResponse({ jsonrpc: '2.0', id: 0, result: '0x1' }, 200, {
+          'content-length': String(MAX_UPSTREAM_BODY_BYTES + 1),
+        }),
+    });
+    const { response, body } = await postJson(
+      '/v1/rpc/base',
+      token,
+      rpc('eth_getTransactionCount', ['0xabc', 'latest']),
+    );
+    expect(response.status).toBe(502);
+    expect(response.headers.get('content-type')).toContain('application/problem+json');
+    expect(body).toMatchObject({
+      code: 'upstream_too_large',
+      chain: 'base',
+      maxBytes: MAX_UPSTREAM_BODY_BYTES,
+    });
+    expect(JSON.stringify(body)).not.toContain('mainnet.base.org');
+  });
+
+  it('stops reading a streamed upstream body at the cap and cancels it', async () => {
+    let pulls = 0;
+    let cancelled = false;
+    // No Content-Length: the byte count, not the header, is what bounds this.
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        if (pulls > 8) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(new Uint8Array(1024 * 1024).fill(0x20));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    upstream = stubUpstreams({
+      [BASE_RPC]: () => new Response(stream, { headers: { 'content-type': 'application/json' } }),
+    });
+    const { response, body } = await postJson(
+      '/v1/rpc/base',
+      token,
+      rpc('eth_getTransactionCount', ['0xdef', 'latest']),
+    );
+    expect(response.status).toBe(502);
+    expect(body).toMatchObject({ code: 'upstream_too_large', maxBytes: MAX_UPSTREAM_BODY_BYTES });
+    expect(cancelled).toBe(true);
+    // Three megabytes read, not the whole stream.
+    expect(pulls).toBeLessThanOrEqual(4);
   });
 });
 

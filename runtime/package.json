@@ -27,7 +27,6 @@
     "@noble/curves": "2.4.0",
     "@noble/hashes": "2.4.0",
     "@scure/base": "2.4.0",
-    "croner": "10.0.1",
     "hono": "4.13.8",
     "pino": "10.3.1",
     "viem": "2.56.8",

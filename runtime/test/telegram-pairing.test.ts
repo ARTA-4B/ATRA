@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { shutdownServices } from '../src/core/services.js';
+import { AppError, ErrorCode } from '../src/util/errors.js';
 import { PairingService } from '../src/telegram/pairing.js';
 import {
   PAIR_CODE_ALPHABET,
@@ -15,8 +16,9 @@ import type { Harness } from './telegram-harness.js';
 /**
  * Pairing is the only moment an unknown Telegram user can become the one
  * user this installation obeys, so every property of the code is asserted:
- * shape, alphabet, lifetime, single use, supersession, and that the database
- * holds only a hash.
+ * shape, alphabet, lifetime, single use, supersession, that the database
+ * holds only a hash, and that a link can never be taken over by a second
+ * account without a local unpair first.
  */
 
 describe('pair codes', () => {
@@ -88,10 +90,15 @@ describe('PairingService', () => {
     expect(p.link()?.chatId).toBe(OPERATOR.chatId);
     expect(p.status(issued.code)).toBe('confirmed');
 
+    // A stranger is stopped by the link itself, before the code is even read.
     const replay = p.verify(issued.code, STRANGER, 'direct');
     expect(replay.ok).toBe(false);
-    if (!replay.ok) expect(replay.reason).toBe('used');
-    // The link is untouched by the failed replay.
+    if (!replay.ok) expect(replay.reason).toBe('already_paired');
+    // The paired account passes that gate and meets the single-use guard.
+    const own = p.verify(issued.code, OPERATOR, 'direct');
+    expect(own.ok).toBe(false);
+    if (!own.ok) expect(own.reason).toBe('used');
+    // The link is untouched by the failed replays.
     expect(p.link()?.userId).toBe(OPERATOR.userId);
 
     const actions = h.services.audit.list({ category: 'telegram' }).map((row) => row.action);
@@ -140,7 +147,7 @@ describe('PairingService', () => {
     const issued = p.issue('gateway');
     expect(p.pending()?.codeHash).toBe(issued.codeHash);
     const link = p.confirmFromGateway(OPERATOR, h.clock.now);
-    expect(link.transport).toBe('gateway');
+    expect(link?.transport).toBe('gateway');
     expect(p.status(issued.code)).toBe('confirmed');
     expect(p.pending()).toBeUndefined();
   });
@@ -149,16 +156,99 @@ describe('PairingService', () => {
     h = await harness();
     const p = pairing();
     expect(p.verify(p.issue('direct').code, OPERATOR, 'direct').ok).toBe(true);
-    const pendingAfterPair = p.issue('direct');
+    // Moving the link to another account starts with an unpair, never a code.
+    expect(() => p.issue('direct')).toThrow(/already paired/i);
     expect(p.unpair('operator', 'test')).toBe(true);
     expect(p.link()).toBeUndefined();
-    expect(p.status(pendingAfterPair.code)).toBe('expired');
     expect(p.unpair('operator', 'again')).toBe(false);
+
+    const pendingAfterUnpair = p.issue('direct');
+    expect(p.unpair('operator', 'third')).toBe(false);
+    expect(p.status(pendingAfterUnpair.code)).toBe('expired');
 
     expect(p.verify(p.issue('direct').code, STRANGER, 'direct').ok).toBe(true);
     expect(p.link()?.userId).toBe(STRANGER.userId);
     expect(
       h.services.db.prepare<[], { n: number }>('SELECT COUNT(*) AS n FROM telegram_link').get()?.n,
     ).toBe(1);
+  });
+
+  it('refuses to issue a code while paired, with the contract error code', async () => {
+    h = await harness();
+    const p = pairing();
+    expect(p.verify(p.issue('direct').code, OPERATOR, 'direct').ok).toBe(true);
+
+    let thrown: unknown;
+    try {
+      p.issue('direct');
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(AppError);
+    expect((thrown as AppError).code).toBe(ErrorCode.TELEGRAM_ALREADY_PAIRED);
+    expect((thrown as AppError).status).toBe(409);
+    // Nothing was written: the operator's own pairing is left exactly as it was.
+    expect(p.link()?.userId).toBe(OPERATOR.userId);
+    expect(p.pending()).toBeUndefined();
+    expect(
+      h.services.db
+        .prepare<[], { n: number }>('SELECT COUNT(*) AS n FROM telegram_pair_codes')
+        .get()?.n,
+    ).toBe(1);
+  });
+
+  it('refuses a live code from another account without consuming it', async () => {
+    h = await harness();
+    const p = pairing();
+    const issued = p.issue('direct');
+    // issue() now keeps a code and a link from coexisting, so the state this
+    // guard defends against has to be written behind the service's back.
+    const iso = new Date(h.clock.now).toISOString();
+    h.services.db
+      .prepare(
+        'INSERT INTO telegram_link (id, user_id, chat_id, display_name, transport, paired_at,' +
+          ' updated_at) VALUES (1, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(OPERATOR.userId, OPERATOR.chatId, OPERATOR.displayName, 'direct', iso, iso);
+
+    const takeover = p.verify(issued.code, STRANGER, 'direct');
+    expect(takeover).toEqual({ ok: false, reason: 'already_paired' });
+    expect(p.link()?.userId).toBe(OPERATOR.userId);
+    // The operator's own code survives the attempt.
+    expect(p.status(issued.code)).toBe('pending');
+    expect(
+      h.services.audit
+        .list({ category: 'telegram' })
+        .some(
+          (row) =>
+            row.action === 'telegram.pair.rejected' && row.detail['reason'] === 'already_paired',
+        ),
+    ).toBe(true);
+
+    // The same account pairing a second chat is a re-pair, not a take-over.
+    const moved = p.verify(issued.code, { ...OPERATOR, chatId: 555 }, 'direct');
+    expect(moved.ok).toBe(true);
+    expect(p.link()?.chatId).toBe(555);
+  });
+
+  it('refuses a gateway confirmation that names another account, and audits it', async () => {
+    h = await harness();
+    const p = pairing();
+    const issued = p.issue('gateway');
+    expect(p.confirmFromGateway(OPERATOR, h.clock.now)?.userId).toBe(OPERATOR.userId);
+
+    expect(p.confirmFromGateway(STRANGER, h.clock.now)).toBeUndefined();
+    expect(p.link()?.userId).toBe(OPERATOR.userId);
+    expect(p.status(issued.code)).toBe('confirmed');
+
+    const refused = h.services.audit
+      .list({ category: 'telegram' })
+      .find((row) => row.action === 'telegram.pair.refused');
+    expect(refused?.status).toBe('failed');
+    expect(refused?.detail['userIdMasked']).toBe('******321');
+    expect(JSON.stringify(refused)).not.toContain(String(STRANGER.userId));
+
+    // The same account reconnecting and re-confirming is still accepted.
+    expect(p.confirmFromGateway(OPERATOR, h.clock.now)?.userId).toBe(OPERATOR.userId);
   });
 });

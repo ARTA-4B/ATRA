@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import pino from 'pino';
 import { Writable } from 'node:stream';
 import { loadConfig, readTelegramSecrets } from '../src/config/env.js';
+import type { AppError } from '../src/util/errors.js';
 import { setRootLogger } from '../src/logging/logger.js';
 import { redact } from '../src/logging/redact.js';
 import { shutdownServices } from '../src/core/services.js';
@@ -68,6 +69,40 @@ describe('configuration', () => {
     expect(() =>
       loadConfig({ ...base, ATRA_GATEWAY_URL: 'ftp://gateway.example', ATRA_GATEWAY_TOKEN: 'x' }),
     ).toThrow(/Invalid environment configuration/);
+  });
+
+  it('refuses cleartext to a remote gateway and allows it for loopback', () => {
+    const base = {
+      NODE_ENV: 'test',
+      ATRA_DATA_DIR: './.test-data',
+      ATRA_GATEWAY_TOKEN: GATEWAY_TOKEN,
+    };
+    // The installation token rides in the upgrade request's Authorization header.
+    for (const url of ['http://gateway.example', 'ws://gateway.example:8787', 'http://10.0.0.5']) {
+      expect(() => loadConfig({ ...base, ATRA_GATEWAY_URL: url })).toThrow(
+        /Invalid environment configuration/,
+      );
+    }
+    let thrown: unknown;
+    try {
+      loadConfig({ ...base, ATRA_GATEWAY_URL: 'http://gateway.example' });
+    } catch (error) {
+      thrown = error;
+    }
+    expect((thrown as AppError).errors?.[0]).toEqual({
+      path: 'ATRA_GATEWAY_URL',
+      message: 'must use https or wss; plain http is allowed only for localhost',
+    });
+
+    for (const url of [
+      'http://localhost:8787',
+      'ws://127.0.0.1:8787',
+      'http://[::1]:8787',
+      'https://gateway.example',
+      'wss://gateway.example',
+    ]) {
+      expect(loadConfig({ ...base, ATRA_GATEWAY_URL: url }).telegram.transport).toBe('gateway');
+    }
   });
 
   it('keeps the tokens off the config object and reads them separately', () => {
@@ -188,6 +223,38 @@ describe('TelegramService', () => {
     events.onUnpaired('operator sent /unpair');
     expect(h.telegram.view().paired).toBe(false);
     expect(h.services.audit.list({ category: 'telegram' })[0]?.action).toBe('telegram.unpaired');
+  });
+
+  it('refuses a gateway pairing that names another account, and keeps the link', async () => {
+    h = await harness();
+    await pairOperator(h);
+    h.transport.events!.onPaired(STRANGER, h.clock.now);
+
+    expect(h.telegram.view().account?.userIdMasked).toBe('******789');
+    const refused = h.services.audit
+      .list({ category: 'telegram' })
+      .find((row) => row.action === 'telegram.pair.refused');
+    expect(refused?.status).toBe('failed');
+    expect(refused?.detail['userIdMasked']).toBe('******321');
+    // Moving to another account starts with an unpair, so no code is issued.
+    expect(() => h.telegram.issuePairCode()).toThrow(/already paired/i);
+    h.telegram.unpair();
+    expect(() => h.telegram.issuePairCode()).not.toThrow();
+  });
+
+  it('audits a superseded gateway session and a revoked installation token', async () => {
+    h = await harness();
+    await pairOperator(h);
+    h.transport.events!.onSuperseded();
+    h.transport.events!.onRevoked();
+
+    const rows = h.services.audit.list({ category: 'telegram' });
+    const superseded = rows.find((row) => row.action === 'telegram.transport.superseded');
+    expect(superseded?.status).toBe('failed');
+    expect(superseded?.summary).toMatch(/revoke and reissue the token/);
+    const revoked = rows.find((row) => row.action === 'telegram.transport.revoked');
+    expect(revoked?.status).toBe('failed');
+    expect(revoked?.summary).toMatch(/until a new token is issued/);
   });
 
   it('announces online on connect and offline on stop, once', async () => {

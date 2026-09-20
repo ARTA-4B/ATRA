@@ -185,6 +185,25 @@ describe('Vault', () => {
     expect(() => shortLived.useSecret(id, (b) => b)).toThrow(/locked/i);
   });
 
+  it('drops the key on its own timer, with nothing calling in', async () => {
+    // Wide enough that unlocking cannot itself outlast the window on a busy
+    // machine: the race this test is for is the timer against an idle
+    // process, not the timer against Argon2.
+    const shortLived = new Vault(db, { autolockMs: 400 });
+    await shortLived.initialize(PASSWORD, FAST_KDF);
+    shortLived.lock();
+    await shortLived.unlock(PASSWORD);
+    expect(shortLived.unlockedAt).toBeDefined();
+
+    // `unlockedAt` is a plain read — unlike `isUnlocked` it does not enforce
+    // the window itself — so a cleared value can only mean the timer fired.
+    // Without it the key would sit in memory until the next call, which on an
+    // idle runtime is never.
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+
+    expect(shortLived.unlockedAt).toBeUndefined();
+  });
+
   it('stores no plaintext anywhere in the database file', async () => {
     await vault.initialize(PASSWORD, FAST_KDF);
     const key = generateEvmPrivateKey();

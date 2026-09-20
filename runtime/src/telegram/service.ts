@@ -372,7 +372,13 @@ export class TelegramService {
     return {
       onCommand: (command) => this.#router.handle(command),
       onPaired: (identity, pairedAt) => {
-        this.#pairing.confirmFromGateway(identity, pairedAt);
+        const link = this.#pairing.confirmFromGateway(identity, pairedAt);
+        if (!link) {
+          this.#log.error(
+            { userIdMasked: maskUserId(identity.userId) },
+            'gateway pairing refused: another Telegram account tried to take the link',
+          );
+        }
       },
       onUnpaired: (reason) => {
         this.#pairing.unpair('gateway', reason.slice(0, 200));
@@ -389,6 +395,28 @@ export class TelegramService {
       onDisconnected: (reason) => {
         this.#connected = false;
         this.#log.warn({ reason }, 'telegram transport disconnected');
+      },
+      onSuperseded: () => {
+        this.#d.audit.append({
+          category: 'telegram',
+          action: 'telegram.transport.superseded',
+          status: 'failed',
+          summary:
+            "Another client connected to the gateway with this installation's token. If you did not just restart ATRA, revoke and reissue the token.",
+          actor: 'system',
+        });
+        this.#log.error('gateway session superseded by another client');
+      },
+      onRevoked: () => {
+        this.#d.audit.append({
+          category: 'telegram',
+          action: 'telegram.transport.revoked',
+          status: 'failed',
+          summary:
+            'The gateway revoked this installation token. Telegram stays offline until a new token is issued.',
+          actor: 'system',
+        });
+        this.#log.error('gateway installation token revoked; telegram transport stopped');
       },
     };
   }

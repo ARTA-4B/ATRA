@@ -1,4 +1,5 @@
 import {
+  TransactionReceiptNotFoundError,
   createPublicClient,
   defineChain,
   encodeFunctionData,
@@ -126,13 +127,18 @@ export class EvmChainAdapter implements ChainAdapter, TransferCapable {
         identityMatches: matches,
       };
     } catch (cause) {
+      // The cause is logged, where the scrubber sees it, and never returned:
+      // this string is rendered in the dashboard, stored and sent to Telegram,
+      // and viem quotes the full RPC URL — which on a BYOK endpoint is the
+      // operator's provider key.
+      this.#log.warn({ err: cause }, 'health check failed');
       return {
         chain: this.chain,
         healthy: false,
         height: null,
         latencyMs: Date.now() - started,
         endpoint: this.#endpoint,
-        error: errorMessage(cause),
+        error: `${this.chain} RPC health check failed: ${failureName(cause)}`,
         identity: null,
         identityMatches: false,
       };
@@ -228,9 +234,13 @@ export class EvmChainAdapter implements ChainAdapter, TransferCapable {
           confirmations: Number(head - receipt.blockNumber) + 1,
           error: receipt.status === 'success' ? null : 'transaction reverted',
         };
-      } catch {
-        // No receipt yet means pending or unknown; the caller distinguishes
-        // those by whether it has seen the hash before.
+      } catch (cause) {
+        // Only the node answering "no such receipt" means pending; the caller
+        // distinguishes pending from unknown by whether it has seen the hash
+        // before. Every other failure — the node being down, a timeout, a
+        // rate limit — is rethrown, because reporting an unreachable node as
+        // "not mined yet" is how a confirmed trade stays open forever.
+        if (!(cause instanceof TransactionReceiptNotFoundError)) throw cause;
         return {
           chain: this.chain,
           hash,
@@ -391,4 +401,16 @@ export class EvmChainAdapter implements ChainAdapter, TransferCapable {
   #observe<T>(value: T): Observation<T> {
     return { value, observedAt: Date.now(), source: this.#endpoint };
   }
+}
+
+/**
+ * Name a failure without quoting its message.
+ *
+ * Health results are shown, stored and forwarded, and viem's messages quote the
+ * endpoint URL — which on a BYOK endpoint is key material.
+ */
+function failureName(cause: unknown): string {
+  if (cause instanceof AppError) return cause.code;
+  if (cause instanceof Error) return cause.name;
+  return 'unknown error';
 }

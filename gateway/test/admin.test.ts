@@ -118,3 +118,84 @@ describe('POST /v1/admin/installs', () => {
     expect(notJson.response.status).toBe(400);
   });
 });
+
+describe('admin authentication', () => {
+  const routes = [
+    { method: 'GET', path: '/v1/admin/installs' },
+    { method: 'POST', path: '/v1/admin/installs' },
+    { method: 'GET', path: '/v1/admin/usage' },
+    { method: 'POST', path: '/v1/admin/installs/lab-runtime-01/revoke' },
+    { method: 'DELETE', path: '/v1/admin/installs/lab-runtime-01' },
+  ];
+
+  it('refuses every admin route when the token is wrong, missing or malformed', async () => {
+    const attempts = [
+      null,
+      '',
+      'Bearer wrong-admin-token',
+      `Bearer ${ADMIN_TOKEN}x`,
+      `Bearer ${ADMIN_TOKEN.slice(0, -1)}`,
+      `Bearer ${ADMIN_TOKEN.toUpperCase()}`,
+      `Basic ${ADMIN_TOKEN}`,
+      ADMIN_TOKEN,
+    ];
+    for (const route of routes) {
+      for (const attempt of attempts) {
+        const init: RequestInit = { method: route.method };
+        if (attempt !== null) init.headers = { authorization: attempt };
+        const { response, body } = await call(route.path, init);
+        expect(response.status, `${route.method} ${route.path} with "${attempt}"`).toBe(401);
+        expect(response.headers.get('content-type')).toContain('application/problem+json');
+        expect(response.headers.get('www-authenticate')).toBe('Bearer');
+        expect(body).toMatchObject({ code: 'unauthorized', status: 401 });
+      }
+    }
+  });
+
+  it('accepts the same routes with the real token, so the guard is what refused', async () => {
+    const headers = { authorization: `Bearer ${ADMIN_TOKEN}` };
+    expect((await call('/v1/admin/installs', { headers })).response.status).toBe(200);
+    expect((await call('/v1/admin/usage', { headers })).response.status).toBe(200);
+    // An unknown installation is a 404 from the handler, not a 401 from the guard.
+    const revoke = await call('/v1/admin/installs/lab-runtime-01/revoke', {
+      method: 'POST',
+      headers,
+    });
+    expect(revoke.response.status).toBe(404);
+    expect(revoke.body).toMatchObject({ code: 'unknown_install' });
+  });
+});
+
+describe('CORS', () => {
+  function corsHeaderNames(response: Response): string[] {
+    const names: string[] = [];
+    response.headers.forEach((_value, name) => {
+      if (name.startsWith('access-control-')) names.push(name);
+    });
+    return names;
+  }
+
+  it('answers no route with CORS headers: nothing here is called from a browser', async () => {
+    const origin = 'https://evil.example';
+
+    const health = await call('/health', { headers: { origin } });
+    expect(health.response.status).toBe(200);
+    expect(corsHeaderNames(health.response)).toEqual([]);
+
+    const proxy = await call('/v1/rpc/base', {
+      method: 'POST',
+      headers: { origin, 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'eth_blockNumber', id: 1 }),
+    });
+    expect(proxy.response.status).toBe(401);
+    expect(corsHeaderNames(proxy.response)).toEqual([]);
+
+    // A preflight is not answered either.
+    const preflight = await call('/v1/rpc/base', {
+      method: 'OPTIONS',
+      headers: { origin, 'access-control-request-method': 'POST' },
+    });
+    expect(corsHeaderNames(preflight.response)).toEqual([]);
+    expect(preflight.response.status).toBe(404);
+  });
+});

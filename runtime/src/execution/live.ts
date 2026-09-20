@@ -21,6 +21,7 @@ import { microsToUsd, nativeToUsdMicros, priceToAtto } from '../risk/money.js';
 import { CHAINS } from '../chains/registry.js';
 import { childLogger } from '../logging/logger.js';
 import { AppError, ErrorCode, errorMessage } from '../util/errors.js';
+import { feeInNativeUnits } from '../risk/engine.js';
 
 /**
  * The LIVE executor: the only code in the runtime that signs and broadcasts.
@@ -269,6 +270,24 @@ export class LiveExecutor {
     return report;
   }
 
+  /**
+   * The worst case the signed transaction can cost, in native units.
+   *
+   * EIP-1559 caps the spend at gas * maxFeePerGas; the refund of the
+   * difference between base fee and cap is not something to rely on when
+   * deciding whether a limit was respected.
+   */
+  #feeOverrun(action: ProposedAction, context: SigningContext): string | null {
+    if (context.family !== 'evm') return null;
+    const approved = feeInNativeUnits(action.feeEstimate.detail);
+    const signing = BigInt(context.gas) * BigInt(context.maxFeePerGas);
+    if (signing <= approved) return null;
+    return (
+      `fee at signing ${signing.toString()} exceeds the approved ${approved.toString()} ` +
+      '(gas moved since the quote); re-quote and decide again'
+    );
+  }
+
   #refusal(action: ProposedAction): string | null {
     if (action.mode !== 'LIVE') return `action mode ${action.mode} is not LIVE`;
     if (this.#state.getMode() !== 'LIVE') return 'runtime is not in LIVE mode';
@@ -293,6 +312,23 @@ export class LiveExecutor {
       context = await adapter.prepareSigning(tx, from);
     } catch (error) {
       return this.#fail(tradeId, action, `prepare failed: ${errorMessage(error)}`, startedAt);
+    }
+
+    // Read the switches again. execute() checked them, but a simulate, a
+    // build and a fee estimate have happened since, each with its own
+    // timeout; an emergency stop engaged in that window must still land
+    // before the key is used.
+    const refusal = this.#refusal(action);
+    if (refusal !== null) {
+      return this.#fail(tradeId, action, `refused before signing: ${refusal}`, startedAt);
+    }
+
+    // The fee the engine approved was computed from the quote's estimate;
+    // prepareSigning re-fetched a fresh one. A spike in between must not be
+    // signed on the strength of the old decision.
+    const feeOverrun = this.#feeOverrun(action, context);
+    if (feeOverrun !== null) {
+      return this.#fail(tradeId, action, feeOverrun, startedAt);
     }
 
     // The adapter must be sending to the contract the engine approved.

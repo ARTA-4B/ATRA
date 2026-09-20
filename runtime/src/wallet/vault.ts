@@ -74,6 +74,17 @@ export interface SecretDescriptor {
 
 const WRAP_AAD = 'atra.vault.dek.v1';
 
+/**
+ * How often the idle window is checked while the vault is unlocked.
+ *
+ * A quarter of the window, so the key is wiped well before a second window
+ * has passed, bounded either way: fast enough that a short autolock (a test,
+ * or an operator who set minutes) is honoured promptly, slow enough that a
+ * 30-minute default does not wake the process every few minutes.
+ */
+const AUTOLOCK_POLL_MIN_MS = 25;
+const AUTOLOCK_POLL_MAX_MS = 60_000;
+
 function secretAad(id: string, kind: SecretKind): string {
   return `atra.vault.secret.v1:${kind}:${id}`;
 }
@@ -86,6 +97,7 @@ export class Vault {
   #dek: Uint8Array | undefined;
   #unlockedAt: number | undefined;
   #lastUsedAt: number | undefined;
+  #autolockTimer: NodeJS.Timeout | undefined;
   readonly #autolockMs: number;
   readonly #defaultKdf: KdfParams;
 
@@ -147,6 +159,7 @@ export class Vault {
 
       this.#dek = dek;
       this.#touch();
+      this.#armAutolock();
       this.#log.info({ kdf: KDF_ALGORITHM, cipher: CIPHER_ALGORITHM }, 'vault initialized');
     } catch (error) {
       wipe(dek);
@@ -199,6 +212,10 @@ export class Vault {
 
   /** Drop the DEK. Idempotent. */
   lock(): void {
+    if (this.#autolockTimer) {
+      clearInterval(this.#autolockTimer);
+      this.#autolockTimer = undefined;
+    }
     if (this.#dek) {
       wipe(this.#dek);
       this.#log.info('vault locked');
@@ -388,6 +405,29 @@ export class Vault {
     this.#dek = dek;
     this.#unlockedAt = Date.now();
     this.#touch();
+    this.#armAutolock();
+  }
+
+  /**
+   * Check the idle window on a timer, not only when something asks for the
+   * key.
+   *
+   * Enforcing it lazily meant an idle runtime kept the DEK in memory
+   * indefinitely — the one situation the autolock exists for. The timer is
+   * unref()ed so it never keeps the process alive, and {@link lock} clears it,
+   * including the call the timer itself makes.
+   */
+  #armAutolock(): void {
+    if (this.#autolockTimer) return;
+
+    const period = Math.min(
+      Math.max(Math.floor(this.#autolockMs / 4), AUTOLOCK_POLL_MIN_MS),
+      AUTOLOCK_POLL_MAX_MS,
+    );
+    this.#autolockTimer = setInterval(() => {
+      this.#enforceAutolock();
+    }, period);
+    this.#autolockTimer.unref();
   }
 
   #touch(): void {

@@ -1,4 +1,3 @@
-import { Cron } from 'croner';
 import type { Db } from '../db/database.js';
 import type { StateStore } from '../core/state.js';
 import type { AuditLog } from '../audit/audit.js';
@@ -50,7 +49,8 @@ export class AutoTradeScheduler {
   readonly #pipeline: AutoTradePipeline;
   readonly #now: () => number;
   readonly #log = childLogger('scheduler');
-  #job: Cron | null = null;
+  #timer: ReturnType<typeof setInterval> | null = null;
+  #nextRunAt: number | null = null;
   #running = false;
 
   constructor(deps: SchedulerDeps) {
@@ -69,13 +69,13 @@ export class AutoTradeScheduler {
   }
 
   stop(): void {
-    this.#job?.stop();
-    this.#job = null;
+    if (this.#timer !== null) clearInterval(this.#timer);
+    this.#timer = null;
+    this.#nextRunAt = null;
   }
 
   status(): SchedulerStatus {
     const row = this.#row();
-    const next = this.#job?.nextRun() ?? null;
     return {
       enabled: row.auto_trade_enabled === 1,
       intervalSeconds: row.interval_seconds,
@@ -83,7 +83,7 @@ export class AutoTradeScheduler {
       lastCycleId: row.last_cycle_id,
       lastCycleAt: row.last_cycle_at,
       lastCycleStatus: row.last_cycle_status,
-      nextRunAt: next ? next.toISOString() : null,
+      nextRunAt: this.#nextRunAt === null ? null : new Date(this.#nextRunAt).toISOString(),
     };
   }
 
@@ -186,21 +186,35 @@ export class AutoTradeScheduler {
     return reports;
   }
 
+  /**
+   * Arm a plain period.
+   *
+   * This used to build a cron pattern, and every interval that was not a
+   * whole number of minutes up to an hour fell through to
+   * `*\/${Math.min(interval, 59)} * * * * *`. The minimum interval is 60 s,
+   * so that expression was always `*\/59 * * * * *`, which fires at :00 and
+   * :59 of every minute: an operator asking for one pass a day got one every
+   * thirty seconds. A period is what the setting means, so a period is what
+   * is armed.
+   */
   #arm(intervalSeconds: number): void {
     this.stop();
-    // Interval expressed as a cron step where it fits, else a fixed pattern
-    // recomputed from the last run: croner accepts both.
-    const pattern =
-      intervalSeconds % 60 === 0 && intervalSeconds <= 3600
-        ? `0 */${String(intervalSeconds / 60)} * * * *`
-        : `*/${String(Math.min(intervalSeconds, 59))} * * * * *`;
+    const periodMs = intervalSeconds * 1_000;
+    this.#nextRunAt = this.#now() + periodMs;
 
-    this.#job = new Cron(pattern, { protect: true, catch: true }, () => {
+    const timer = setInterval(() => {
+      this.#nextRunAt = this.#now() + periodMs;
+      // runOnce refuses to overlap itself, so a pass that outlives its
+      // period is skipped rather than queued.
       void this.runOnce('scheduler').catch((error: unknown) => {
         this.#log.warn({ err: error }, 'scheduled pass skipped');
       });
-    });
-    this.#log.info({ intervalSeconds, pattern }, 'auto-trade armed');
+    }, periodMs);
+    // The HTTP server holds the process open; a pending pass must not.
+    timer.unref?.();
+
+    this.#timer = timer;
+    this.#log.info({ intervalSeconds }, 'auto-trade armed');
   }
 
   #watchlist(): Array<{ chain: ChainId; poolId: string; label: string }> {

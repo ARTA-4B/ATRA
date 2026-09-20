@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createApp } from '../src/http/server.js';
 import { buildServices, shutdownServices } from '../src/core/services.js';
 import { loadConfig } from '../src/config/env.js';
@@ -283,6 +287,59 @@ describe('ATRA HTTP API', () => {
       shutdownServices(container);
     });
 
+    it('sends a content security policy that admits no inline script by default', async () => {
+      const response = await client.get('/health');
+      const csp = response.headers.get('content-security-policy') ?? '';
+
+      expect(csp).toContain("default-src 'self'");
+      expect(csp).toContain("script-src 'self'");
+      expect(csp).toContain("frame-ancestors 'none'");
+      expect(csp).toContain("object-src 'none'");
+      expect(csp).toContain("base-uri 'none'");
+      expect(csp).toContain("form-action 'self'");
+      // A runtime with no dashboard has no inline script to allow.
+      expect(csp).not.toContain('sha256-');
+      expect(csp).not.toContain("script-src 'self' 'unsafe-inline'");
+    });
+
+    it('allows the served dashboard’s inline script by hash, and only that one', () => {
+      // The dashboard sets the theme in an inline script before first paint;
+      // a policy that forgot it would blank the page on every load.
+      const inline = 'document.documentElement.dataset.theme="dark";';
+      const dir = mkdtempSync(join(tmpdir(), 'atra-static-'));
+      writeFileSync(
+        join(dir, 'index.html'),
+        `<!doctype html><html><head><script>${inline}</script></head>` +
+          '<body><script type="module" src="/assets/app.js"></script></body></html>',
+        'utf8',
+      );
+
+      const config = loadConfig({
+        NODE_ENV: 'test',
+        ATRA_MODE: 'ci',
+        ATRA_LOG_LEVEL: 'silent',
+        ATRA_DATA_DIR: './.test-data',
+        ATRA_STATIC_DIR: dir,
+      });
+      const withDashboard = buildServices(config, {
+        databaseFile: ':memory:',
+        adapters: new Map(),
+        kdfParams: FAST_KDF,
+      });
+
+      return new TestClient(createApp(withDashboard)).get('/health').then((response) => {
+        const csp = response.headers.get('content-security-policy') ?? '';
+        const hash = createHash('sha256').update(inline, 'utf8').digest('base64');
+
+        expect(csp).toContain(`script-src 'self' 'sha256-${hash}'`);
+        // One hash: the script that carries a src is served from 'self'.
+        expect(csp.match(/sha256-/g)).toHaveLength(1);
+
+        shutdownServices(withDashboard);
+        rmSync(dir, { recursive: true, force: true });
+      });
+    });
+
     it('rejects a malformed local-client entry at startup', () => {
       const config = loadConfig({
         NODE_ENV: 'test',
@@ -333,6 +390,28 @@ describe('ATRA HTTP API', () => {
 
       const ready = await client.get('/ready');
       expect(ready.status).toBe(200);
+    });
+
+    it('answers setup progress before, without and with a session', async () => {
+      const anonymous = new TestClient(app);
+
+      // Before a password exists there is nothing to protect.
+      const before = await anonymous.get('/api/v1/setup');
+      expect(before.status).toBe(200);
+      expect(before.body.data.steps.passwordSet).toBe(false);
+
+      await client.post('/api/v1/auth/setup', { password: PASSWORD });
+
+      const anonymousAfter = await anonymous.get('/api/v1/setup');
+      expect(anonymousAfter.status).toBe(401);
+      expect(anonymousAfter.body.code).toBe('UNAUTHENTICATED');
+
+      // The signed-in case: the session guard used to be handed the route's
+      // own `next`, which ran the rest of the router and answered 404.
+      const authenticated = await client.get('/api/v1/setup');
+      expect(authenticated.status).toBe(200);
+      expect(authenticated.body.data.steps.passwordSet).toBe(true);
+      expect(authenticated.body.data.steps.vaultCreated).toBe(true);
     });
 
     it('never returns private keys from the setup endpoint', async () => {
@@ -953,5 +1032,90 @@ describe('Phase 3 routes', () => {
     const response = await client.get('/api/v1/wallet/transactions');
     expect(response.status).toBe(200);
     expect(response.body.data).toEqual([]);
+  });
+
+  it('clamps a nonsense page size instead of failing the query', async () => {
+    // `Number('abc')` is NaN and `Number('2.5')` is not an integer; either one
+    // bound to a `LIMIT ?` made SQLite throw, and a malformed request became a
+    // 500 that reads like a broken runtime.
+    const paths = [
+      '/api/v1/trading/decisions',
+      '/api/v1/trading/trades',
+      '/api/v1/wallet/transactions',
+      '/api/v1/liquidity/actions',
+    ];
+
+    for (const path of paths) {
+      for (const limit of ['abc', '2.5', '-1', '0', '', '99999999999999999999']) {
+        const response = await client.get(`${path}?limit=${limit}`);
+        expect([path, limit, response.status]).toEqual([path, limit, 200]);
+        expect(Array.isArray(response.body.data)).toBe(true);
+      }
+    }
+  });
+});
+
+describe('status endpoint', () => {
+  // A BYOK endpoint carries the provider key in its path, and viem's error
+  // formatter repeats the whole URL and the request body inside the message.
+  const ENDPOINT = 'https://x.example/v2/SECRETKEY123456789012345678';
+
+  let services: Services;
+  let client: TestClient;
+
+  beforeEach(async () => {
+    const config = loadConfig({
+      NODE_ENV: 'test',
+      ATRA_MODE: 'ci',
+      ATRA_LOG_LEVEL: 'silent',
+      ATRA_DATA_DIR: './.test-data',
+    });
+
+    const leaky = stubAdapter('base', {
+      health: () =>
+        Promise.resolve({
+          chain: 'base',
+          healthy: false,
+          height: null,
+          latencyMs: null,
+          endpoint: ENDPOINT,
+          error: [
+            'HTTP request failed.',
+            '',
+            `URL: ${ENDPOINT}`,
+            'Request body: {"method":"eth_chainId","params":[]}',
+            '',
+            `Details: 401 Unauthorized from ${ENDPOINT}`,
+          ].join('\n'),
+          identity: null,
+          identityMatches: false,
+        }),
+    });
+
+    services = buildServices(config, {
+      databaseFile: ':memory:',
+      adapters: new Map<ChainId, ChainAdapter>([['base', leaky]]),
+      kdfParams: FAST_KDF,
+    });
+    client = new TestClient(createApp(services));
+    await client.post('/api/v1/auth/setup', { password: PASSWORD });
+  });
+
+  afterEach(() => {
+    shutdownServices(services);
+  });
+
+  it('never echoes a BYOK endpoint, neither as the endpoint nor inside the error', async () => {
+    const response = await client.get('/api/v1/status');
+    expect(response.status).toBe(200);
+
+    expect(JSON.stringify(response.body)).not.toContain('SECRETKEY123456789012345678');
+
+    const base = response.body.data.chains.find((row: { chain: string }) => row.chain === 'base');
+    expect(base.endpoint).toBe('x.example');
+    // Still useful to the operator: which host, and what it said.
+    expect(base.error).toContain('x.example');
+    expect(base.error).toContain('401 Unauthorized');
+    expect(base.error).not.toContain('Request body');
   });
 });

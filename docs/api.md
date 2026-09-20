@@ -140,7 +140,7 @@ balances in this build (Phase 4 did not change that). `warnings[]` includes
 | `GET /api/v1/wallet/transactions?limit=` | `WithdrawResult[]` — operator withdrawals, newest first |
 | `GET /api/v1/wallet/transactions/:txId` | one withdrawal, re-read from the chain if still `submitted` |
 | `POST /api/v1/wallet/withdraw/quote` | `{ chainId, asset: "USDC"\|"ETH"\|"BNB"\|"SOL", destination, amount: "<decimal>"\|"all" }` → `WithdrawQuote` |
-| `POST /api/v1/wallet/withdraw` | `{ quoteId, ack: true, confirmation?: "WITHDRAW" }` + reauth `wallet.withdraw` (+ `Idempotency-Key`) → `WithdrawResult`, 202 |
+| `POST /api/v1/wallet/withdraw` | `{ quoteId, ack: true, confirmation: "WITHDRAW" }` + reauth `wallet.withdraw` (+ `Idempotency-Key`) → `WithdrawResult`, 202 |
 | `POST /api/v1/wallet/export` | `{ format, keystorePassword?, confirmation: "EXPORT" }` + reauth `wallet.export`; loopback only |
 
 Amounts are **base-unit strings** (wei, lamports, token base units). Convert
@@ -164,7 +164,7 @@ through the risk engine and they work in PAPER mode and under emergency stop.
   "availableBalance": { … } | null,
   "fee": { "native": { … } | null, "usd": 0.06 | null, "source": "chain-rpc" | "none" },
   "remainingBalance": { … } | null,
-  "requiresTypedConfirmation": false,
+  "requiresTypedConfirmation": true,
   "warnings": [],
   "mode": "PAPER",
   "submittable": true
@@ -174,13 +174,17 @@ through the risk engine and they work in PAPER mode and under emergency stop.
 Rules the server enforces:
 
 - quotes expire after **90 s** and are consumed on use;
-- `requiresTypedConfirmation` is true for `"all"`, for ≥ 1,000 USD, and when
-  the USD value is unknown; then `confirmation` must be exactly `WITHDRAW`
-  (422 otherwise);
+- `confirmation` must be exactly `WITHDRAW` on **every** withdrawal, whatever
+  the amount (422 otherwise). `requiresTypedConfirmation` is always `true`;
+  it stays in the quote so the dashboard reads the rule from the server rather
+  than hard-coding it. Amounts ≥ 1,000 USD, and amounts whose USD value could
+  not be established, add a `warning` instead of changing the requirement;
 - `submittable: false` (fee unknown, balance short) → submit is 409;
 - EVM destinations: 40 hex, not the zero address, EIP-55 checksum enforced
-  when mixed-case; Solana: base58 32-byte key; the agent wallet itself is
-  refused;
+  when mixed-case. An all-lowercase or all-uppercase address has no checksum
+  to verify, so it is accepted with the warning `address has no EIP-55
+  checksum; verify every character`. Solana: base58 32-byte key; the agent
+  wallet itself is refused;
 - the transaction hash is written to the local record **before** broadcast.
 
 `WithdrawResult`: `{ txId, txHash, status: "submitted"|"confirmed"|"failed", explorerUrl, activityId }`.

@@ -385,7 +385,7 @@ export async function connectedRuntime(): Promise<{ runtime: RuntimeSocket; welc
 export async function pairRuntime(
   runtime: RuntimeSocket,
   telegram: TelegramStub,
-  user: { userId: number; username?: string },
+  user: { userId: number; username?: string; chatId?: number },
   code = 'ABCD-2345',
 ): Promise<{ paired: any; code: string }> {
   const normalized = code.toUpperCase().replace('-', '');

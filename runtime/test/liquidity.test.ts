@@ -351,10 +351,22 @@ class FakeLpAdapter implements LpAdapter {
     };
   }
 
-  #tx(to: string, from: string, prepared: Prepared, summary: string): UnsignedTransaction {
+  /**
+   * The gas limit travels in the payload and comes back out in
+   * prepareSigning, exactly as V2PoolAdapter does it. The executor compares
+   * the signed fee with the one the engine approved, so a double that quotes
+   * one limit and signs another is not a faithful double.
+   */
+  #tx(
+    to: string,
+    from: string,
+    prepared: Prepared,
+    summary: string,
+    gasLimit: bigint,
+  ): UnsignedTransaction {
     return {
       chain: this.chain,
-      payload: { to, from, data: '0xabcdef', value: '0', gasLimit: '250000', prepared },
+      payload: { to, from, data: '0xabcdef', value: '0', gasLimit: gasLimit.toString(), prepared },
       summary,
     };
   }
@@ -366,6 +378,7 @@ class FakeLpAdapter implements LpAdapter {
       from,
       { kind: 'add', add: quote, from },
       'fake addLiquidity',
+      260_000n,
     );
   }
 
@@ -376,11 +389,12 @@ class FakeLpAdapter implements LpAdapter {
       from,
       { kind: 'remove', remove: quote, from },
       'fake removeLiquidity',
+      220_000n,
     );
   }
 
   buildClaim(_plan: LpClaimPlan, owner: string): UnsignedTransaction {
-    return this.#tx(POOL, owner, { kind: 'claim', from: owner }, 'fake claimFees');
+    return this.#tx(POOL, owner, { kind: 'claim', from: owner }, 'fake claimFees', 150_000n);
   }
 
   allowance(): Promise<bigint> {
@@ -393,6 +407,7 @@ class FakeLpAdapter implements LpAdapter {
       owner,
       { kind: 'approve', from: owner },
       `fake approve ${amount.toString()}`,
+      60_000n,
     );
   }
 
@@ -401,7 +416,12 @@ class FakeLpAdapter implements LpAdapter {
   }
 
   prepareSigning(tx: UnsignedTransaction, from: string): Promise<SigningContext> {
-    const payload = tx.payload as { to: string; data: string; prepared: Prepared };
+    const payload = tx.payload as {
+      to: string;
+      data: string;
+      gasLimit: string;
+      prepared: Prepared;
+    };
     this.#lastPrepared = payload.prepared;
     const context: SigningContext = {
       family: 'evm',
@@ -410,7 +430,7 @@ class FakeLpAdapter implements LpAdapter {
       to: payload.to,
       data: payload.data,
       value: '0',
-      gas: '250000',
+      gas: payload.gasLimit,
       nonce: this.broadcasts.length,
       maxFeePerGas: '1000000000',
       maxPriorityFeePerGas: '1000000',

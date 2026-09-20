@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import type { AppEnv } from '../context.js';
 import { envelope } from '../respond.js';
+import { limitParam } from '../query.js';
 import { parse } from './auth.js';
 import { requireSession } from '../middleware.js';
 import { AppError, ErrorCode } from '../../util/errors.js';
@@ -100,7 +101,7 @@ export function tradingRoutes(): Hono<AppEnv> {
 
   app.get('/decisions', (c) => {
     const services = c.get('services');
-    const limit = Math.min(Number(c.req.query('limit') ?? 50), 500);
+    const limit = limitParam(c.req.query('limit'), 50, 500);
     return c.json(envelope(c, services.gate.listDecisions(limit), { source: 'local' }));
   });
 
@@ -114,7 +115,7 @@ export function tradingRoutes(): Hono<AppEnv> {
 
   app.get('/trades', (c) => {
     const services = c.get('services');
-    const limit = Math.min(Number(c.req.query('limit') ?? 50), 500);
+    const limit = limitParam(c.req.query('limit'), 50, 500);
     const status = c.req.query('status');
     if (status !== undefined && !TRADE_STATUSES.includes(status as TradeStatus)) {
       throw new AppError(ErrorCode.SCHEMA_INVALID, 'Unknown trade status');

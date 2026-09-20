@@ -43,6 +43,10 @@ export interface TransportEvents {
   }): void;
   onConnected(): void;
   onDisconnected(reason: string): void;
+  /** Another connection took this installation's slot on the gateway. */
+  onSuperseded(): void;
+  /** The gateway rejected the installation token; no reconnect can succeed. */
+  onRevoked(): void;
 }
 
 export interface TransportStatus {
@@ -150,6 +154,16 @@ export const GATEWAY_DEFAULTS = {
   maxMissedPongs: 3,
 } as const;
 
+/**
+ * The two close codes that mean something about this installation rather than
+ * about this connection: 4001, another client is now holding the slot, and
+ * 4003, the installation token no longer exists. Every other code is a blip.
+ */
+export const GATEWAY_CLOSE = { superseded: 4001, revoked: 4003 } as const;
+
+/** Shown in the dashboard's transport status after a 4003. */
+export const GATEWAY_TOKEN_REVOKED = 'gateway token revoked; issue a new token';
+
 /** Turn the configured base URL into the WebSocket endpoint. */
 export function gatewayWebSocketUrl(base: string): string {
   const url = new URL(base);
@@ -179,6 +193,7 @@ export class GatewayTransport implements TelegramTransport {
   #events: TransportEvents | null = null;
   #socket: GatewaySocket | null = null;
   #stopped = true;
+  #revoked = false;
   #welcomed = false;
   #attempts = 0;
   #missedPongs = 0;
@@ -208,6 +223,7 @@ export class GatewayTransport implements TelegramTransport {
     if (!this.#stopped) return;
     this.#events = events;
     this.#stopped = false;
+    this.#revoked = false;
     this.#attempts = 0;
     this.#connect();
   }
@@ -395,18 +411,35 @@ export class GatewayTransport implements TelegramTransport {
     }
   }
 
-  #onClose(code: number, reason: string): void {
+  /**
+   * `local` marks a close this transport initiated. It matters because our own
+   * close codes overlap the gateway's (a connect timeout closes with 4001), and
+   * only a code the gateway chose is a verdict about this installation.
+   */
+  #onClose(code: number, reason: string, local = false): void {
     const wasWelcomed = this.#welcomed;
     this.#socket = null;
     this.#welcomed = false;
     this.#clearTimers();
     this.#log.warn({ code, reason: this.#scrub(reason) }, 'gateway connection closed');
     if (wasWelcomed) this.#events?.onDisconnected(reason || `close ${String(code)}`);
+
+    if (!local && code === GATEWAY_CLOSE.revoked) {
+      // Reconnecting would only replay a refused token until someone looks at
+      // the dashboard, so the loop stops here and the status says why.
+      this.#revoked = true;
+      this.#lastError = GATEWAY_TOKEN_REVOKED;
+      this.#log.error('gateway revoked this installation token; not reconnecting');
+      this.#events?.onRevoked();
+      return;
+    }
+    if (!local && code === GATEWAY_CLOSE.superseded) this.#events?.onSuperseded();
+
     this.#scheduleReconnect();
   }
 
   #scheduleReconnect(): void {
-    if (this.#stopped) return;
+    if (this.#stopped || this.#revoked) return;
     this.#attempts += 1;
     const delay = this.backoffDelayMs(this.#attempts);
     this.#log.info({ attempt: this.#attempts, delayMs: delay }, 'gateway reconnect scheduled');
@@ -439,7 +472,7 @@ export class GatewayTransport implements TelegramTransport {
     }
     // A WHATWG socket fires 'close' asynchronously; a fake may not fire it at
     // all when closed from our side, so the transition is driven here.
-    if (this.#socket === socket) this.#onClose(code, reason);
+    if (this.#socket === socket) this.#onClose(code, reason, true);
   }
 
   /** The promise-shaped send: a "not connected" is a rejection, never a throw. */

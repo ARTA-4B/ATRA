@@ -53,11 +53,13 @@ export function setupRoutes(): Hono<AppEnv> {
    * installation's state are not for anonymous callers. Before setup there is
    * nothing to protect and no session to require.
    */
-  app.get('/', async (c, next) => {
+  app.get('/', async (c) => {
     const services = c.get('services');
     if (services.auth.isConfigured) {
-      await requireSession()(c, next);
-      if (c.get('session') === undefined) return;
+      // The guard runs for its 401, not to continue the chain: handed the
+      // route's own `next` it would run the rest of the router and an
+      // authenticated operator would fall through to the API's 404.
+      await requireSession()(c, () => Promise.resolve());
     }
     const installation = services.state.getInstallation();
     const wallets = services.auth.isConfigured ? services.wallets.list() : [];

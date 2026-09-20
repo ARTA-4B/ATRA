@@ -49,7 +49,7 @@ export function createApp(services: Services): Hono<AppEnv> {
   });
 
   app.use('*', requestContext());
-  app.use('*', securityHeaders());
+  app.use('*', securityHeaders(services.config.staticDir));
   app.use('*', async (c, next) => {
     c.set('services', services);
     c.set('mode', services.state.getMode());

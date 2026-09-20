@@ -14,12 +14,40 @@ import type { ChainHealth } from '../../chains/types.js';
  * reported as null until Phase 2 provides a priced market snapshot, rather than
  * showing a zero that an operator would read as "my wallet is empty".
  */
-function hostOnly(endpoint: string): string {
+function endpointHost(endpoint: string): string | undefined {
   try {
     return new URL(endpoint).host;
   } catch {
-    return 'unknown';
+    return undefined;
   }
+}
+
+function hostOnly(endpoint: string): string {
+  return endpointHost(endpoint) ?? 'unknown';
+}
+
+/**
+ * Take the endpoint back out of an adapter's error text.
+ *
+ * `endpoint` is reduced to its host everywhere in this response because a BYOK
+ * URL carries the provider key in its path — but the error string is written
+ * by the transport, not by us, and viem's formatter repeats the whole URL and
+ * the request body inside the message. Those lines are dropped and any
+ * remaining copy of the endpoint is reduced to its host, so the operator still
+ * learns which provider failed and never learns the key.
+ */
+function sanitizeHealthError(error: string | null, endpoint: string): string | null {
+  if (error === null) return null;
+
+  const kept = error
+    .split('\n')
+    .filter((line) => !/^\s*(?:URL|Request body):/i.test(line))
+    .join('\n');
+
+  const host = endpointHost(endpoint);
+  const scrubbed = (host === undefined ? kept : kept.split(endpoint).join(host)).trim();
+
+  return scrubbed === '' ? 'health check failed' : scrubbed;
 }
 
 export function overviewRoutes(): Hono<AppEnv> {
@@ -78,8 +106,13 @@ export function overviewRoutes(): Hono<AppEnv> {
               }
             : null,
           // Endpoints are reduced to their host: a BYOK URL carries the key in
-          // its path, and it must not be echoed to the browser.
-          chains: health.map((entry) => ({ ...entry, endpoint: hostOnly(entry.endpoint) })),
+          // its path, and it must not be echoed to the browser — neither as
+          // the endpoint nor buried in the transport's error message.
+          chains: health.map((entry) => ({
+            ...entry,
+            endpoint: hostOnly(entry.endpoint),
+            error: sanitizeHealthError(entry.error, entry.endpoint),
+          })),
           // Honest about what is not built yet, rather than showing an idle
           // agent that does not exist.
           agents: [

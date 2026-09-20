@@ -1,5 +1,7 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { BlockList, isIP } from 'node:net';
+import { join } from 'node:path';
 import type { Context, MiddlewareHandler } from 'hono';
 import { getCookie } from 'hono/cookie';
 import { AppError, ErrorCode } from '../util/errors.js';
@@ -122,9 +124,12 @@ export function csrfGuard(corsOrigins: string[]): MiddlewareHandler<AppEnv> {
  *
  * "Local" is configurable because the obvious definition — loopback — is wrong
  * inside a container: with the port published on the host's 127.0.0.1, the
- * runtime sees the operator's requests arriving from the bridge gateway (for
- * example 172.17.0.1), and a strict loopback check would block first-run setup
- * on the primary install path. Compose therefore lists the private ranges.
+ * runtime sees the operator's requests arriving from the bridge gateway rather
+ * than from 127.0.0.1, and a strict loopback check would block first-run setup
+ * on the primary install path. Compose therefore pins its own bridge subnet and
+ * lists that one gateway address — not the private ranges, which would make
+ * this guard a no-op for every other host on a LAN the moment the port mapping
+ * is widened.
  *
  * Fails closed: a request whose source address cannot be determined is
  * refused, not waved through.
@@ -228,8 +233,15 @@ export function requireSession(): MiddlewareHandler<AppEnv> {
   };
 }
 
-/** Conservative headers for a locally served dashboard. */
-export function securityHeaders(): MiddlewareHandler<AppEnv> {
+/**
+ * Conservative headers for a locally served dashboard.
+ *
+ * The policy is built once, at construction, because computing it reads the
+ * served entry document from disk.
+ */
+export function securityHeaders(staticDir?: string): MiddlewareHandler<AppEnv> {
+  const policy = contentSecurityPolicy(staticDir);
+
   return async (c, next) => {
     await next();
     c.header('x-content-type-options', 'nosniff');
@@ -237,10 +249,59 @@ export function securityHeaders(): MiddlewareHandler<AppEnv> {
     c.header('x-frame-options', 'DENY');
     c.header('cross-origin-opener-policy', 'same-origin');
     c.header('permissions-policy', 'geolocation=(), microphone=(), camera=()');
+    c.header('content-security-policy', policy);
     if (c.req.path.startsWith('/api/')) {
       c.header('cache-control', 'no-store');
     }
   };
+}
+
+/** A `<script>` with no `src`, so its body is the thing a hash must cover. */
+const INLINE_SCRIPT_RE = /<script\b(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi;
+
+/**
+ * The `'sha256-…'` source for every inline script in a document.
+ *
+ * The dashboard sets the theme in an inline script before first paint, which
+ * is the one thing a plain `script-src 'self'` would break. Hashing what is
+ * actually served keeps the policy honest: change the script and the hash
+ * changes with it, rather than a nonce or `'unsafe-inline'` that would admit
+ * anything an injection managed to place on the page.
+ */
+export function inlineScriptHashes(html: string): string[] {
+  return [...html.matchAll(INLINE_SCRIPT_RE)].map(
+    (match) =>
+      `'sha256-${createHash('sha256')
+        .update(match[1] ?? '', 'utf8')
+        .digest('base64')}'`,
+  );
+}
+
+function contentSecurityPolicy(staticDir: string | undefined): string {
+  return [
+    "default-src 'self'",
+    `script-src ${["'self'", ...servedScriptHashes(staticDir)].join(' ')}`,
+    "connect-src 'self'",
+    "img-src 'self' data:",
+    // The dashboard's styles are injected by its bundler at runtime.
+    "style-src 'self' 'unsafe-inline'",
+    "font-src 'self'",
+    "frame-ancestors 'none'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'self'",
+  ].join('; ');
+}
+
+function servedScriptHashes(staticDir: string | undefined): string[] {
+  if (!staticDir) return [];
+  try {
+    return inlineScriptHashes(readFileSync(join(staticDir, 'index.html'), 'utf8'));
+  } catch {
+    // A runtime with no built dashboard serves no inline script, so there is
+    // nothing to allow and the stricter policy is the correct one.
+    return [];
+  }
 }
 
 function stripPort(host: string): string {

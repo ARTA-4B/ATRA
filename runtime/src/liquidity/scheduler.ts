@@ -1,4 +1,3 @@
-import { Cron } from 'croner';
 import type { StateStore } from '../core/state.js';
 import type { AuditLog } from '../audit/audit.js';
 import type { RiskPolicyStore } from '../risk/store.js';
@@ -51,7 +50,8 @@ export class LiquidityScheduler {
   readonly #policy: RiskPolicyStore;
   readonly #pipeline: LiquidityPipeline;
   readonly #log = childLogger('lp-scheduler');
-  #job: Cron | null = null;
+  #timer: ReturnType<typeof setInterval> | null = null;
+  #nextRunAt: number | null = null;
   #running = false;
 
   constructor(deps: LiquiditySchedulerDeps) {
@@ -69,13 +69,13 @@ export class LiquidityScheduler {
   }
 
   stop(): void {
-    this.#job?.stop();
-    this.#job = null;
+    if (this.#timer !== null) clearInterval(this.#timer);
+    this.#timer = null;
+    this.#nextRunAt = null;
   }
 
   status(): LpSchedulerStatus {
     const row = this.#store.scheduler();
-    const next = this.#job?.nextRun() ?? null;
     return {
       enabled: row.enabled,
       intervalSeconds: row.intervalSeconds,
@@ -83,7 +83,7 @@ export class LiquidityScheduler {
       lastCycleId: row.lastCycleId,
       lastCycleAt: row.lastCycleAt,
       lastCycleStatus: row.lastCycleStatus,
-      nextRunAt: next ? next.toISOString() : null,
+      nextRunAt: this.#nextRunAt === null ? null : new Date(this.#nextRunAt).toISOString(),
     };
   }
 
@@ -182,19 +182,32 @@ export class LiquidityScheduler {
     return reports;
   }
 
+  /**
+   * Arm a plain period.
+   *
+   * This used to build a cron pattern, and every interval that was not a
+   * whole number of minutes up to an hour fell through to
+   * `*\/${Math.min(interval, 59)} * * * * *`. The minimum interval is 60 s,
+   * so that expression was always `*\/59 * * * * *`, which fires at :00 and
+   * :59 of every minute: an operator asking for one LP pass a day got one every
+   * thirty seconds. A period is what the setting means, so a period is what
+   * is armed.
+   */
   #arm(intervalSeconds: number): void {
     this.stop();
-    const pattern =
-      intervalSeconds % 60 === 0 && intervalSeconds <= 3600
-        ? `0 */${String(intervalSeconds / 60)} * * * *`
-        : `*/${String(Math.min(intervalSeconds, 59))} * * * * *`;
+    const periodMs = intervalSeconds * 1_000;
+    this.#nextRunAt = Date.now() + periodMs;
 
-    this.#job = new Cron(pattern, { protect: true, catch: true }, () => {
+    const timer = setInterval(() => {
+      this.#nextRunAt = Date.now() + periodMs;
       void this.runOnce('scheduler').catch((error: unknown) => {
         this.#log.warn({ err: error }, 'scheduled LP pass skipped');
       });
-    });
-    this.#log.info({ intervalSeconds, pattern }, 'LP automation armed');
+    }, periodMs);
+    timer.unref?.();
+
+    this.#timer = timer;
+    this.#log.info({ intervalSeconds }, 'LP automation armed');
   }
 
   #pools(): Array<{ chain: ChainId; protocol: string; poolId: string }> {

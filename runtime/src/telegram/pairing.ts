@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Db } from '../db/database.js';
 import type { AuditLog } from '../audit/audit.js';
+import { AppError, ErrorCode } from '../util/errors.js';
 import { childLogger } from '../logging/logger.js';
 import { PAIR_CODE_TTL_MS, generatePairCode, hashPairCode, normalizePairCode } from './protocol.js';
 import type { PairStatus, TelegramIdentity, TelegramLink, TransportKind } from './types.js';
@@ -18,6 +19,11 @@ import { maskUserId } from './types.js';
  *
  * The database never holds the code itself. A new code retires every older
  * unused one, so there is exactly one code that can succeed at any moment.
+ *
+ * Pairing is one-way: while a link exists no code can be issued and no other
+ * Telegram account can take the link over. Moving to another phone or account
+ * is an explicit unpair from the local dashboard, so a leaked code alone can
+ * never redirect the remote control to someone else.
  */
 
 export interface PairingDeps {
@@ -34,7 +40,10 @@ export interface IssuedPairCode {
 
 export type VerifyResult =
   | { ok: true; link: TelegramLink }
-  | { ok: false; reason: 'malformed' | 'unknown' | 'expired' | 'used' | 'superseded' };
+  | {
+      ok: false;
+      reason: 'malformed' | 'unknown' | 'expired' | 'used' | 'superseded' | 'already_paired';
+    };
 
 interface CodeRow {
   id: string;
@@ -65,8 +74,23 @@ export class PairingService {
     this.#now = deps.now ?? (() => Date.now());
   }
 
-  /** Issue a code. Every older unused code is retired in the same transaction. */
+  /**
+   * Issue a code. Every older unused code is retired in the same transaction.
+   *
+   * Refused while a link exists: a code that can only ever confirm the account
+   * already on file is worth nothing, and one that could replace it would make
+   * the dashboard's "issue a code" button a hand-over button.
+   */
   issue(transport: TransportKind): IssuedPairCode {
+    const existing = this.link();
+    if (existing) {
+      throw new AppError(
+        ErrorCode.TELEGRAM_ALREADY_PAIRED,
+        `Telegram is already paired with ${existing.displayName}. Unpair from the dashboard before pairing another account.`,
+        { status: 409 },
+      );
+    }
+
     const now = this.#now();
     const code = generatePairCode();
     const codeHash = hashPairCode(code);
@@ -129,6 +153,9 @@ export class PairingService {
    * Direct transport: verify a code the operator sent to the bot and link the
    * identity, atomically. The UPDATE is the single-use guard; two concurrent
    * attempts with the same code cannot both see `changes === 1`.
+   *
+   * A stranger holding a valid code is refused before the code is consumed, so
+   * the operator's own code still works after someone else has tried it.
    */
   verify(code: string, identity: TelegramIdentity, transport: TransportKind): VerifyResult {
     const normalized = normalizePairCode(code);
@@ -140,6 +167,12 @@ export class PairingService {
     const now = this.#now();
 
     const outcome = this.#db.transaction((): VerifyResult => {
+      // The same account pairing a second chat is a re-pair, not a take-over.
+      const existing = this.link();
+      if (existing && existing.userId !== identity.userId) {
+        return { ok: false, reason: 'already_paired' };
+      }
+
       const consumed = this.#db
         .prepare(
           'UPDATE telegram_pair_codes SET used_at = ? WHERE code_hash = ?' +
@@ -176,8 +209,31 @@ export class PairingService {
    * Gateway transport: the gateway matched the code and tells us who paired.
    * The pending code is consumed here so the dashboard's poll flips to
    * `confirmed`; the identity is stored as the gateway reported it.
+   *
+   * Returns nothing when the gateway names an account other than the one on
+   * file. The gateway is a server the runtime does not trust with this: the
+   * link may only change after a local unpair.
    */
-  confirmFromGateway(identity: TelegramIdentity, pairedAt: number): TelegramLink {
+  confirmFromGateway(identity: TelegramIdentity, pairedAt: number): TelegramLink | undefined {
+    const existing = this.link();
+    if (existing && existing.userId !== identity.userId) {
+      this.#audit.append({
+        category: 'telegram',
+        action: 'telegram.pair.refused',
+        status: 'failed',
+        summary:
+          'Telegram pairing refused: already paired with another account. Unpair from the dashboard first if you meant to move phones.',
+        actor: `telegram:${maskUserId(identity.userId)}`,
+        detail: {
+          userIdMasked: maskUserId(identity.userId),
+          pairedWithMasked: maskUserId(existing.userId),
+          transport: 'gateway',
+        },
+      });
+      this.#log.error('gateway named a different Telegram account; pairing refused');
+      return undefined;
+    }
+
     const now = this.#now();
     const link = this.#db.transaction(() => {
       this.#db

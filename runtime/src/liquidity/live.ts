@@ -22,6 +22,7 @@ import type { LiquidityRegistry } from './registry.js';
 import type { LpExecutionOutcome, LpFillPrices } from './paper.js';
 import type { LpPlan } from './proposal.js';
 import type { LpAdapter, LpPoolState, LpReceipt } from './types.js';
+import { feeInNativeUnits } from '../risk/engine.js';
 
 /**
  * The LIVE LP executor: the only liquidity code that signs and broadcasts.
@@ -282,6 +283,34 @@ export class LiveLpExecutor {
       return {
         ok: false,
         outcome: this.#fail(tradeId, action, 'LP execution is EVM-only in this build', startedAt),
+      };
+    }
+
+    // execute() checked the switches before the build; a stop engaged since
+    // then must still land before the key is used.
+    const refusal = this.#refusal(action);
+    if (refusal !== null) {
+      return {
+        ok: false,
+        outcome: this.#fail(tradeId, action, `refused before signing: ${refusal}`, startedAt),
+      };
+    }
+
+    // The engine approved a fee from the quote's estimate; prepareSigning
+    // re-fetched a fresh one. EIP-1559 caps the spend at gas * maxFeePerGas,
+    // and that cap must still be the one the engine measured.
+    const approvedFee = feeInNativeUnits(action.feeEstimate.detail);
+    const signingFee = BigInt(context.gas) * BigInt(context.maxFeePerGas);
+    if (signingFee > approvedFee) {
+      return {
+        ok: false,
+        outcome: this.#fail(
+          tradeId,
+          action,
+          `fee at signing ${signingFee.toString()} exceeds the approved ${approvedFee.toString()} ` +
+            '(gas moved since the quote); re-quote and decide again',
+          startedAt,
+        ),
       };
     }
 

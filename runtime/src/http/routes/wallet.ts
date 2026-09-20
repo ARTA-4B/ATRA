@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import type { AppEnv } from '../context.js';
 import { envelope } from '../respond.js';
+import { limitParam } from '../query.js';
 import { parse } from './auth.js';
 import { AppError, ErrorCode } from '../../util/errors.js';
 import { REAUTH_HEADER, localOnly, requireSession } from '../middleware.js';
@@ -132,7 +133,7 @@ export function walletRoutes(): Hono<AppEnv> {
   /** Operator-initiated transfers. Agent trades are under /trading. */
   app.get('/transactions', (c) => {
     const services = c.get('services');
-    const limit = Math.min(Number(c.req.query('limit') ?? 50), 200);
+    const limit = limitParam(c.req.query('limit'), 50, 200);
     return c.json(envelope(c, services.withdrawals.list(limit), { source: 'local' }));
   });
 

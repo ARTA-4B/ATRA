@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import type { AppEnv } from '../context.js';
 import { envelope } from '../respond.js';
+import { limitParam } from '../query.js';
 import { parse } from './auth.js';
 import { requireSession } from '../middleware.js';
 import { CHAIN_IDS } from '../../chains/registry.js';
@@ -42,7 +43,7 @@ export function liquidityRoutes(liquidity: LiquidityService): Hono<AppEnv> {
   app.get('/positions', (c) => c.json(envelope(c, liquidity.positions(), { source: 'local' })));
 
   app.get('/actions', (c) => {
-    const limit = Math.min(Math.max(Number(c.req.query('limit') ?? 50) || 50, 1), 500);
+    const limit = limitParam(c.req.query('limit'), 50, 500);
     return c.json(envelope(c, liquidity.actions(limit), { source: 'local' }));
   });
 

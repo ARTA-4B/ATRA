@@ -36,7 +36,19 @@ Every word that smells like a key (`/export`, `/withdraw`, `/key`, `/seed`,
 | Nothing configured | `POST /api/v1/telegram/pair` answers `409 TELEGRAM_NOT_CONFIGURED`; everything else reports "not configured" | |
 
 Selection is gateway, then direct, then none. `ATRA_MODE=ci` never opens a
-transport. A gateway URL without its token is refused at boot.
+transport. A gateway URL without its token is refused at boot, and so is a
+cleartext one: `ATRA_GATEWAY_URL` must be `https:` or `wss:` unless the host
+is `localhost`, `127.0.0.1` or `::1`. The installation token is sent in the
+upgrade request's `Authorization` header, so an unencrypted hop off this
+machine would hand it to whoever is carrying the packets.
+
+Two gateway close codes are not treated as a blip. **4001** (another client
+connected with this installation's token) reconnects as usual but writes a
+`telegram.transport.superseded` audit row, so a stolen token in use elsewhere
+shows up instead of hiding behind a normal-looking reconnect loop. **4003**
+(the installation token was revoked) stops the reconnect loop for good, writes
+`telegram.transport.revoked` and leaves `gateway token revoked; issue a new
+token` in the transport status the dashboard shows.
 
 Tokens are read from the environment once, at the composition root
 (`readTelegramSecrets`), handed to the transport and held nowhere else: not on
@@ -76,7 +88,20 @@ tells the gateway to drop its side. On every gateway `welcome` the runtime
 compares the two sides and fails closed on disagreement (a different user, or
 one side paired and the other not: the link is dropped).
 
-One installation, one Telegram user. Re-pairing replaces the row.
+One installation, one Telegram user, and the link only ever changes after a
+local unpair:
+
+- While a link exists, `POST /api/v1/telegram/pair` answers
+  `409 TELEGRAM_ALREADY_PAIRED`. There is no code to leak, because there is no
+  code to issue.
+- A code that reaches the bot from a different Telegram account is refused
+  before it is consumed, so the operator's own code still works afterwards.
+  The same account pairing a second chat is a re-pair and is allowed.
+- A gateway `paired` frame naming a different account is refused and written
+  to the audit trail as `telegram.pair.refused` (masked user id, status
+  `failed`). The gateway is a server; it does not get to move the link.
+
+So a phone move is: unpair in the dashboard, issue a code, pair again.
 
 ## Every message walks the same gates
 

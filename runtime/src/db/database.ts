@@ -1,9 +1,10 @@
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AppError, ErrorCode, errorMessage } from '../util/errors.js';
 import { childLogger } from '../logging/logger.js';
+import type { Logger } from '../logging/logger.js';
 
 /**
  * Local persistence.
@@ -63,7 +64,10 @@ export function openDatabase(options: OpenDatabaseOptions): Db {
   const inMemory = options.file === ':memory:';
 
   if (!inMemory) {
-    mkdirSync(dirname(options.file), { recursive: true });
+    // This directory holds the wrapped vault key and every trade ATRA has
+    // made. On a shared machine the default 0755 would make all of that
+    // world-readable.
+    mkdirSync(dirname(options.file), { recursive: true, mode: 0o700 });
   }
 
   const handle = new DatabaseSync(options.file);
@@ -74,6 +78,10 @@ export function openDatabase(options: OpenDatabaseOptions): Db {
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 5000');
 
+  // After the journal pragma, so the WAL and shared-memory files exist to be
+  // narrowed too: they hold the same rows as the database itself.
+  if (!inMemory) restrictPermissions(options.file, log);
+
   if (options.migrate !== false) {
     const applied = migrate(db);
     if (applied.length > 0) {
@@ -82,6 +90,27 @@ export function openDatabase(options: OpenDatabaseOptions): Db {
   }
 
   return db;
+}
+
+/**
+ * Narrow the database files to their owner.
+ *
+ * POSIX only: Windows ignores the mode bits and inherits the ACL of the data
+ * directory instead. A filesystem that cannot represent the mode (a mounted
+ * share, for instance) is reported rather than fatal — refusing to start would
+ * leave the operator with no runtime at all, which is the worse failure.
+ */
+function restrictPermissions(file: string, log: Logger): void {
+  if (process.platform === 'win32') return;
+
+  for (const path of [file, `${file}-wal`, `${file}-shm`]) {
+    try {
+      chmodSync(path, 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      log.warn({ path, err: error }, 'could not restrict database file permissions');
+    }
+  }
 }
 
 function wrap(handle: DatabaseSync): Db {

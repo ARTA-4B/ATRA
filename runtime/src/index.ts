@@ -21,6 +21,11 @@ import type { StartedServer } from './http/server.js';
  */
 
 async function main(): Promise<void> {
+  // Before anything is created: the database, its WAL, a backup file and a log
+  // are all for this operator alone. POSIX only; Windows has no umask and
+  // inherits the directory's ACL instead.
+  if (process.platform !== 'win32') process.umask(0o077);
+
   const config = loadConfig();
 
   const logger = createLogger(config.log);

@@ -1085,6 +1085,75 @@ describe('Phase 3: LIVE executor', () => {
     expect(h.services.trades.get(row.id)?.status).toBe('signed');
   });
 
+  it('refuses to sign when gas has risen above the fee the engine approved', async () => {
+    h = await harness({
+      trader: openWeth('10'),
+      execution: { allowance: 10n ** 30n },
+      chains: { base: { tokens: new Map([[USDC_BASE, 1_000_000_000n]]) } },
+    });
+    await activateLive(h.services);
+
+    // The engine approved a fee computed from the quote's gas price. The node
+    // now reports a much higher one, and prepareSigning multiplies whatever it
+    // is told: the transaction about to be signed costs more than the decision
+    // allowed for, so it must not be signed at all.
+    const original = h.execution.prepareSigning.bind(h.execution);
+    h.execution.prepareSigning = async (tx, from) => {
+      const context = await original(tx, from);
+      if (context.family !== 'evm') return context;
+      return { ...context, maxFeePerGas: (BigInt(context.maxFeePerGas) * 10n).toString() };
+    };
+
+    const report = await h.services.pipeline.runCycle({
+      chain: 'base',
+      token: WETH_BASE,
+      source: 'operator',
+    });
+
+    expect(report.outcome).toBe('failed');
+    expect(report.execution?.error).toMatch(/fee at signing .* exceeds the approved/);
+    expect(h.execution.signingContexts).toHaveLength(1);
+    expect(h.execution.broadcasts).toHaveLength(0);
+    const trade = h.services.trades.get(report.trade!.tradeId)!;
+    expect(trade.status).toBe('failed');
+    expect(trade.txHash).toBeNull();
+  });
+
+  it('refuses to sign when the emergency stop lands after the decision', async () => {
+    h = await harness({
+      trader: openWeth('10'),
+      execution: { allowance: 10n ** 30n },
+      chains: { base: { tokens: new Map([[USDC_BASE, 1_000_000_000n]]) } },
+    });
+    await activateLive(h.services);
+
+    // The stop is engaged inside the simulation, i.e. after execute() read the
+    // switches and before the key is used. Every await in between is a window
+    // the operator expects the stop to close.
+    const simulate = h.execution.simulate.bind(h.execution);
+    h.execution.simulate = async (quote) => {
+      h.services.state.setEmergencyStop(true, 'operator pulled the switch', 'operator');
+      return simulate(quote);
+    };
+
+    const report = await h.services.pipeline.runCycle({
+      chain: 'base',
+      token: WETH_BASE,
+      source: 'operator',
+    });
+
+    expect(report.outcome).toBe('failed');
+    // Engaging the stop also demotes the runtime to PAPER, so either half of
+    // the refusal is correct; what matters is that no key was used.
+    expect(report.execution?.error).toMatch(
+      /refused before signing: (emergency stop is active|runtime is not in LIVE mode)/,
+    );
+    expect(h.services.state.getSwitches().emergencyStop).toBe(true);
+    expect(h.execution.signingContexts).toHaveLength(1);
+    expect(h.execution.broadcasts).toHaveLength(0);
+    expect(h.services.trades.get(report.trade!.tradeId)?.txHash).toBeNull();
+  });
+
   it('reconciles in-flight rows on restart by hash and never re-signs', async () => {
     h = await harness({ trader: openWeth('10'), execution: { allowance: 10n ** 30n } });
     // A signed-but-unresolved row, as a crash between sign and confirm leaves it.
@@ -1249,7 +1318,7 @@ describe('Phase 3: withdrawals', () => {
     expect(() => parseDecimalAmount('abc', 6)).toThrow(/decimal number/);
   });
 
-  it('quotes, requires typed confirmation for "all", and signs with the hash recorded first', async () => {
+  it('quotes, requires typed confirmation, and signs with the hash recorded first', async () => {
     h = await harness({
       trader: openWeth('0'),
       chains: { base: { tokens: new Map([[USDC_BASE, 50_000_000n]]) } },
@@ -1267,7 +1336,7 @@ describe('Phase 3: withdrawals', () => {
     expect(quote.availableBalance?.raw).toBe('50000000');
     expect(quote.remainingBalance?.raw).toBe('25000000');
     expect(quote.fee.native?.raw).toBe('21000000000000');
-    expect(quote.requiresTypedConfirmation).toBe(false);
+    expect(quote.requiresTypedConfirmation).toBe(true);
     expect(quote.submittable).toBe(true);
     expect(quote.mode).toBe('PAPER');
 
@@ -1284,7 +1353,7 @@ describe('Phase 3: withdrawals', () => {
     ).rejects.toThrow(/WITHDRAW/);
 
     const result = await h.services.withdrawals.execute(
-      { quoteId: quote.quoteId, ack: true },
+      { quoteId: quote.quoteId, ack: true, confirmation: 'WITHDRAW' },
       'idem-1',
     );
     expect(result.status).toBe('confirmed');
@@ -1293,7 +1362,7 @@ describe('Phase 3: withdrawals', () => {
 
     // Idempotent replay returns the same transaction, sends nothing.
     const replay = await h.services.withdrawals.execute(
-      { quoteId: quote.quoteId, ack: true },
+      { quoteId: quote.quoteId, ack: true, confirmation: 'WITHDRAW' },
       'idem-1',
     );
     expect(replay.txId).toBe(result.txId);
@@ -1301,11 +1370,54 @@ describe('Phase 3: withdrawals', () => {
 
     // A consumed quote cannot be reused.
     await expect(
-      h.services.withdrawals.execute({ quoteId: quote.quoteId, ack: true }, undefined),
+      h.services.withdrawals.execute(
+        { quoteId: quote.quoteId, ack: true, confirmation: 'WITHDRAW' },
+        undefined,
+      ),
     ).rejects.toThrow(/expired or unknown/);
 
     const listed = h.services.withdrawals.list();
     expect(listed[0]?.txHash).toBe(result.txHash);
+  });
+
+  it('requires the typed word on a small withdrawal too, and flags an unchecksummed address', async () => {
+    h = await harness({
+      trader: openWeth('0'),
+      chains: { base: { tokens: new Map([[USDC_BASE, 50_000_000n]]) } },
+    });
+    await h.services.vault.unlock(PASSWORD);
+
+    // One dollar, priced, nowhere near any threshold: the case that used to
+    // go through on a single click.
+    const lowercase = await h.services.withdrawals.quote({
+      chainId: 'base',
+      asset: 'USDC',
+      destination: '0x' + 'ab'.repeat(20),
+      amount: '1',
+    });
+    expect(lowercase.requiresTypedConfirmation).toBe(true);
+    expect(lowercase.warnings.join(' ')).toMatch(/no EIP-55 checksum/);
+    await expect(
+      h.services.withdrawals.execute({ quoteId: lowercase.quoteId, ack: true }, undefined),
+    ).rejects.toThrow(/WITHDRAW/);
+    expect(h.chains.base.broadcasts).toHaveLength(0);
+
+    // A checksummed destination is not warned about, and the typed word is
+    // still what lets the transfer through.
+    const checksummed = await h.services.withdrawals.quote({
+      chainId: 'base',
+      asset: 'USDC',
+      destination: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+      amount: '1',
+    });
+    expect(checksummed.warnings.join(' ')).not.toMatch(/EIP-55/);
+
+    const result = await h.services.withdrawals.execute(
+      { quoteId: checksummed.quoteId, ack: true, confirmation: 'WITHDRAW' },
+      undefined,
+    );
+    expect(result.status).toBe('confirmed');
+    expect(h.chains.base.broadcasts).toHaveLength(1);
   });
 
   it('refuses to submit when the fee is unknown or the balance is short', async () => {
@@ -1347,7 +1459,7 @@ describe('Phase 3: withdrawals', () => {
     });
     expect(quote.amount.raw).toBe('1000000000');
     const result = await h.services.withdrawals.execute(
-      { quoteId: quote.quoteId, ack: true },
+      { quoteId: quote.quoteId, ack: true, confirmation: 'WITHDRAW' },
       undefined,
     );
     expect(result.status).toBe('confirmed');

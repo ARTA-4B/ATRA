@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { evaluate } from '../src/risk/engine.js';
 import { nativeToUsdMicros, priceToAtto } from '../src/risk/money.js';
 import { MarketService } from '../src/market/service.js';
@@ -367,6 +370,44 @@ describe('review: password guessing is throttled', () => {
     await expect(auth.login('correct horse battery staple')).resolves.toBeDefined();
   });
 
+  it('evaluates at most the limit even when every guess arrives at once', async () => {
+    const auth = new AuthService(db, new AuditLog(db), FAST_KDF);
+    await auth.setPassword('correct horse battery staple');
+
+    // The counter used to be read before the ~1.5 s key derivation and written
+    // after it, so ten simultaneous guesses were all evaluated against a count
+    // of zero. Each rejection says which happened: "Incorrect" means the KDF
+    // ran, "Too many" means the attempt was refused without it.
+    const settled = await Promise.allSettled(
+      Array.from({ length: 10 }, () => auth.login('wrong password here')),
+    );
+    const reasons = settled.map((result) =>
+      result.status === 'rejected' ? String((result.reason as Error).message) : 'accepted',
+    );
+
+    expect(reasons.filter((message) => /Incorrect/.test(message))).toHaveLength(
+      LOGIN_FAILURE_LIMIT,
+    );
+    expect(reasons.filter((message) => /Too many/.test(message))).toHaveLength(
+      10 - LOGIN_FAILURE_LIMIT,
+    );
+  });
+
+  it('keeps the lockout when the service is rebuilt on the same database', async () => {
+    const clock = 2_000_000;
+    const auth = new AuthService(db, new AuditLog(db), FAST_KDF, () => clock);
+    await auth.setPassword('correct horse battery staple');
+
+    for (let i = 0; i < LOGIN_FAILURE_LIMIT; i += 1) {
+      await expect(auth.login('wrong password here')).rejects.toThrow(/Incorrect/);
+    }
+
+    // A second service over the same database is what a restarted process
+    // sees; an in-memory counter would have handed it a fresh budget.
+    const restarted = new AuthService(db, new AuditLog(db), FAST_KDF, () => clock);
+    await expect(restarted.login('correct horse battery staple')).rejects.toThrow(/Too many/);
+  });
+
   it('a success clears the failure count', async () => {
     const auth = new AuthService(db, new AuditLog(db), FAST_KDF);
     await auth.setPassword('correct horse battery staple');
@@ -379,6 +420,31 @@ describe('review: password guessing is throttled', () => {
     // Another run of failures starts from zero rather than tripping at once.
     await expect(auth.login('wrong password here')).rejects.toThrow(/Incorrect/);
   });
+});
+
+describe('review: the database is not readable by other accounts', () => {
+  // POSIX only. Windows ignores the mode bits and inherits the parent ACL, so
+  // there is nothing here to assert on the author's machine; CI runs Linux.
+  it.skipIf(process.platform === 'win32')(
+    'creates the data directory 0700 and the database files 0600',
+    () => {
+      const root = mkdtempSync(join(tmpdir(), 'atra-perms-'));
+      const dir = join(root, 'data');
+      const file = join(dir, 'atra.db');
+
+      const db = openDatabase({ file });
+      try {
+        expect(statSync(dir).mode & 0o777).toBe(0o700);
+        for (const path of [file, `${file}-wal`, `${file}-shm`]) {
+          if (!existsSync(path)) continue;
+          expect([path, statSync(path).mode & 0o777]).toEqual([path, 0o600]);
+        }
+      } finally {
+        closeDatabase(db);
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe('review: providers never emit a zero price', () => {

@@ -26,7 +26,9 @@ import { childLogger } from '../logging/logger.js';
  *
  *  - a fresh single-use re-authentication token (checked by the route);
  *  - a quote that expires after 90 seconds and is consumed on use;
- *  - typed confirmation (`WITHDRAW`) for "all" and for ≥ 1,000 USD;
+ *  - typed confirmation (`WITHDRAW`) on every withdrawal, whatever the amount:
+ *    the product promise is that money never leaves on a single click, and a
+ *    threshold turns that into a promise about most withdrawals;
  *  - a fee that could actually be estimated — a quote with an unknown fee is
  *    returned so the dashboard can show why, but cannot be submitted;
  *  - address validation at least as strict as the dashboard's, including
@@ -43,6 +45,7 @@ import { childLogger } from '../logging/logger.js';
  */
 
 export const WITHDRAW_QUOTE_TTL_MS = 90_000;
+/** Above this, the quote says so in a warning; the typed word is required either way. */
 export const TYPED_CONFIRMATION_USD = 1_000;
 export const WITHDRAW_ASSETS = ['USDC', 'ETH', 'BNB', 'SOL'] as const;
 export type WithdrawAsset = (typeof WITHDRAW_ASSETS)[number];
@@ -72,6 +75,7 @@ export interface WithdrawQuote {
   availableBalance: TokenAmountView | null;
   fee: { native: TokenAmountView | null; usd: number | null; source: string };
   remainingBalance: TokenAmountView | null;
+  /** Always true. Kept as a field so the dashboard reads the rule, not a constant. */
   requiresTypedConfirmation: boolean;
   warnings: string[];
   mode: 'PAPER' | 'LIVE';
@@ -145,6 +149,12 @@ export class WithdrawalService {
     const warnings: string[] = [];
 
     const destination = validateDestination(chain, input.destination);
+    if (chainFamily(chain) === 'evm' && !hasChecksumCase(input.destination)) {
+      // A single-case address satisfies every checksum vacuously, so a typo in
+      // it cannot be caught. Refusing it would reject what most explorers and
+      // wallets copy out; saying so is the honest middle.
+      warnings.push('This address has no EIP-55 checksum; verify every character.');
+    }
     const token = resolveAsset(chain, input.asset);
     const from = this.#wallets.depositAddress(chain);
     if (destination.toLowerCase() === from.toLowerCase()) {
@@ -248,12 +258,12 @@ export class WithdrawalService {
           )
         : null;
 
-    let requiresTypedConfirmation = input.amount === 'all';
+    // Every withdrawal is typed out in full; the cases that used to decide
+    // this now only decide what the operator is warned about.
     if (amountUsd === null) {
-      requiresTypedConfirmation = true;
-      warnings.push('USD value unknown; typed confirmation required.');
+      warnings.push('USD value unknown; this withdrawal cannot be checked against a limit.');
     } else if (amountUsd >= TYPED_CONFIRMATION_USD) {
-      requiresTypedConfirmation = true;
+      warnings.push(`This is a large withdrawal: about ${amountUsd.toFixed(2)} USD.`);
     }
 
     // Sufficiency: token amount, plus gas in native for both cases.
@@ -302,7 +312,7 @@ export class WithdrawalService {
       },
       remainingBalance:
         remaining === null || remaining < 0n ? null : view(remaining, token.decimals, token.symbol),
-      requiresTypedConfirmation,
+      requiresTypedConfirmation: true,
       warnings,
       mode: this.#state.getMode(),
       submittable,
@@ -354,7 +364,7 @@ export class WithdrawalService {
         details: { warnings: pending.quote.warnings },
       });
     }
-    if (pending.quote.requiresTypedConfirmation && input.confirmation !== 'WITHDRAW') {
+    if (input.confirmation !== 'WITHDRAW') {
       throw new AppError(ErrorCode.SCHEMA_INVALID, 'Type WITHDRAW to confirm this withdrawal', {
         errors: [{ path: 'confirmation', message: 'CONFIRMATION_REQUIRED' }],
       });
@@ -631,9 +641,7 @@ export function validateDestination(chain: ChainId, destination: string): string
     if (/^0x0{40}$/.test(destination)) {
       throw invalidAddress('the zero address burns funds');
     }
-    const body = destination.slice(2);
-    const mixedCase = body !== body.toLowerCase() && body !== body.toUpperCase();
-    if (mixedCase && !isAddress(destination, { strict: true })) {
+    if (hasChecksumCase(destination) && !isAddress(destination, { strict: true })) {
       throw invalidAddress('EIP-55 checksum does not match');
     }
     return destination.toLowerCase();
@@ -644,6 +652,15 @@ export function validateDestination(chain: ChainId, destination: string): string
     throw invalidAddress('must be a base58 Solana public key');
   }
   return destination;
+}
+
+/**
+ * True when an EVM address carries the case information EIP-55 encodes. An
+ * all-lowercase or all-uppercase address has no checksum to verify.
+ */
+function hasChecksumCase(address: string): boolean {
+  const body = address.slice(2);
+  return body !== body.toLowerCase() && body !== body.toUpperCase();
 }
 
 function invalidAddress(message: string): AppError {

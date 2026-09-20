@@ -1,7 +1,13 @@
 import { runDurableObjectAlarm } from 'cloudflare:test';
 import { env } from 'cloudflare:workers';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { HUB_NAME } from '../src/hub.js';
+import {
+  CLOSE_RATE_LIMITED,
+  FRAME_LIMIT_PER_MINUTE,
+  HUB_NAME,
+  NOTIFY_LIMIT_PER_HOUR,
+  PAIR_OFFER_LIMIT_PER_MINUTE,
+} from '../src/hub.js';
 import { OFFLINE_TEXT } from '../src/webhook.js';
 import {
   connectRuntime,
@@ -279,5 +285,83 @@ describe('Hub: alarm', () => {
     // does not re-arm.
     await runDurableObjectAlarm(stub);
     expect(await runDurableObjectAlarm(stub)).toBe(false);
+  });
+});
+
+describe('Hub: inbound frame budget', () => {
+  it('keeps the budgets small enough to still be budgets', () => {
+    // A budget that drifts upward stops being one, and the tests below scale
+    // with these numbers, so the numbers themselves are pinned.
+    expect(FRAME_LIMIT_PER_MINUTE).toBeLessThanOrEqual(120);
+    expect(NOTIFY_LIMIT_PER_HOUR).toBeLessThanOrEqual(60);
+    expect(PAIR_OFFER_LIMIT_PER_MINUTE).toBeLessThanOrEqual(10);
+  });
+
+  it('closes a socket that spends the per-minute frame budget', async () => {
+    // hello is the first frame of the window.
+    const { runtime } = await connectedRuntime();
+    // A reply nobody is waiting for is logged and answered with nothing, so
+    // the budget is the only thing these frames spend.
+    for (let i = 1; i < FRAME_LIMIT_PER_MINUTE; i += 1) {
+      runtime.send(frame('reply', { requestId: `gone-${i}`, text: 'x' }));
+    }
+    expect(await runtime.maybeNext(300)).toBeNull();
+
+    runtime.send(frame('reply', { requestId: 'one-too-many', text: 'x' }));
+    expect(await runtime.next()).toMatchObject({ type: 'error', code: 'rate_limited' });
+    expect((await runtime.closed).code).toBe(CLOSE_RATE_LIMITED);
+  });
+
+  it('stops relaying at the hourly notify budget and closes the socket', async () => {
+    const { runtime } = await connectedRuntime();
+    const userId = nextUser();
+    await pairRuntime(runtime, telegram, { userId });
+    const before = telegram.sent.length;
+
+    for (let i = 0; i < NOTIFY_LIMIT_PER_HOUR; i += 1) {
+      runtime.send(frame('notify', { kind: 'trade', text: `fill ${i}` }));
+    }
+    await telegram.waitForSent(before + NOTIFY_LIMIT_PER_HOUR, 10_000);
+
+    runtime.send(frame('notify', { kind: 'trade', text: 'one too many' }));
+    expect(await runtime.next()).toMatchObject({ type: 'error', code: 'rate_limited' });
+    expect((await runtime.closed).code).toBe(CLOSE_RATE_LIMITED);
+    await settle(200);
+    // The frame over the cap costs no Telegram call.
+    expect(telegram.sent).toHaveLength(before + NOTIFY_LIMIT_PER_HOUR);
+  });
+
+  it('closes a socket that offers more pair codes a minute than the budget allows', async () => {
+    const { runtime } = await connectedRuntime();
+    for (let i = 0; i < PAIR_OFFER_LIMIT_PER_MINUTE; i += 1) {
+      const codeHash = `${i}`.padStart(64, 'b');
+      runtime.send(frame('pair.offer', { codeHash, expiresAt: Date.now() + 60_000 }));
+    }
+    expect(await runtime.maybeNext(300)).toBeNull();
+
+    runtime.send(frame('pair.offer', { codeHash: 'c'.repeat(64), expiresAt: Date.now() + 60_000 }));
+    expect(await runtime.next()).toMatchObject({ type: 'error', code: 'rate_limited' });
+    expect((await runtime.closed).code).toBe(CLOSE_RATE_LIMITED);
+  });
+
+  it('leaves a runtime that keeps to a normal rate alone', async () => {
+    const { runtime } = await connectedRuntime();
+    const userId = nextUser();
+    await pairRuntime(runtime, telegram, { userId });
+    const before = telegram.sent.length;
+
+    for (let i = 0; i < 5; i += 1) {
+      runtime.send(frame('notify', { kind: 'trade', text: `fill ${i}` }));
+    }
+    await telegram.waitForSent(before + 5);
+    expect(await runtime.maybeNext(200)).toBeNull();
+
+    // And the socket still answers a command afterwards.
+    const posted = postWebhook(makeUpdate({ userId, text: '/status' }));
+    const command = await runtime.next();
+    runtime.send(frame('reply', { requestId: command.requestId, text: 'ok' }));
+    await posted;
+    expect(telegram.sent.at(-1)).toEqual({ chatId: userId, text: 'ok' });
+    await runtime.close();
   });
 });

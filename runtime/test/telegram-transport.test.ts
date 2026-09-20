@@ -10,7 +10,9 @@ import {
 } from '../src/telegram/protocol.js';
 import {
   DirectBotTransport,
+  GATEWAY_CLOSE,
   GATEWAY_DEFAULTS,
+  GATEWAY_TOKEN_REVOKED,
   GatewayTransport,
   gatewayWebSocketUrl,
 } from '../src/telegram/transport.js';
@@ -169,6 +171,8 @@ function gatewayRig(overrides: Partial<TransportEvents> = {}) {
     welcomes: [] as unknown[],
     connected: 0,
     disconnected: [] as string[],
+    superseded: 0,
+    revoked: 0,
   };
   const handlers: TransportEvents = {
     onCommand: (command) => {
@@ -189,6 +193,12 @@ function gatewayRig(overrides: Partial<TransportEvents> = {}) {
     },
     onDisconnected: (reason) => {
       events.disconnected.push(reason);
+    },
+    onSuperseded: () => {
+      events.superseded += 1;
+    },
+    onRevoked: () => {
+      events.revoked += 1;
     },
     ...overrides,
   };
@@ -390,6 +400,60 @@ describe('GatewayTransport', () => {
     expect(rig.timers.pending()).toBe(0);
   });
 
+  it('reports a superseded session once per close and keeps reconnecting', () => {
+    const rig = gatewayRig();
+    rig.transport.start(rig.handlers);
+    const first = rig.sockets[0]!;
+    first.open();
+    first.receive(welcome(true));
+
+    first.emit('close', { code: GATEWAY_CLOSE.superseded, reason: 'superseded' });
+    expect(rig.events.superseded).toBe(1);
+    expect(rig.events.revoked).toBe(0);
+    expect(rig.events.disconnected).toEqual(['superseded']);
+    // A close the transport no longer owns must not raise it a second time.
+    first.emit('close', { code: GATEWAY_CLOSE.superseded, reason: 'superseded' });
+    expect(rig.events.superseded).toBe(1);
+
+    rig.timers.advance(1_000);
+    const second = rig.sockets[1]!;
+    expect(second).toBeDefined();
+    second.open();
+    second.receive(welcome(true));
+    second.emit('close', { code: GATEWAY_CLOSE.superseded, reason: '' });
+    expect(rig.events.superseded).toBe(2);
+  });
+
+  it("does not read our own close codes as the gateway's verdict", () => {
+    const rig = gatewayRig();
+    rig.transport.start(rig.handlers);
+    // The connect timeout closes with 4001; that is us, not another client.
+    rig.timers.advance(GATEWAY_DEFAULTS.connectTimeoutMs);
+    expect(rig.sockets[0]!.closed?.code).toBe(GATEWAY_CLOSE.superseded);
+    expect(rig.events.superseded).toBe(0);
+    rig.timers.advance(1_000);
+    expect(rig.sockets).toHaveLength(2);
+  });
+
+  it('stops for good when the gateway revokes the installation token', () => {
+    const rig = gatewayRig();
+    rig.transport.start(rig.handlers);
+    const socket = rig.sockets[0]!;
+    socket.open();
+    socket.receive(welcome(true));
+
+    socket.emit('close', { code: GATEWAY_CLOSE.revoked, reason: 'token revoked' });
+    expect(rig.events.revoked).toBe(1);
+    expect(rig.events.superseded).toBe(0);
+    expect(rig.transport.status().connected).toBe(false);
+    expect(rig.transport.status().lastError).toBe(GATEWAY_TOKEN_REVOKED);
+
+    // No reconnect is scheduled, so nothing replays the refused token.
+    rig.timers.advance(600_000);
+    expect(rig.sockets).toHaveLength(1);
+    expect(rig.timers.pending()).toBe(0);
+  });
+
   it('never writes the token anywhere but the upgrade header', () => {
     const rig = gatewayRig();
     rig.transport.start(rig.handlers);
@@ -451,6 +515,8 @@ function directRig(script: { updates?: unknown[]; fail?: boolean }) {
     onWelcome: () => {},
     onConnected: () => {},
     onDisconnected: () => {},
+    onSuperseded: () => {},
+    onRevoked: () => {},
   };
   const transport = new DirectBotTransport({
     token: BOT_TOKEN,

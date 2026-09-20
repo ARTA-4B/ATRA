@@ -33,9 +33,14 @@ What `docker compose up` gives you, from `docker-compose.yml`:
 - a health check through `node` (the slim image has no `wget`), a 30-second
   stop grace period so the runtime can lock the vault and checkpoint the
   database on SIGTERM, `restart: unless-stopped`, and log rotation;
-- `ATRA_LOCAL_CLIENTS` set to the private ranges, because inside the
-  container your browser's requests arrive from the Docker bridge, not from
-  loopback, and setup and key export are restricted to "local" callers.
+- a private bridge network with a pinned subnet (`172.28.0.0/24`) and
+  `ATRA_LOCAL_CLIENTS` set to loopback plus that bridge's gateway
+  (`172.28.0.1/32`) — nothing wider. Inside the container your browser's
+  requests arrive from the bridge gateway, not from loopback, and setup, key
+  export and treasury-admin setup are restricted to "local" callers; listing
+  the whole private space instead would quietly turn that restriction off the
+  day someone widens the port mapping. Change the subnet and the environment
+  variable together if `172.28.0.0/24` collides with something on your machine.
 
 This is verified on every push by `.github/workflows/docker-smoke.yml`: build,
 `up --wait`, `/health`, `/ready` 503 before setup, `/api/v1/meta` reporting
@@ -44,6 +49,34 @@ mapping, a scan of the container logs for key material, a restart, and a
 graceful `docker stop` with exit code 0 for the API-only image. The author's
 machine (Windows 11 Home without WSL) has never run Docker; CI is the Docker
 gate for this project.
+
+### If setup is refused with `LOOPBACK_ONLY`
+
+Docker Desktop (macOS and Windows) publishes ports through its own VM proxy
+rather than the host's kernel, so the address the runtime sees for your browser
+is not always the bridge gateway `docker-compose.yml` names — it can be the
+Desktop VM's own address. The symptom is `/api/v1/auth/setup` answering 403
+with `LOOPBACK_ONLY` while everything else works.
+
+ATRA does not put the address it saw in the response — a refusal should not
+teach the caller what to claim to be. First confirm the gateway really is the
+one the compose file pins:
+
+```sh
+docker network inspect atra --format '{{ (index .IPAM.Config 0).Gateway }}'
+```
+
+If it is `172.28.0.1` and setup is still refused, widen `ATRA_LOCAL_CLIENTS` in
+`.env` to the pinned subnet and no further:
+
+```sh
+ATRA_LOCAL_CLIENTS=127.0.0.0/8,::1,172.28.0.0/24
+```
+
+then `docker compose up -d`. That subnet holds this project's own containers
+and its gateway, nothing else. Do not reach for `10.0.0.0/8`,
+`172.16.0.0/12` or `192.168.0.0/16`: those are your LAN, and they turn the
+guard off for every machine on it the moment the port mapping is widened.
 
 ### The helper script
 

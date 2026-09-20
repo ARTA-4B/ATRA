@@ -171,6 +171,14 @@ function defaultDataDir(): string {
   return resolve(base, 'atra');
 }
 
+/** Hostnames that cannot leave the machine, so cleartext is nobody else's to read. */
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+
+function isLoopbackHost(hostname: string): boolean {
+  // A WHATWG URL keeps IPv6 literals bracketed: http://[::1]:8787 → '[::1]'.
+  return LOOPBACK_HOSTS.has(hostname.replace(/^\[|\]$/g, '').toLowerCase());
+}
+
 function splitList(value: string | undefined): string[] {
   if (!value) return [];
   return value
@@ -205,13 +213,28 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig 
       errors: [{ path: 'ATRA_GATEWAY_TOKEN', message: 'required when ATRA_GATEWAY_URL is set' }],
     });
   }
-  if (
-    raw.ATRA_GATEWAY_URL !== undefined &&
-    !/^(https?|wss?):$/.test(new URL(raw.ATRA_GATEWAY_URL).protocol)
-  ) {
-    throw new AppError(ErrorCode.SCHEMA_INVALID, 'Invalid environment configuration', {
-      errors: [{ path: 'ATRA_GATEWAY_URL', message: 'must be an http(s) or ws(s) URL' }],
-    });
+  if (raw.ATRA_GATEWAY_URL !== undefined) {
+    const gateway = new URL(raw.ATRA_GATEWAY_URL);
+    if (!/^(https?|wss?):$/.test(gateway.protocol)) {
+      throw new AppError(ErrorCode.SCHEMA_INVALID, 'Invalid environment configuration', {
+        errors: [{ path: 'ATRA_GATEWAY_URL', message: 'must be an http(s) or ws(s) URL' }],
+      });
+    }
+    // The installation token travels in the upgrade request's Authorization
+    // header, so an unencrypted hop off this machine hands it to the network.
+    if (
+      (gateway.protocol === 'http:' || gateway.protocol === 'ws:') &&
+      !isLoopbackHost(gateway.hostname)
+    ) {
+      throw new AppError(ErrorCode.SCHEMA_INVALID, 'Invalid environment configuration', {
+        errors: [
+          {
+            path: 'ATRA_GATEWAY_URL',
+            message: 'must use https or wss; plain http is allowed only for localhost',
+          },
+        ],
+      });
+    }
   }
   const dataDir = raw.ATRA_DATA_DIR
     ? isAbsolute(raw.ATRA_DATA_DIR)

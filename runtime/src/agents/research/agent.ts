@@ -27,6 +27,13 @@ import type { Db } from '../../db/database.js';
  * is stripped and reported as a hallucination, which is also how the model's
  * evaluation suite scores it.
  *
+ * Text that came from a provider — a token symbol, a dex name, an upstream
+ * error — is treated as hostile input, because anyone who can list a pool
+ * chooses it. It is flattened to a single capped line before it reaches the
+ * prompt, so it cannot forge a line of evidence, and it never contributes to
+ * the set of figures the model is allowed to quote, so it cannot smuggle a
+ * number past the hallucination filter.
+ *
  * When the evidence is thin the result is `INSUFFICIENT_DATA`. That is a
  * success, not a failure: an agent that handles money must be able to say it
  * does not know.
@@ -64,6 +71,33 @@ export interface ResearchResult {
   hallucinatedValues: string[];
   summary: string;
 }
+
+/** Caps for provider-controlled text, long enough for every honest value. */
+const MAX_SYMBOL = 16;
+const MAX_DEX = 32;
+/** A pool id is an address: 44 characters on Solana, 42 on the EVM chains. */
+const MAX_ID = 64;
+const MAX_REASON = 200;
+
+/**
+ * Fact keys whose value is a figure ATRA measured.
+ *
+ * Only these feed the allowed-number set. A symbol, a dex name or a pool
+ * address is a string an upstream chose, and letting the digits inside one
+ * count as evidence would let a provider authorise any number it liked —
+ * listing a token as "9999" would make 9999 quotable by the model.
+ */
+const NUMERIC_FACT_KEYS = new Set([
+  'price.usd',
+  'price.crossCheckDeviationBps',
+  'pool.priceUsd',
+  'liquidity.usd',
+  'volume.24hUsd',
+  'change.24hBps',
+  'history.candles',
+  'history.firstClose',
+  'history.lastClose',
+]);
 
 /** What the model is allowed to return. Deliberately narrow. */
 const interpretationSchema = z.object({
@@ -245,10 +279,12 @@ export class ResearchAgent {
           pool = snapshot;
           facts.push(...this.#poolFacts(snapshot));
         } else {
-          staleInputs.push(`pool ${request.poolId} was not found by any provider`);
+          staleInputs.push(
+            cleanText(`pool ${request.poolId} was not found by any provider`, MAX_REASON),
+          );
         }
       } catch (error) {
-        staleInputs.push(`pool lookup failed: ${errorMessage(error)}`);
+        staleInputs.push(cleanText(`pool lookup failed: ${errorMessage(error)}`, MAX_REASON));
       }
     }
 
@@ -275,13 +311,15 @@ export class ResearchAgent {
             );
           }
           if (price.disputed) {
-            staleInputs.push(price.reason ?? 'providers disagree about this price');
+            staleInputs.push(
+              cleanText(price.reason ?? 'providers disagree about this price', MAX_REASON),
+            );
           }
         } else {
-          staleInputs.push(price.reason ?? 'no provider returned a price');
+          staleInputs.push(cleanText(price.reason ?? 'no provider returned a price', MAX_REASON));
         }
       } catch (error) {
-        staleInputs.push(`price lookup failed: ${errorMessage(error)}`);
+        staleInputs.push(cleanText(`price lookup failed: ${errorMessage(error)}`, MAX_REASON));
       }
 
       if (!pool) {
@@ -293,7 +331,7 @@ export class ResearchAgent {
             facts.push(...this.#poolFacts(deepest));
           }
         } catch (error) {
-          staleInputs.push(`pool discovery failed: ${errorMessage(error)}`);
+          staleInputs.push(cleanText(`pool discovery failed: ${errorMessage(error)}`, MAX_REASON));
         }
       }
     }
@@ -320,7 +358,7 @@ export class ResearchAgent {
           staleInputs.push('no historical candles were available for this pool');
         }
       } catch (error) {
-        staleInputs.push(`history lookup failed: ${errorMessage(error)}`);
+        staleInputs.push(cleanText(`history lookup failed: ${errorMessage(error)}`, MAX_REASON));
       }
     }
 
@@ -334,17 +372,31 @@ export class ResearchAgent {
 
   #poolFacts(snapshot: MarketSnapshot): ResearchFact[] {
     const facts: ResearchFact[] = [
-      this.#fact('pool.id', snapshot.poolId, snapshot.source, snapshot.observedAt),
+      // A pool id is a provider string like any other, even though every honest
+      // one is an address.
+      this.#fact(
+        'pool.id',
+        cleanText(snapshot.poolId, MAX_ID),
+        snapshot.source,
+        snapshot.observedAt,
+      ),
     ];
 
     if (snapshot.dexId) {
-      facts.push(this.#fact('pool.dex', snapshot.dexId, snapshot.source, snapshot.observedAt));
+      facts.push(
+        this.#fact(
+          'pool.dex',
+          cleanText(snapshot.dexId, MAX_DEX),
+          snapshot.source,
+          snapshot.observedAt,
+        ),
+      );
     }
     if (snapshot.base.symbol && snapshot.quote.symbol) {
       facts.push(
         this.#fact(
           'pool.pair',
-          `${snapshot.base.symbol}/${snapshot.quote.symbol}`,
+          `${cleanText(snapshot.base.symbol, MAX_SYMBOL)}/${cleanText(snapshot.quote.symbol, MAX_SYMBOL)}`,
           snapshot.source,
           snapshot.observedAt,
         ),
@@ -478,16 +530,31 @@ function jsonSchemaForInterpretation(): Record<string, unknown> {
   };
 }
 
-/** Every numeric token that appears in the evidence, as written. */
+/**
+ * Flatten provider text to one capped line.
+ *
+ * `\p{C}` covers control characters, line breaks and the invisible formatting
+ * characters, so a symbol cannot end a line and start one that reads like
+ * evidence or like an instruction. What survives is collapsed and truncated,
+ * because a legitimate symbol is short and a long one is an attempt at
+ * something else.
+ */
+function cleanText(value: string, max: number): string {
+  const flattened = value.replace(/\p{C}/gu, ' ').replace(/\s+/g, ' ').trim();
+  return flattened.length > max ? `${flattened.slice(0, max)}...` : flattened;
+}
+
+/** Every numeric token that appears in a measured fact, as written. */
 function allowedNumbers(evidence: Evidence): Set<string> {
   const allowed = new Set<string>();
 
   for (const fact of evidence.facts) {
+    // Ages are rendered into the prompt in seconds, so they are fair to cite.
+    allowed.add(normalizeNumber(String(Math.round(fact.ageMs / 1000))));
+    if (!NUMERIC_FACT_KEYS.has(fact.key)) continue;
     for (const match of fact.value.matchAll(/\d+(?:\.\d+)?/g)) {
       allowed.add(normalizeNumber(match[0]));
     }
-    // Ages are rendered into the prompt in seconds, so they are fair to cite.
-    allowed.add(normalizeNumber(String(Math.round(fact.ageMs / 1000))));
   }
 
   // Small integers are almost always counts or ordinals rather than claims

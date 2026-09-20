@@ -4,6 +4,7 @@ import {
   HELP_TEXT,
   OFFLINE_TEXT,
   PAIR_FAILED_TEXT,
+  PAIR_REFUSED_OWNER_TEXT,
   REFUSED_TEXT,
   UNPAIRED_HINT,
   pairedText,
@@ -282,6 +283,137 @@ describe('POST /tg/webhook: linked users', () => {
       expect(result.body.outcome).toBe('refused');
       expect(telegram.sent.at(-1)).toEqual({ chatId: userId, text: REFUSED_TEXT });
     }
+    expect(await runtime.maybeNext(300)).toBeNull();
+    await runtime.close();
+  });
+});
+
+describe('POST /tg/webhook: re-pairing an installation', () => {
+  it('refuses a different Telegram user and warns the chat that is already linked', async () => {
+    const { runtime } = await connectedRuntime();
+    const owner = nextUser();
+    await pairRuntime(runtime, telegram, { userId: owner }, 'HERS-2345');
+
+    // The installation offers a fresh code and somebody else redeems it.
+    const stranger = nextUser();
+    const codeHash = await sha256Hex('THFT2345');
+    runtime.send(frame('pair.offer', { codeHash, expiresAt: Date.now() + 60_000 }));
+    await settle();
+    const before = telegram.sent.length;
+
+    const result = await postWebhook(makeUpdate({ userId: stranger, text: '/pair THFT-2345' }));
+    expect(result.body.outcome).toBe('pair_refused');
+    expect(telegram.sent.slice(before)).toEqual([
+      { chatId: stranger, text: PAIR_FAILED_TEXT },
+      { chatId: owner, text: PAIR_REFUSED_OWNER_TEXT },
+    ]);
+
+    const link = await linkRow(runtime.installId);
+    expect(link?.tg_user_id).toBe(owner);
+    expect(link?.tg_chat_id).toBe(owner);
+    // The runtime hears nothing: no paired frame, no unpaired frame.
+    expect(await runtime.maybeNext(300)).toBeNull();
+    // The code is spent all the same, so the refusal cannot be retried.
+    expect((await pairCodeRow(codeHash))?.used_at).not.toBeNull();
+    await runtime.close();
+  });
+
+  it('lets the same user re-pair from a new chat', async () => {
+    const { runtime } = await connectedRuntime();
+    const userId = nextUser();
+    await pairRuntime(runtime, telegram, { userId }, 'AGAN-2345');
+
+    // A reinstalled app talks to the bot from a fresh chat; same account.
+    const newChat = userId + 500_000;
+    const { paired } = await pairRuntime(
+      runtime,
+      telegram,
+      { userId, chatId: newChat },
+      'AGAN-3456',
+    );
+    expect(paired).toMatchObject({ type: 'paired', telegram: { userId, chatId: newChat } });
+    expect(telegram.sent.at(-1)).toEqual({ chatId: newChat, text: pairedText(runtime.installId) });
+
+    const link = await linkRow(runtime.installId);
+    expect(link?.tg_user_id).toBe(userId);
+    expect(link?.tg_chat_id).toBe(newChat);
+    await runtime.close();
+  });
+});
+
+describe('pair.offer: one live code per hash', () => {
+  it('refuses a hash another installation is still offering', async () => {
+    const a = await connectedRuntime();
+    const b = await connectedRuntime();
+    const codeHash = await sha256Hex('CNFL2345');
+
+    a.runtime.send(frame('pair.offer', { codeHash, expiresAt: Date.now() + 60_000 }));
+    await settle();
+    expect((await pairCodeRow(codeHash))?.install_id).toBe(a.runtime.installId);
+
+    b.runtime.send(frame('pair.offer', { codeHash, expiresAt: Date.now() + 60_000 }));
+    expect(await b.runtime.next()).toMatchObject({ type: 'error', code: 'code_in_use' });
+    // The row still belongs to the installation that offered it first.
+    expect((await pairCodeRow(codeHash))?.install_id).toBe(a.runtime.installId);
+    expect(await a.runtime.maybeNext(200)).toBeNull();
+    await a.runtime.close();
+    await b.runtime.close();
+  });
+
+  it('takes over a foreign row that is expired or already used', async () => {
+    const { runtime } = await connectedRuntime();
+    const stale = await mintToken();
+
+    const expired = await sha256Hex('XPRD2345');
+    await insertPairCode(expired, stale.installId, { expiresAt: Date.now() - 1_000 });
+    runtime.send(frame('pair.offer', { codeHash: expired, expiresAt: Date.now() + 60_000 }));
+    await settle();
+    expect(await runtime.maybeNext(200)).toBeNull();
+    expect((await pairCodeRow(expired))?.install_id).toBe(runtime.installId);
+
+    const used = await sha256Hex('USED2345');
+    await insertPairCode(used, stale.installId, { usedAt: Date.now() });
+    runtime.send(frame('pair.offer', { codeHash: used, expiresAt: Date.now() + 60_000 }));
+    await settle();
+    expect(await runtime.maybeNext(200)).toBeNull();
+    const row = await pairCodeRow(used);
+    expect(row?.install_id).toBe(runtime.installId);
+    expect(row?.used_at).toBeNull();
+    await runtime.close();
+  });
+});
+
+describe('POST /tg/webhook: update kinds', () => {
+  it('ignores an edited message, a channel post and a callback query', async () => {
+    const { runtime } = await connectedRuntime();
+    const userId = nextUser();
+    await pairRuntime(runtime, telegram, { userId }, 'KIND-2345');
+    const before = telegram.sent.length;
+
+    const from = { id: userId, is_bot: false, first_name: 'Test' };
+    const message = {
+      message_id: 11,
+      date: Math.floor(Date.now() / 1000),
+      chat: { id: userId, type: 'private' },
+      from,
+      text: '/status',
+    };
+    const updates = [
+      { update_id: 9_100_001, edited_message: { ...message, edit_date: message.date } },
+      {
+        update_id: 9_100_002,
+        channel_post: { ...message, chat: { id: -100_123, type: 'channel' } },
+      },
+      { update_id: 9_100_003, callback_query: { id: 'cb-1', from, data: '/status' } },
+    ];
+    for (const update of updates) {
+      const result = await postWebhook(update);
+      expect(result.response.status).toBe(200);
+      expect(result.body.outcome).toBe('ignored');
+    }
+
+    // Nothing is answered and nothing reaches the paired runtime.
+    expect(telegram.sent).toHaveLength(before);
     expect(await runtime.maybeNext(300)).toBeNull();
     await runtime.close();
   });

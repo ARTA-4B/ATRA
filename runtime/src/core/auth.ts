@@ -32,6 +32,14 @@ export const REAUTH_TTL_MS = 5 * 60 * 1_000;
  * or an attacker. Five failures in the window lock the password check for the
  * lockout period. The KDF already makes each guess cost about a second; this
  * bounds the guess rate regardless of how many requests arrive in parallel.
+ *
+ * Two properties make that true, and both are easy to lose:
+ *
+ *  - the attempt is counted *before* the KDF is awaited, so N requests that
+ *    arrive together are not all evaluated against a count none of them has
+ *    updated yet;
+ *  - the count lives in the database, so restarting the process does not hand
+ *    a guesser a fresh budget.
  */
 export const LOGIN_FAILURE_LIMIT = 5;
 export const LOGIN_FAILURE_WINDOW_MS = 15 * 60 * 1_000;
@@ -70,6 +78,11 @@ interface ReauthRow {
   used_at: string | null;
 }
 
+interface ThrottleRow {
+  failures: string;
+  locked_until: number | null;
+}
+
 export interface Session {
   id: string;
   createdAt: string;
@@ -86,9 +99,6 @@ export class AuthService {
   readonly #audit: AuditLog;
   readonly #log = childLogger('auth');
   readonly #kdf: KdfParams;
-  /** Timestamps of recent password failures, newest last. */
-  #failures: number[] = [];
-  #lockedUntil = 0;
   readonly #now: () => number;
 
   constructor(
@@ -104,27 +114,30 @@ export class AuthService {
   }
 
   /**
-   * Refuse to check a password while locked out.
+   * Charge this attempt to the throttle, then refuse it if the throttle has
+   * tripped.
    *
-   * Applied before the KDF runs, so a locked-out caller cannot even burn CPU.
+   * The write happens before the caller awaits the KDF, which is what makes
+   * the limit hold under concurrency: the attempt that takes the count to the
+   * limit locks the check for every attempt behind it, whether or not any of
+   * them has finished deriving a key. An attempt that turns out to be the
+   * right password clears the count again.
    */
-  #assertNotLockedOut(): void {
+  #beginAttempt(): void {
     const now = this.#now();
-    if (now < this.#lockedUntil) {
+    const state = this.#throttle();
+
+    if (state.lockedUntil !== null && now < state.lockedUntil) {
       throw new AppError(ErrorCode.RATE_LIMITED, 'Too many failed password attempts', {
-        retryAfterSec: Math.ceil((this.#lockedUntil - now) / 1_000),
+        retryAfterSec: Math.ceil((state.lockedUntil - now) / 1_000),
       });
     }
-  }
 
-  #recordFailure(): void {
-    const now = this.#now();
-    this.#failures = this.#failures.filter((at) => now - at < LOGIN_FAILURE_WINDOW_MS);
-    this.#failures.push(now);
+    const failures = state.failures.filter((at) => now - at < LOGIN_FAILURE_WINDOW_MS);
+    failures.push(now);
 
-    if (this.#failures.length >= LOGIN_FAILURE_LIMIT) {
-      this.#lockedUntil = now + LOGIN_LOCKOUT_MS;
-      this.#failures = [];
+    if (failures.length >= LOGIN_FAILURE_LIMIT) {
+      this.#writeThrottle([], now + LOGIN_LOCKOUT_MS);
       this.#audit.append({
         category: 'auth',
         action: 'login.locked',
@@ -132,11 +145,51 @@ export class AuthService {
         summary: `Password checks locked for ${String(LOGIN_LOCKOUT_MS / 60_000)} minutes after repeated failures`,
       });
       this.#log.warn('password checks locked out after repeated failures');
+      return;
     }
+
+    this.#writeThrottle(failures, null);
   }
 
   #recordSuccess(): void {
-    this.#failures = [];
+    this.#writeThrottle([], null);
+  }
+
+  #throttle(): { failures: number[]; lockedUntil: number | null } {
+    const row = this.#db
+      .prepare<[], ThrottleRow>('SELECT failures, locked_until FROM auth_throttle WHERE id = 1')
+      .get();
+
+    if (!row) return { failures: [], lockedUntil: null };
+
+    let failures: number[] = [];
+    try {
+      const parsed: unknown = JSON.parse(row.failures);
+      if (Array.isArray(parsed)) {
+        failures = parsed.filter((value): value is number => typeof value === 'number');
+      }
+    } catch {
+      // A corrupt counter must not become an open door: an unreadable list is
+      // treated as empty, and the row is rewritten on the next attempt.
+    }
+
+    return { failures, lockedUntil: row.locked_until };
+  }
+
+  #writeThrottle(failures: number[], lockedUntil: number | null): void {
+    this.#db
+      .prepare<[string, number | null, string, string, number | null, string]>(
+        'INSERT INTO auth_throttle (id, failures, locked_until, updated_at) VALUES (1, ?, ?, ?)' +
+          ' ON CONFLICT(id) DO UPDATE SET failures = ?, locked_until = ?, updated_at = ?',
+      )
+      .run(
+        JSON.stringify(failures),
+        lockedUntil,
+        new Date(this.#now()).toISOString(),
+        JSON.stringify(failures),
+        lockedUntil,
+        new Date(this.#now()).toISOString(),
+      );
   }
 
   get isConfigured(): boolean {
@@ -250,10 +303,9 @@ export class AuthService {
       throw new AppError(ErrorCode.SETUP_REQUIRED, 'Run first-time setup before signing in');
     }
 
-    this.#assertNotLockedOut();
+    this.#beginAttempt();
 
     if (!(await this.verifyPassword(password))) {
-      this.#recordFailure();
       this.#audit.append({
         category: 'auth',
         action: 'login.failed',
@@ -342,10 +394,9 @@ export class AuthService {
     purpose: ReauthPurpose,
     password: string,
   ): Promise<{ token: string; expiresAt: string }> {
-    this.#assertNotLockedOut();
+    this.#beginAttempt();
 
     if (!(await this.verifyPassword(password))) {
-      this.#recordFailure();
       this.#audit.append({
         category: 'auth',
         action: 'reauth.failed',
