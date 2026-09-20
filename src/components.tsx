@@ -4,7 +4,7 @@ import { ArrowUpRight, Check, ChevronRight, Copy, Database, LoaderCircle, Moon, 
 import { chains } from './data/services';
 import type { Chain, DataState } from './data/services';
 
-export function Logo({ small = false }: { small?: boolean }) { return <a className={`logo ${small ? 'small' : ''}`} href="#/" aria-label="ATRA home"><img src="/brand/heron.png" alt="" width="26" height="38" decoding="async"/><span>ATRA</span></a>; }
+export function Logo({ small = false }: { small?: boolean }) { return <a className={`logo ${small ? 'small' : ''}`} href="/" aria-label="ATRA home"><img src="/brand/heron.png" alt="" width="26" height="38" decoding="async"/><span>ATRA</span></a>; }
 export function Badge({ children, tone = '' }: { children: ReactNode; tone?: string }) { return <span className={`badge ${tone}`}>{children}</span>; }
 /** The networks' own marks (see docs/brand/THIRD_PARTY_MARKS.md); Robinhood publishes a black and a white feather, so both ship and CSS picks one per theme. */
 const CHAIN_LOGO: Record<string, { src: string; dark?: string; slug: string }> = {

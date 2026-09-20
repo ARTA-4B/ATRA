@@ -1,19 +1,20 @@
 import { test, expect } from '@playwright/test';
 
 test('public and dashboard routes render without page overflow or runtime errors', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
   const errors: string[] = []; page.on('pageerror', e => errors.push(e.message));
   const routes = ['/', '/market', '/install', '/docs', '/docs/security', '/docs/status', '/app/overview', '/app/market', '/app/agents', '/app/auto-trade', '/app/auto-lp', '/app/wallet', '/app/risk', '/app/activity', '/app/telegram', '/app/settings', '/app/setup'];
   for (const route of routes) {
     await page.goto('/#' + route); await expect(page.locator('h1')).toBeVisible();
-    await page.waitForTimeout(100);
-    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), route).toBeTruthy();
+    await page.waitForTimeout(650);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1), route).toBeTruthy();
     await page.screenshot({ path: `artifacts/${test.info().project.name}-${route.replaceAll('/', '-') || 'home'}.png`, fullPage: true });
   }
   expect(errors).toEqual([]);
 });
 
 test('market filters, research, watchlist, and provider states', async ({ page }) => {
-  await page.goto('/#/app/market');
+  await page.goto('/app/market');
   await expect(page.getByRole('button', { name: 'View ETH on Base', exact: true })).toBeVisible();
   await page.getByRole('textbox', { name: 'Search assets or pairs' }).fill('SOL');
   await expect(page.locator('tbody tr')).toHaveCount(1);
@@ -34,7 +35,7 @@ test('market filters, research, watchlist, and provider states', async ({ page }
 });
 
 test('wallet review blocks execution and export never reveals a key', async ({ page }) => {
-  await page.goto('/#/app/wallet'); await page.getByRole('button', { name: 'Withdraw', exact: true }).first().click();
+  await page.goto('/app/wallet'); await page.getByRole('button', { name: 'Withdraw', exact: true }).first().click();
   await expect(page.getByRole('button', { name: 'Review withdrawal' })).toBeDisabled();
   await page.getByLabel('Destination address').fill('0x1111111111111111111111111111111111111111');
   await page.getByLabel('Amount (USDC)').fill('25');
@@ -53,7 +54,7 @@ test('wallet review blocks execution and export never reveals a key', async ({ p
 });
 
 test('risk validation, persistence and emergency recovery', async ({ page }) => {
-  await page.goto('/#/app/risk');
+  await page.goto('/app/risk');
   await page.getByLabel('Maximum trade size (USD)').fill('7000');
   await page.getByRole('button', { name: 'Save risk limits' }).click();
   await expect(page.getByRole('alert')).toContainText('cannot exceed');
@@ -71,7 +72,7 @@ test('risk validation, persistence and emergency recovery', async ({ page }) => 
 });
 
 test('onboarding completes in paper mode without pretending wallets exist', async ({ page }) => {
-  await page.goto('/#/app/setup');
+  await page.goto('/app/setup');
   await page.getByRole('button', { name: 'Continue', exact: true }).click();
   await page.getByRole('button', { name: 'Continue', exact: true }).click();
   await page.getByRole('button', { name: 'Create Agent Wallets', exact: true }).click();
