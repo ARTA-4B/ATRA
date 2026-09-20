@@ -175,11 +175,11 @@ describe('Vault', () => {
   });
 
   it('auto-locks after the idle window', async () => {
-    const shortLived = new Vault(db, { autolockMs: 1 });
+    const shortLived = new Vault(db, { autolockMs: 40 });
     await shortLived.initialize(PASSWORD, FAST_KDF);
     const id = shortLived.putSecret('evm_private_key', 'agent', new Uint8Array([1]));
 
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    await new Promise((resolve) => setTimeout(resolve, 90));
 
     expect(shortLived.isUnlocked).toBe(false);
     expect(() => shortLived.useSecret(id, (b) => b)).toThrow(/locked/i);
