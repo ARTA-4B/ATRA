@@ -4,7 +4,7 @@ import { ArrowUpRight, Check, ChevronRight, Copy, Database, LoaderCircle, Triang
 import { chains } from './data/services';
 import type { Chain, DataState } from './data/services';
 
-export function Logo({ small = false }: { small?: boolean }) { return <a className={`logo ${small ? 'small' : ''}`} href="#/" aria-label="ATRA home"><svg viewBox="0 0 200 200" aria-hidden="true"><circle cx="100" cy="100" r="90" fill="currentColor"/><circle cx="100" cy="82" r="24" fill="var(--bg)"/><path d="M88 98 H112 L120 146 H80 Z" fill="var(--bg)"/></svg><span>ATRA</span></a>; }
+export function Logo({ small = false }: { small?: boolean }) { return <a className={`logo ${small ? 'small' : ''}`} href="#/" aria-label="ATRA home"><img src="/brand/heron.png" alt="" width="26" height="38" decoding="async"/><span>ATRA</span></a>; }
 export function Badge({ children, tone = '' }: { children: ReactNode; tone?: string }) { return <span className={`badge ${tone}`}>{children}</span>; }
 export function ChainMark({ chain }: { chain: string }) { return <span className={`chain-mark ${chain === 'Base' ? 'base' : chain === 'Solana' ? 'solana' : chain === 'BNB Smart Chain' ? 'bnb' : 'robinhood'}`} aria-hidden="true">{chain === 'Base' ? '—' : chain === 'Solana' ? '≋' : chain === 'BNB Smart Chain' ? '◇' : '↗'}</span>; }
 export function ChainBadge({ chain }: { chain: string }) { return <span className="chain-label"><ChainMark chain={chain}/>{chain}</span>; }

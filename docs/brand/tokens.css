@@ -10,8 +10,9 @@
  * prefers dark and no explicit light choice was made, and always under
  * [data-theme="dark"].
  *
- * Typography: "Sora" for the wordmark and page titles, "Manrope" for UI
- * text, "IBM Plex Mono" for numbers, hashes and code. No serif, no italics.
+ * Typography: "Libre Caslon Text" for the wordmark only (it sits next to a
+ * 1910 wood engraving), "Sora" for page titles, "Manrope" for UI text,
+ * "IBM Plex Mono" for numbers, hashes and code.
  */
 
 :root {
@@ -54,6 +55,7 @@
   --radius-lg: 14px;
 
   /* type */
+  --font-wordmark: 'Libre Caslon Text', Georgia, 'Times New Roman', serif;
   --font-display: 'Sora', 'Manrope', system-ui, sans-serif;
   --font-ui: 'Manrope', system-ui, -apple-system, 'Segoe UI', sans-serif;
   --font-mono: 'IBM Plex Mono', Consolas, monospace;
