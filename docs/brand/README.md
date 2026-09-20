@@ -74,7 +74,7 @@ https://fonts.googleapis.com/css2?family=Libre+Caslon+Text:wght@700&family=Sora:
 - **Bio (156/160):** Open-source, self-hosted autonomous crypto agent for Base, BNB Smart Chain, Robinhood Chain & Solana. Your keys stay on your machine. Paper mode by default.
 - **Bio, shorter (146):** Self-hosted, open-source crypto agent for Base, BSC, Robinhood Chain & Solana. Your keys never leave your machine. Paper mode by default. No hype.
 - **Bio, Indonesian (154):** Agen kripto otonom open-source yang lo host sendiri untuk Base, BNB Smart Chain, Robinhood Chain & Solana. Kunci tetap di mesin lo. Paper mode by default.
-- **Website:** https://github.com/lamaokamg-hub/ATRA
+- **Website:** https://github.com/ARTA-4B/ATRA
 - **Location:** Self-hosted
 - **Profile picture:** `pp-800.png` · **Header:** `x-banner-1500x500.png`
 

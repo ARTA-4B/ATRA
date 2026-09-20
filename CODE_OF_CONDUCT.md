@@ -37,7 +37,7 @@ And this is not tolerated:
 ## Reporting
 
 Report conduct problems privately to the maintainer through a
-[GitHub private security advisory](https://github.com/lamaokamg-hub/ATRA/security/advisories/new)
+[GitHub private security advisory](https://github.com/ARTA-4B/ATRA/security/advisories/new)
 with "conduct" in the title, or by contacting the maintainer directly through
 the GitHub profile of the repository owner. Reports are read by the
 maintainer only, kept confidential, and answered.

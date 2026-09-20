@@ -7,7 +7,7 @@ where you are. State on 2026-09-20.
 ## The supported path: Docker
 
 ```sh
-git clone https://github.com/lamaokamg-hub/ATRA.git
+git clone https://github.com/ARTA-4B/ATRA.git
 cd ATRA
 docker compose up -d
 ```

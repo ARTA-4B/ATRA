@@ -90,7 +90,7 @@ What each section does and what "good" looks like:
 |---|---|---|
 | GPU check | `nvidia-smi` | two Tesla T4, 15 GiB each |
 | Dependencies | `pip install …` pinned | `deps ok 4.57.6 0.27.0 0.19.1 0.50.2` |
-| Clone | `git clone lamaokamg-hub/ATRA` | a commit hash |
+| Clone | `git clone ARTA-4B/ATRA` | a commit hash |
 | Dataset | `python -m data.build --seed 42 --per-domain 200` | about 1,000 examples, split roughly 84/7/9 |
 | Checks | `python -m data.checks data/out` | `no errors`, `NO_ACTION` ratio ≥ 0.40, four chains present |
 | Dry run | `python train.py --dry-run` | dataset hash printed, exits before loading a model |
