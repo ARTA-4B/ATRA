@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { microsToUsd } from '../src/risk/money.js';
 import { randomUUID } from 'node:crypto';
 import type { z } from 'zod';
 import { recoverTransactionAddress } from 'viem';
@@ -1444,6 +1445,35 @@ describe('Phase 4: LIVE LP executor', () => {
     const removal = h.services.trades.get(exit.trade!.tradeId)!;
     expect(removal.kind).toBe('lp_remove');
     expect(removal.status).toBe('filled');
+  });
+
+  it('counts what a LIVE exit realized, gas included, in the day', async () => {
+    // The paper path records LP P&L; for a while the live path did not, so
+    // impermanent loss and gas on real money were invisible to the daily-loss
+    // check — the one place they matter most.
+    h = await harness({
+      model: [decide('ADD_LIQUIDITY', '20'), decide('EXIT')],
+      lp: { allowance: 0n },
+      chains: liveChains,
+    });
+    await activateLive(h.services);
+    expect((await run(h)).outcome).toBe('filled');
+
+    // The entry realizes only its gas.
+    const afterAdd = h.services.ledger.realizedPnlTodayUsd('LIVE');
+    expect(afterAdd).toBeLessThan(0n);
+
+    expect((await run(h)).outcome).toBe('filled');
+
+    // The exit releases the position's basis against what the burn returned,
+    // so the day moves again and stays negative: nothing here was profitable.
+    const afterExit = h.services.ledger.realizedPnlTodayUsd('LIVE');
+    expect(afterExit).toBeLessThan(afterAdd);
+    expect(h.services.ledger.toRiskLedger('LIVE', priceLookup).realizedPnlTodayUsd).toBe(
+      microsToUsd(afterExit),
+    );
+    // PAPER is a separate book and must not have moved.
+    expect(h.services.ledger.realizedPnlTodayUsd('PAPER')).toBe(0n);
   });
 
   it('collects fees in LIVE when the pool reports enough claimable', async () => {

@@ -560,43 +560,140 @@ export class LiveLpExecutor {
           priceToAtto(prices.token1Usd),
           'ceil',
         );
-      this.#store.bookAdd({
-        mode: 'LIVE',
-        chain: action.chain,
-        protocol: action.protocol,
-        poolId: pool.poolId,
-        token0: { address: pool.token0.address, decimals: pool.token0.decimals },
-        token1: { address: pool.token1.address, decimals: pool.token1.decimals },
-        lpTokens,
-        amount0,
-        amount1,
-        capitalUsd: microsToUsd(capital),
-        at: filledAt,
-        rebalance: action.kind === 'lp_rebalance',
+      // Captured before the closure: control-flow narrowing does not reach
+      // into a callback, and these are known non-null on this branch.
+      const mintedLp = lpTokens;
+      // The position row and the day's P&L row are written together: a
+      // position booked without its gas would be a position whose cost the
+      // daily-loss check never sees.
+      this.#store.transaction(() => {
+        this.#store.bookAdd({
+          mode: 'LIVE',
+          chain: action.chain,
+          protocol: action.protocol,
+          poolId: pool.poolId,
+          token0: { address: pool.token0.address, decimals: pool.token0.decimals },
+          token1: { address: pool.token1.address, decimals: pool.token1.decimals },
+          lpTokens: mintedLp,
+          amount0,
+          amount1,
+          capitalUsd: microsToUsd(capital),
+          at: filledAt,
+          rebalance: action.kind === 'lp_rebalance',
+        });
+        // An entry realises nothing but its gas, exactly as an opening swap
+        // realises only its fee.
+        this.#store.recordPnl({
+          tradeId: trade.id,
+          mode: 'LIVE',
+          chain: action.chain,
+          protocol: action.protocol,
+          poolId: pool.poolId,
+          action: action.kind === 'lp_rebalance' ? 'REBALANCE' : 'ADD',
+          proceedsUsd: 0n,
+          costReleasedUsd: 0n,
+          feeUsd: usdToMicros(feeUsd),
+          at: filledAt,
+          simulated: false,
+        });
       });
       summary = `LIVE LP add ${receipt.hash.slice(0, 12)}…: ${amount0}/${amount1} -> ${lpTokens} LP`;
     } else if (plan.kind === 'remove') {
       lpTokens = plan.quote.lpTokens;
       amount0 = chainAmount('received', pool.token0.address, plan.quote.min0, 'token0 returned');
       amount1 = chainAmount('received', pool.token1.address, plan.quote.min1, 'token1 returned');
+      // What the burn returned, at the fill-time prices the executor already
+      // holds. This is the number impermanent loss actually shows up in.
+      const proceedsUsd =
+        nativeToUsdMicros(
+          amountToBigint(amount0),
+          pool.token0.decimals,
+          priceToAtto(prices.token0Usd),
+          'floor',
+        ) +
+        nativeToUsdMicros(
+          amountToBigint(amount1),
+          pool.token1.decimals,
+          priceToAtto(prices.token1Usd),
+          'floor',
+        );
+      const burnedLp = lpTokens;
       const stored = this.#store.getPosition('LIVE', action.chain, action.protocol, pool.poolId);
       if (stored && amountToBigint(stored.lpTokens) >= amountToBigint(lpTokens)) {
-        this.#store.bookRemove({
+        this.#store.transaction(() => {
+          const booked = this.#store.bookRemove({
+            mode: 'LIVE',
+            chain: action.chain,
+            protocol: action.protocol,
+            poolId: pool.poolId,
+            lpTokens: burnedLp,
+            at: filledAt,
+          });
+          this.#store.recordPnl({
+            tradeId: trade.id,
+            mode: 'LIVE',
+            chain: action.chain,
+            protocol: action.protocol,
+            poolId: pool.poolId,
+            action: booked.closed ? 'EXIT' : 'REMOVE',
+            proceedsUsd,
+            costReleasedUsd: booked.costReleasedUsd,
+            feeUsd: usdToMicros(feeUsd),
+            at: filledAt,
+            simulated: false,
+          });
+        });
+      } else {
+        notes.push('ledger held fewer LP tokens than were burned; position row left as is');
+        // The basis is unknown, so only the gas is certain. Recording it with
+        // no released cost keeps the day honest in the one direction it can be.
+        this.#store.recordPnl({
+          tradeId: trade.id,
           mode: 'LIVE',
           chain: action.chain,
           protocol: action.protocol,
           poolId: pool.poolId,
-          lpTokens,
+          action: 'REMOVE',
+          proceedsUsd: 0n,
+          costReleasedUsd: 0n,
+          feeUsd: usdToMicros(feeUsd),
           at: filledAt,
+          simulated: false,
         });
-      } else {
-        notes.push('ledger held fewer LP tokens than were burned; position row left as is');
       }
       summary = `LIVE LP remove ${receipt.hash.slice(0, 12)}…: ${lpTokens} LP -> ${amount0}/${amount1}`;
     } else {
       amount0 = receipt.received[pool.token0.address.toLowerCase()] ?? '0';
       amount1 = receipt.received[pool.token1.address.toLowerCase()] ?? '0';
-      this.#store.touchClaim('LIVE', action.chain, action.protocol, pool.poolId, filledAt);
+      this.#store.transaction(() => {
+        this.#store.touchClaim('LIVE', action.chain, action.protocol, pool.poolId, filledAt);
+        // Claimed fees are a realised gain against no basis.
+        this.#store.recordPnl({
+          tradeId: trade.id,
+          mode: 'LIVE',
+          chain: action.chain,
+          protocol: action.protocol,
+          poolId: pool.poolId,
+          action: 'COLLECT_FEES',
+          proceedsUsd:
+            nativeToUsdMicros(
+              amountToBigint(amount0),
+              pool.token0.decimals,
+              priceToAtto(prices.token0Usd),
+              'floor',
+            ) +
+            nativeToUsdMicros(
+              amountToBigint(amount1),
+              pool.token1.decimals,
+              priceToAtto(prices.token1Usd),
+              'floor',
+            ),
+          costReleasedUsd: 0n,
+          feeUsd: usdToMicros(feeUsd),
+          at: filledAt,
+          simulated: false,
+        });
+      });
       summary = `LIVE LP fee claim ${receipt.hash.slice(0, 12)}…: ${amount0}/${amount1} received`;
     }
 
