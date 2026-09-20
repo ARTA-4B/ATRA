@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { Db } from '../db/database.js';
+import type { Db, SqlValue } from '../db/database.js';
 import type { ChainId } from '../chains/registry.js';
 import type { LpSnapshot, Mode } from '../risk/types.js';
 import { lpPoolKey } from '../risk/types.js';
@@ -7,6 +7,9 @@ import { amountToBigint, microsToUsd, usdToMicros } from '../risk/money.js';
 import { AppError, ErrorCode } from '../util/errors.js';
 import { childLogger } from '../logging/logger.js';
 import type { LpRecordedAction } from './types.js';
+// The pool's own tick bounds, not a copy of them: a range this store accepts
+// is a range the chain would accept.
+import { MAX_TICK, MIN_TICK } from './evm/tick-math.js';
 
 /**
  * The LP ledger: positions, the append-only action log, rebalance counts and
@@ -105,6 +108,138 @@ export interface BookRemoveInput {
   protocol: string;
   poolId: string;
   lpTokens: string;
+  at: number;
+}
+
+/**
+ * The three things that move a range position's liquidity. Narrowed from the
+ * dashboard's vocabulary rather than invented beside it, so a range row and an
+ * `lp_actions` row still speak the same language; a HOLD or a fee claim never
+ * changes what a position holds and so is never one of these.
+ */
+export type LpRangeAction = Extract<LpRecordedAction, 'ADD' | 'REMOVE' | 'EXIT'>;
+
+/**
+ * One concentrated-liquidity position NFT.
+ *
+ * The sibling of `LpPositionRecord`, with the three differences that make a v3
+ * position a different animal: it is keyed by `tokenId` rather than by pool,
+ * it carries a tick range, and it holds no amounts — what a range position is
+ * made of depends on where the price is, so the amounts live in `mark` with
+ * the time they were observed. `liquidity` of '0' is a closed position, and
+ * the row stays to say so.
+ */
+export interface LpRangePositionRecord {
+  id: string;
+  mode: Mode;
+  chain: ChainId;
+  protocol: string;
+  poolId: string;
+  tokenId: string;
+  token0: string;
+  token1: string;
+  decimals0: number;
+  decimals1: number;
+  /** The raw uint24 fee, in hundredths of a basis point (500 = 0.05%). */
+  feePips: number;
+  tickLower: number;
+  tickUpper: number;
+  liquidity: string;
+  /** Cost basis in micro-USD. */
+  capitalUsd: bigint;
+  openedAt: string;
+  lastAction: LpRangeAction;
+  lastActionAt: string;
+  closedAt: string | null;
+  mark: {
+    valueUsd: bigint | null;
+    feesUsd: bigint | null;
+    amount0: string | null;
+    amount1: string | null;
+    inRange: boolean | null;
+    poolTick: number | null;
+    note: string | null;
+    markedAt: string | null;
+  };
+}
+
+/** One recorded change to a position's liquidity, from `lp_range_events`. */
+export interface LpRangeEventRecord {
+  id: string;
+  positionId: string;
+  mode: Mode;
+  chain: ChainId;
+  protocol: string;
+  poolId: string;
+  tokenId: string;
+  action: LpRangeAction;
+  /** Signed, in liquidity units: negative burns. */
+  liquidityDelta: string;
+  liquidityAfter: string;
+  /** Signed micro-USD: positive was paid in, negative was released. */
+  capitalDeltaUsd: bigint;
+  capitalAfterUsd: bigint;
+  at: string;
+}
+
+export interface OpenRangePositionInput {
+  mode: Mode;
+  chain: ChainId;
+  protocol: string;
+  poolId: string;
+  tokenId: string;
+  token0: { address: string; decimals: number };
+  token1: { address: string; decimals: number };
+  feePips: number;
+  tickLower: number;
+  tickUpper: number;
+  liquidity: string;
+  /** Micro-USD paid in. */
+  capitalUsd: bigint;
+  at: number;
+}
+
+export interface AdjustRangePositionInput {
+  mode: Mode;
+  chain: ChainId;
+  protocol: string;
+  tokenId: string;
+  /** Positive mints liquidity, negative burns it. Never zero. */
+  liquidityDelta: bigint;
+  /** Micro-USD paid in. Only an increase pays anything in. */
+  capitalUsd?: bigint;
+  at: number;
+}
+
+export interface CloseRangePositionInput {
+  mode: Mode;
+  chain: ChainId;
+  protocol: string;
+  tokenId: string;
+  at: number;
+}
+
+export interface RangeAdjustResult {
+  /**
+   * Always present, unlike `bookRemove`'s: a range position that has been
+   * fully burned is a row with zero liquidity and a `closedAt`, not an absence.
+   */
+  position: LpRangePositionRecord;
+  /** Micro-USD of cost basis the burn released; zero for an increase. */
+  costReleasedUsd: bigint;
+  closed: boolean;
+}
+
+/** What a cycle observed about a range position. Every field is dated by `at`. */
+export interface RangeMarkInput {
+  valueUsd: bigint | null;
+  feesUsd: bigint | null;
+  amount0: string | null;
+  amount1: string | null;
+  /** Whether the pool's tick was inside the range when it was read. */
+  inRange: boolean | null;
+  poolTick: number | null;
+  note: string | null;
   at: number;
 }
 
@@ -334,6 +469,348 @@ export class LiquidityStore {
       );
   }
 
+  // --- range positions -----------------------------------------------------
+
+  /**
+   * The v3 family: one row per position NFT, in `lp_range_positions`.
+   *
+   * These methods are siblings of `bookAdd`/`bookRemove`/`getPosition`/
+   * `listPositions` and never touch their tables. The cost-basis arithmetic is
+   * deliberately the same — average cost in, pro-rata out, rounded up so a
+   * burn can only under-report profit — because the difference between a v2
+   * and a v3 position is what it is made of, not how it is paid for.
+   *
+   * Nothing here builds, signs or values anything: an executor writes what it
+   * already did, and a cycle writes what it already read.
+   */
+
+  /** Open positions for a mode, oldest first. Closed ones on request. */
+  listRangePositions(
+    mode: Mode,
+    options: { includeClosed?: boolean } = {},
+  ): LpRangePositionRecord[] {
+    const sql = options.includeClosed
+      ? 'SELECT * FROM lp_range_positions WHERE mode = ? ORDER BY opened_at, rowid'
+      : 'SELECT * FROM lp_range_positions WHERE mode = ? AND closed_at IS NULL' +
+        ' ORDER BY opened_at, rowid';
+    return this.#db.prepare<[Mode], RangePositionRow>(sql).all(mode).map(toRangePosition);
+  }
+
+  /**
+   * One position by its token id.
+   *
+   * Keyed by tokenId rather than by pool because the pool does not identify a
+   * v3 position: several live in the same pool at once, which is the whole
+   * reason `getPosition`'s key could not be reused.
+   */
+  getRangePosition(
+    mode: Mode,
+    chain: ChainId,
+    protocol: string,
+    tokenId: string,
+  ): LpRangePositionRecord | undefined {
+    const row = this.#db
+      .prepare<[Mode, string, string, string], RangePositionRow>(
+        'SELECT * FROM lp_range_positions WHERE mode = ? AND chain = ? AND protocol = ?' +
+          ' AND token_id = ?',
+      )
+      .get(mode, chain, protocol, canonicalTokenId(tokenId));
+    return row ? toRangePosition(row) : undefined;
+  }
+
+  /** Every open position in one pool. The v3 answer to `getPosition`. */
+  listPoolRangePositions(
+    mode: Mode,
+    chain: ChainId,
+    protocol: string,
+    poolId: string,
+    options: { includeClosed?: boolean } = {},
+  ): LpRangePositionRecord[] {
+    const base =
+      'SELECT * FROM lp_range_positions WHERE mode = ? AND chain = ? AND protocol = ?' +
+      ' AND pool_id = ?';
+    const sql = options.includeClosed
+      ? `${base} ORDER BY opened_at, rowid`
+      : `${base} AND closed_at IS NULL ORDER BY opened_at, rowid`;
+    return this.#db
+      .prepare<[Mode, string, string, string], RangePositionRow>(sql)
+      .all(mode, chain, protocol, poolId)
+      .map(toRangePosition);
+  }
+
+  /**
+   * Book a newly minted position NFT at what was paid for it.
+   *
+   * Unlike `bookAdd` this refuses a token id it has already booked instead of
+   * adding to it: an ERC-721 is minted once, so a second open for the same id
+   * is two rows' worth of capital claiming one position. Adding to a position
+   * that exists is `adjustRangePosition`.
+   */
+  openRangePosition(input: OpenRangePositionInput): LpRangePositionRecord {
+    const at = new Date(input.at).toISOString();
+    const tokenId = canonicalTokenId(input.tokenId);
+    const liquidity = amountToBigint(input.liquidity);
+    if (liquidity <= 0n) {
+      throw new AppError(
+        ErrorCode.SCHEMA_INVALID,
+        'A range position must open with positive liquidity',
+      );
+    }
+    if (input.capitalUsd < 0n) {
+      throw new AppError(
+        ErrorCode.SCHEMA_INVALID,
+        'A range position cost basis cannot be negative',
+      );
+    }
+    assertFeePips(input.feePips);
+    assertTickRange(input.tickLower, input.tickUpper);
+
+    const write = this.#db.transaction(() => {
+      const existing = this.getRangePosition(input.mode, input.chain, input.protocol, tokenId);
+      if (existing) {
+        throw new AppError(ErrorCode.CONFLICT, 'That range position is already booked', {
+          details: { chain: input.chain, protocol: input.protocol, tokenId },
+        });
+      }
+      this.#db
+        .prepare(
+          'INSERT INTO lp_range_positions (id, mode, chain, protocol, pool_id, token_id, token0,' +
+            ' token1, decimals0, decimals1, fee_pips, tick_lower, tick_upper, liquidity,' +
+            ' capital_usd, opened_at, last_action, last_action_at, closed_at)' +
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ADD', ?, NULL)",
+        )
+        .run(
+          randomUUID(),
+          input.mode,
+          input.chain,
+          input.protocol,
+          input.poolId,
+          tokenId,
+          input.token0.address,
+          input.token1.address,
+          input.token0.decimals,
+          input.token1.decimals,
+          input.feePips,
+          input.tickLower,
+          input.tickUpper,
+          liquidity.toString(),
+          microsToUsd(input.capitalUsd),
+          at,
+          at,
+        );
+      const position = this.getRangePosition(input.mode, input.chain, input.protocol, tokenId)!;
+      this.#recordRangeEvent(position, 'ADD', liquidity, input.capitalUsd, at);
+      return position;
+    });
+    return write();
+  }
+
+  /**
+   * Mint more liquidity into a booked position, or burn some of it.
+   *
+   * A positive delta adds `capitalUsd` to the basis; a negative one releases
+   * the basis pro rata, rounded up, exactly as `bookRemove` does. A decrease
+   * pays nothing in, so passing capital with one is refused rather than
+   * quietly ignored — that combination is a caller confusing proceeds (which
+   * this layer does not record) with cost.
+   *
+   * A position burned to zero stays as a row: `closed` says what happened and
+   * the row's `closedAt` dates it. The chain allows increasing such a position
+   * again as long as its NFT was never burned, so an increase after a close
+   * re-opens the same row rather than refusing what the chain would permit.
+   */
+  adjustRangePosition(input: AdjustRangePositionInput): RangeAdjustResult {
+    const at = new Date(input.at).toISOString();
+    const tokenId = canonicalTokenId(input.tokenId);
+    const delta = input.liquidityDelta;
+    const capital = input.capitalUsd ?? 0n;
+    if (delta === 0n) {
+      throw new AppError(ErrorCode.SCHEMA_INVALID, 'A range adjustment must move liquidity');
+    }
+    if (capital < 0n) {
+      throw new AppError(
+        ErrorCode.SCHEMA_INVALID,
+        'A range position cost basis cannot be negative',
+      );
+    }
+    if (delta < 0n && capital !== 0n) {
+      throw new AppError(
+        ErrorCode.SCHEMA_INVALID,
+        'A decrease pays no capital in; it releases cost basis instead',
+      );
+    }
+
+    const write = this.#db.transaction(() => {
+      const existing = this.getRangePosition(input.mode, input.chain, input.protocol, tokenId);
+      if (!existing) {
+        throw new AppError(ErrorCode.CONFLICT, 'No range position to adjust', {
+          details: { chain: input.chain, protocol: input.protocol, tokenId },
+        });
+      }
+      const held = amountToBigint(existing.liquidity);
+      if (delta < 0n && -delta > held) {
+        throw new AppError(ErrorCode.CONFLICT, 'Decrease exceeds the range position', {
+          details: { held: held.toString(), burned: (-delta).toString() },
+        });
+      }
+      const remaining = held + delta;
+      const basis = existing.capitalUsd;
+      const costReleased = delta < 0n ? (basis * -delta + held - 1n) / held : 0n;
+      const nextBasis = delta > 0n ? basis + capital : basis - costReleased;
+      const action: LpRangeAction = delta > 0n ? 'ADD' : remaining === 0n ? 'EXIT' : 'REMOVE';
+
+      this.#db
+        .prepare(
+          'UPDATE lp_range_positions SET liquidity = ?, capital_usd = ?, last_action = ?,' +
+            ' last_action_at = ?, closed_at = ? WHERE id = ?',
+        )
+        .run(
+          remaining.toString(),
+          microsToUsd(nextBasis),
+          action,
+          at,
+          remaining === 0n ? at : null,
+          existing.id,
+        );
+
+      const position = this.getRangePosition(input.mode, input.chain, input.protocol, tokenId)!;
+      this.#recordRangeEvent(position, action, delta, delta > 0n ? capital : -costReleased, at);
+      return { position, costReleasedUsd: costReleased, closed: remaining === 0n };
+    });
+    return write();
+  }
+
+  /** Burn everything the position still holds, releasing the whole basis. */
+  closeRangePosition(input: CloseRangePositionInput): RangeAdjustResult {
+    const tokenId = canonicalTokenId(input.tokenId);
+    const write = this.#db.transaction(() => {
+      const existing = this.getRangePosition(input.mode, input.chain, input.protocol, tokenId);
+      if (!existing) {
+        throw new AppError(ErrorCode.CONFLICT, 'No range position to close', {
+          details: { chain: input.chain, protocol: input.protocol, tokenId },
+        });
+      }
+      const held = amountToBigint(existing.liquidity);
+      if (held === 0n) {
+        throw new AppError(ErrorCode.CONFLICT, 'That range position is already closed', {
+          details: { chain: input.chain, protocol: input.protocol, tokenId },
+        });
+      }
+      return this.adjustRangePosition({
+        mode: input.mode,
+        chain: input.chain,
+        protocol: input.protocol,
+        tokenId,
+        liquidityDelta: -held,
+        at: input.at,
+      });
+    });
+    return write();
+  }
+
+  /**
+   * Store what a cycle observed about a range position.
+   *
+   * The v3 sibling of `mark`, and it carries more because a range position is
+   * worth explaining: the amounts it currently consists of and whether the
+   * pool's tick was inside the range — an out-of-range position is one-sided
+   * and earning nothing, which a USD value alone never shows. Nothing is
+   * estimated here either: an unobserved position keeps its null mark.
+   */
+  markRangePosition(
+    mode: Mode,
+    chain: ChainId,
+    protocol: string,
+    tokenId: string,
+    mark: RangeMarkInput,
+  ): void {
+    this.#db
+      .prepare(
+        'UPDATE lp_range_positions SET mark_value_usd = ?, mark_fees_usd = ?, mark_amount0 = ?,' +
+          ' mark_amount1 = ?, mark_in_range = ?, mark_pool_tick = ?, mark_note = ?, marked_at = ?' +
+          ' WHERE mode = ? AND chain = ? AND protocol = ? AND token_id = ?',
+      )
+      .run(
+        mark.valueUsd === null ? null : microsToUsd(mark.valueUsd),
+        mark.feesUsd === null ? null : microsToUsd(mark.feesUsd),
+        mark.amount0,
+        mark.amount1,
+        mark.inRange === null ? null : mark.inRange ? 1 : 0,
+        mark.poolTick,
+        mark.note,
+        new Date(mark.at).toISOString(),
+        mode,
+        chain,
+        protocol,
+        canonicalTokenId(tokenId),
+      );
+  }
+
+  /** The append-only trail behind the rows above, newest first. */
+  listRangeEvents(
+    options: { mode?: Mode; tokenId?: string; limit?: number } = {},
+  ): LpRangeEventRecord[] {
+    const limit = Math.min(Math.max(options.limit ?? 50, 1), 500);
+    const clauses: string[] = [];
+    const params: SqlValue[] = [];
+    if (options.mode) {
+      clauses.push('mode = ?');
+      params.push(options.mode);
+    }
+    if (options.tokenId !== undefined) {
+      clauses.push('token_id = ?');
+      params.push(canonicalTokenId(options.tokenId));
+    }
+    const where = clauses.length > 0 ? ` WHERE ${clauses.join(' AND ')}` : '';
+    return this.#db
+      .prepare<SqlValue[], RangeEventRow>(
+        `SELECT * FROM lp_range_events${where} ORDER BY at DESC, rowid DESC LIMIT ?`,
+      )
+      .all(...params, limit)
+      .map(toRangeEvent);
+  }
+
+  /**
+   * Write the audit row for a change that has already been applied.
+   *
+   * Takes the position as it now stands rather than recomputing anything, so
+   * the `*_after` columns are the row itself and a later disagreement between
+   * the log and the position is real evidence, not a second opinion.
+   */
+  #recordRangeEvent(
+    position: LpRangePositionRecord,
+    action: LpRangeAction,
+    liquidityDelta: bigint,
+    capitalDeltaUsd: bigint,
+    at: string,
+  ): void {
+    this.#db
+      .prepare(
+        'INSERT INTO lp_range_events (id, position_id, mode, chain, protocol, pool_id, token_id,' +
+          ' action, liquidity_delta, liquidity_after, capital_delta_usd, capital_after_usd, at)' +
+          ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(
+        randomUUID(),
+        position.id,
+        position.mode,
+        position.chain,
+        position.protocol,
+        position.poolId,
+        position.tokenId,
+        action,
+        liquidityDelta.toString(),
+        position.liquidity,
+        microsToUsd(capitalDeltaUsd),
+        microsToUsd(position.capitalUsd),
+        at,
+      );
+    this.#log.debug(
+      { tokenId: position.tokenId, action, liquidityDelta: liquidityDelta.toString() },
+      'range position change recorded',
+    );
+  }
+
   // --- realized P&L --------------------------------------------------------
 
   /**
@@ -549,6 +1026,52 @@ interface PositionRow {
   marked_at: string | null;
 }
 
+interface RangePositionRow {
+  id: string;
+  mode: Mode;
+  chain: ChainId;
+  protocol: string;
+  pool_id: string;
+  token_id: string;
+  token0: string;
+  token1: string;
+  decimals0: number;
+  decimals1: number;
+  fee_pips: number;
+  tick_lower: number;
+  tick_upper: number;
+  liquidity: string;
+  capital_usd: string;
+  opened_at: string;
+  last_action: LpRangeAction;
+  last_action_at: string;
+  closed_at: string | null;
+  mark_value_usd: string | null;
+  mark_fees_usd: string | null;
+  mark_amount0: string | null;
+  mark_amount1: string | null;
+  mark_in_range: number | null;
+  mark_pool_tick: number | null;
+  mark_note: string | null;
+  marked_at: string | null;
+}
+
+interface RangeEventRow {
+  id: string;
+  position_id: string;
+  mode: Mode;
+  chain: ChainId;
+  protocol: string;
+  pool_id: string;
+  token_id: string;
+  action: LpRangeAction;
+  liquidity_delta: string;
+  liquidity_after: string;
+  capital_delta_usd: string;
+  capital_after_usd: string;
+  at: string;
+}
+
 interface ActionRow {
   id: string;
   cycle_id: string;
@@ -605,6 +1128,112 @@ function toPosition(row: PositionRow): LpPositionRecord {
       markedAt: row.marked_at,
     },
   };
+}
+
+function toRangePosition(row: RangePositionRow): LpRangePositionRecord {
+  return {
+    id: row.id,
+    mode: row.mode,
+    chain: row.chain,
+    protocol: row.protocol,
+    poolId: row.pool_id,
+    tokenId: row.token_id,
+    token0: row.token0,
+    token1: row.token1,
+    decimals0: row.decimals0,
+    decimals1: row.decimals1,
+    feePips: row.fee_pips,
+    tickLower: row.tick_lower,
+    tickUpper: row.tick_upper,
+    liquidity: row.liquidity,
+    capitalUsd: usdToMicros(row.capital_usd),
+    openedAt: row.opened_at,
+    lastAction: row.last_action,
+    lastActionAt: row.last_action_at,
+    closedAt: row.closed_at,
+    mark: {
+      valueUsd: row.mark_value_usd === null ? null : usdToMicros(row.mark_value_usd),
+      feesUsd: row.mark_fees_usd === null ? null : usdToMicros(row.mark_fees_usd),
+      amount0: row.mark_amount0,
+      amount1: row.mark_amount1,
+      inRange: row.mark_in_range === null ? null : row.mark_in_range === 1,
+      poolTick: row.mark_pool_tick,
+      note: row.mark_note,
+      markedAt: row.marked_at,
+    },
+  };
+}
+
+function toRangeEvent(row: RangeEventRow): LpRangeEventRecord {
+  return {
+    id: row.id,
+    positionId: row.position_id,
+    mode: row.mode,
+    chain: row.chain,
+    protocol: row.protocol,
+    poolId: row.pool_id,
+    tokenId: row.token_id,
+    action: row.action,
+    liquidityDelta: row.liquidity_delta,
+    liquidityAfter: row.liquidity_after,
+    capitalDeltaUsd: usdToMicros(row.capital_delta_usd),
+    capitalAfterUsd: usdToMicros(row.capital_after_usd),
+    at: row.at,
+  };
+}
+
+/**
+ * A position's token id in one canonical form.
+ *
+ * It is a uint256 the chain assigned, so it is validated exactly as the
+ * base-unit amounts beside it are — digits, no leading zeros — and always
+ * stored and looked up in that form. Otherwise '07' and '7' are one position
+ * on chain and two rows here.
+ */
+function canonicalTokenId(tokenId: string): string {
+  try {
+    return amountToBigint(tokenId).toString();
+  } catch (cause) {
+    throw new AppError(ErrorCode.SCHEMA_INVALID, 'Malformed position token id', {
+      cause,
+      details: { tokenId },
+    });
+  }
+}
+
+/** A fee is hundredths of a basis point, so 100% is a million of them. */
+const MAX_FEE_PIPS = 1_000_000;
+
+function assertFeePips(feePips: number): void {
+  if (!Number.isInteger(feePips) || feePips <= 0 || feePips >= MAX_FEE_PIPS) {
+    throw new AppError(ErrorCode.SCHEMA_INVALID, 'Impossible v3 fee tier', {
+      details: { feePips },
+    });
+  }
+}
+
+/**
+ * Ticks are `number` here for the reason `tick-math.ts` states: a tick is an
+ * int24 index, which a double holds exactly and which is what an `int24`
+ * decodes into, so converting at this boundary would only add a conversion to
+ * get wrong. The bounds are the pool's own, imported rather than copied.
+ */
+function assertTickRange(tickLower: number, tickUpper: number): void {
+  for (const [field, tick] of [
+    ['tickLower', tickLower],
+    ['tickUpper', tickUpper],
+  ] as const) {
+    if (!Number.isInteger(tick) || tick < MIN_TICK || tick > MAX_TICK) {
+      throw new AppError(ErrorCode.SCHEMA_INVALID, `${field} is outside the v3 tick range`, {
+        details: { [field]: tick, min: MIN_TICK, max: MAX_TICK },
+      });
+    }
+  }
+  if (tickLower >= tickUpper) {
+    throw new AppError(ErrorCode.SCHEMA_INVALID, 'Position range is empty or inverted', {
+      details: { tickLower, tickUpper },
+    });
+  }
 }
 
 function toAction(row: ActionRow): LpActionRecord {
