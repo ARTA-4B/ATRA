@@ -599,6 +599,65 @@ describe('balances', () => {
   });
 });
 
+describe('the quote against the wider market', () => {
+  // slippage.implied compares the quote with itself and slippage.priceImpact
+  // compares it with a probe on the same pool, so a venue whose price has
+  // drifted from everywhere else passes both: its numbers are consistent,
+  // just consistently wrong. This check is the one that looks outside.
+
+  it('passes a quote that matches the cross-checked price', () => {
+    const decision = decide({});
+    const check = decision.checks.find((c) => c.name === 'quote.market');
+    expect(check?.passed).toBe(true);
+    expect(decision.code).toBe('OK');
+  });
+
+  it('rejects a quote thirty per cent below the market', () => {
+    // 0.0028 WETH for 10 USDC: internally consistent, and about 30% short of
+    // what the cross-checked price says 10 USDC is worth.
+    const action = makeAction({
+      quote: {
+        expectedAmountOut: '2800000000000000',
+        minAmountOut: '2791600000000000',
+        slippageBps: 30,
+        priceImpactBps: 5,
+        quotedAt: NOW - 2_000,
+        source: 'uniswap-v4-quoter',
+        marketId: '0xpool',
+      },
+    });
+
+    const decision = decide({ action });
+    expect(decision.code).toBe('QUOTE_OFF_MARKET');
+    const check = decision.checks.find((c) => c.name === 'quote.market');
+    expect(check?.passed).toBe(false);
+    expect(check?.detail).toMatch(/cross-checked price/);
+  });
+
+  it('is not evaluated, and fails, when the output price is unusable', () => {
+    const snapshot = makeSnapshot();
+    snapshot.prices[`base:${BASE_WETH}`] = { value: '0', at: NOW - 1_000, source: 'dexscreener' };
+
+    const decision = decide({ snapshot });
+    const check = decision.checks.find((c) => c.name === 'quote.market');
+    expect(check?.passed).toBe(false);
+    expect(check?.observed).toBe('not-evaluated');
+  });
+
+  it('does not apply to an approval', () => {
+    const decision = decide({
+      action: makeAction({
+        kind: 'approve',
+        contract: PERMIT2,
+        tokenOut: { address: BASE_USDC, decimals: 6 },
+        quote: null,
+        amountIn: '10000000',
+      }),
+    });
+    expect(decision.checks.find((c) => c.name === 'quote.market')?.skipped).toBe('not-applicable');
+  });
+});
+
 describe('reduce-only exits', () => {
   it('rejects an exit with no matching position', () => {
     expect(decide({ action: makeAction({ reduceOnly: true }) }).code).toBe('REDUCE_ONLY_MISMATCH');

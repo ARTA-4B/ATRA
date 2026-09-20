@@ -10,7 +10,7 @@ import type { RiskPolicy } from '../risk/policy.js';
 import type { ActionSource, MarketSnapshot, Mode, ProposedAction, Stamped } from '../risk/types.js';
 import { balanceKey, liquidityKey, priceKey, proposedActionSchema } from '../risk/types.js';
 import { deriveIdempotencyKey } from '../risk/engine.js';
-import { amountToBigint, floorDiv, priceToAtto, usdToMicros } from '../risk/money.js';
+import { amountToBigint, floorDiv, microsToUsd, priceToAtto, usdToMicros } from '../risk/money.js';
 import type { TradeDecision } from '../agents/trader/agent.js';
 import { childLogger } from '../logging/logger.js';
 import { errorMessage } from '../util/errors.js';
@@ -69,6 +69,29 @@ export interface ProposalBuilderDeps {
   ledger: LedgerService;
   wallets: WalletService;
   now?: () => number;
+}
+
+/**
+ * Protocols that route across venues instead of trading one pool.
+ *
+ * For these the question "which pool will this trade use" has no single
+ * answer, so the pair's pools are measured together.
+ */
+const AGGREGATOR_PROTOCOLS = new Set(['jupiter-v6']);
+function isAggregator(protocol: string): boolean {
+  return AGGREGATOR_PROTOCOLS.has(protocol.toLowerCase());
+}
+
+/**
+ * The venue behind a protocol name or a provider's dex id.
+ *
+ * The runtime says `aerodrome-v2`; DexScreener says `aerodrome`. Comparing the
+ * leading segment matches those without pretending that `aerodrome` and
+ * `aerodrome-slipstream` are the same thing: to the provider they are
+ * different venues, and they are compared as such.
+ */
+function venueOf(name: string): string {
+  return name.toLowerCase().split(/[-_]/)[0] ?? '';
 }
 
 export class ProposalBuilder {
@@ -192,7 +215,7 @@ export class ProposalBuilder {
     );
 
     // --- liquidity -----------------------------------------------------------
-    const liquidity = await this.#liquidity(chain, tokenIn.address, tokenOut.address);
+    const liquidity = await this.#liquidity(chain, tokenIn.address, tokenOut.address, quote);
     if (liquidity) notes.push(`liquidity ${liquidity.value} USD via ${liquidity.source}`);
     else notes.push('no pool liquidity figure could be read');
 
@@ -381,7 +404,12 @@ export class ProposalBuilder {
   }
 
   /** The deepest pool that trades exactly this pair, as the providers see it. */
-  async #liquidity(chain: ChainId, a: string, b: string): Promise<Stamped<string> | undefined> {
+  async #liquidity(
+    chain: ChainId,
+    a: string,
+    b: string,
+    quote: ExecutionQuote,
+  ): Promise<Stamped<string> | undefined> {
     try {
       const pools = await this.#market.getPoolsForToken(chain, a);
       const matching = pools.filter((pool) => {
@@ -392,12 +420,53 @@ export class ProposalBuilder {
           pool.liquidityUsd !== null
         );
       });
-      const deepest = matching.sort((x, y) => Number(y.liquidityUsd) - Number(x.liquidityUsd))[0];
-      if (!deepest?.liquidityUsd) return undefined;
+      if (matching.length === 0) return undefined;
+
+      // An aggregator routes across venues, so no single pool is the trade;
+      // what it can reach is the pair's pools together.
+      if (isAggregator(quote.protocol)) {
+        const total = matching.reduce((sum, pool) => sum + usdToMicros(pool.liquidityUsd!), 0n);
+        if (total <= 0n) return undefined;
+        const freshest = matching.reduce((newest, pool) =>
+          Date.parse(pool.observedAt) > Date.parse(newest.observedAt) ? pool : newest,
+        );
+        return {
+          value: microsToUsd(total),
+          at: Date.parse(freshest.observedAt),
+          source: `${freshest.source}:${String(matching.length)} pools via ${quote.protocol}`,
+        };
+      }
+
+      // A venue quote must be measured on the venue's own pool. The quoted
+      // market id is the exact answer; the dex family is the fallback when a
+      // provider names its pools differently from the router. Finding neither
+      // is not a reason to measure something else: the engine reads a missing
+      // figure as not-evaluated and fails, which is the right answer to "I
+      // cannot see the pool you are about to trade".
+      const venue = venueOf(quote.protocol);
+      const exact = matching.find(
+        (pool) => pool.poolId.toLowerCase() === quote.marketId.toLowerCase(),
+      );
+      const sameVenue = matching.filter((pool) => venueOf(pool.dexId ?? '') === venue);
+      const chosen =
+        exact ?? sameVenue.sort((x, y) => Number(y.liquidityUsd) - Number(x.liquidityUsd))[0];
+
+      if (!chosen?.liquidityUsd) {
+        this.#log.info(
+          {
+            chain,
+            protocol: quote.protocol,
+            marketId: quote.marketId,
+            candidates: matching.length,
+          },
+          'no provider pool matches the quoted venue; liquidity left unreported',
+        );
+        return undefined;
+      }
       return {
-        value: deepest.liquidityUsd,
-        at: Date.parse(deepest.observedAt),
-        source: `${deepest.source}:${deepest.poolId}`,
+        value: chosen.liquidityUsd,
+        at: Date.parse(chosen.observedAt),
+        source: `${chosen.source}:${chosen.poolId}`,
       };
     } catch (error) {
       this.#log.warn({ chain, a, b, err: error }, 'liquidity lookup failed');

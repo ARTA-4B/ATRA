@@ -236,6 +236,7 @@ const REMAINING_CHECK_NAMES: CheckName[] = [
   { name: 'deployed.total', code: 'TOTAL_DEPLOYED_BREACHED' },
   { name: 'slippage.implied', code: 'SLIPPAGE_EXCEEDS_MAX' },
   { name: 'slippage.priceImpact', code: 'SLIPPAGE_EXCEEDS_MAX' },
+  { name: 'quote.market', code: 'QUOTE_OFF_MARKET' },
   { name: 'fee.usd', code: 'FEE_EXCEEDS_MAX' },
   { name: 'liquidity.market', code: 'LIQUIDITY_BELOW_MIN' },
   { name: 'cooldown.market', code: 'COOLDOWN_ACTIVE' },
@@ -639,6 +640,46 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
       passed: action.quote.priceImpactBps <= policy.maxPriceImpactBps,
       observed: String(action.quote.priceImpactBps),
       limit: String(policy.maxPriceImpactBps),
+    });
+  }
+
+  // --- the quote against the wider market ----------------------------------
+  // The two checks above are self-referential: one compares the quote with
+  // itself, the other with a probe on the same pool. Neither notices a pool
+  // whose price has drifted from everywhere else, which is exactly the pool a
+  // trade should not be routed into. The tolerance is the operator's own
+  // slippage and impact budget: inside it the venue is allowed to be worse
+  // than the market, beyond it the quote is not describing the same asset.
+  const priceOutAtto = usablePrice(priceOut);
+  if (isApprove || !action.quote || isLp) {
+    ctx.skip('quote.market', 'QUOTE_OFF_MARKET', 'not-applicable');
+  } else {
+    const expectedOutUsd =
+      priceOutAtto === undefined
+        ? undefined
+        : nativeToUsdMicros(
+            amountToBigint(action.quote.expectedAmountOut),
+            action.tokenOut.decimals,
+            priceOutAtto,
+            'floor',
+          );
+    // amountInUsd was rounded up for the size cap; round the floor down from
+    // it so the tolerance is never tightened by rounding alone.
+    // bpsOf caps at 10,000: a policy that allowed more than a 100% haircut
+    // would put the floor below zero, which is no floor at all.
+    const toleranceBps = Math.min(policy.maxSlippageBps + policy.maxPriceImpactBps, 10_000);
+    const floorUsd =
+      amountInUsd === undefined ? undefined : amountInUsd - bpsOf(amountInUsd, toleranceBps);
+
+    ctx.check({
+      name: 'quote.market',
+      code: 'QUOTE_OFF_MARKET',
+      passed: expectedOutUsd !== undefined && floorUsd !== undefined && expectedOutUsd >= floorUsd,
+      observed: expectedOutUsd === undefined ? NOT_EVALUATED : microsToUsd(expectedOutUsd),
+      limit: floorUsd === undefined ? NOT_EVALUATED : microsToUsd(floorUsd),
+      detail: `expected output valued at the cross-checked price, against ${microsToUsd(
+        amountInUsd ?? 0n,
+      )} in less ${String(toleranceBps)} bps`,
     });
   }
 

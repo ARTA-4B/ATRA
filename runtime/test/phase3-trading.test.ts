@@ -372,6 +372,10 @@ class FakeExecutionAdapter implements ExecutionAdapter, Erc20ApprovalCapable {
 interface FakeMarketState {
   prices: Map<string, string | null>;
   liquidityUsd: string | null;
+  /** The venue the provider reports for the pool. Defaults to the quote's. */
+  dexId?: string;
+  /** Extra pools the provider also returns for the pair. */
+  extraPools?: Array<{ dexId: string; liquidityUsd: string }>;
   observedAt: () => string;
 }
 
@@ -379,7 +383,11 @@ function fakeMarket(state: FakeMarketState): MarketDataProvider {
   const pool = (chain: ChainId, base: string, quote: string): MarketSnapshot => ({
     chain,
     poolId: `${base}-${quote}`,
-    dexId: 'fake',
+    // The venue has to agree with the quote's protocol. The engine measures
+    // minLiquidityUsd on the pool the router will actually trade, so a double
+    // whose provider pool belongs to a different dex than its own quote is
+    // not modelling anything real.
+    dexId: state.dexId ?? 'aerodrome',
     base: { address: base, symbol: 'BASE', name: null, decimals: null },
     quote: { address: quote, symbol: 'QUOTE', name: null, decimals: null },
     priceUsd: state.prices.get(base) ?? null,
@@ -403,8 +411,16 @@ function fakeMarket(state: FakeMarketState): MarketDataProvider {
         error: null,
         chains: ['base'],
       }),
-    getPoolsForToken: (chain, token) =>
-      Promise.resolve([pool(chain, token, token === USDC_BASE ? WETH_BASE : USDC_BASE)]),
+    getPoolsForToken: (chain, token) => {
+      const other = token === USDC_BASE ? WETH_BASE : USDC_BASE;
+      const extra = (state.extraPools ?? []).map((spec) => ({
+        ...pool(chain, token, other),
+        poolId: `${spec.dexId}-${token}-${other}`,
+        dexId: spec.dexId,
+        liquidityUsd: spec.liquidityUsd,
+      }));
+      return Promise.resolve([pool(chain, token, other), ...extra]);
+    },
     getPool: (chain, poolId) => {
       const [base = WETH_BASE, quote = USDC_BASE] = poolId.split('-');
       return Promise.resolve(pool(chain, base, quote));
@@ -1313,6 +1329,58 @@ describe('Phase 3: LIVE executor', () => {
     expect(h.execution.simulated).toHaveLength(1);
     expect(h.execution.builds).toHaveLength(1);
     expect(h.execution.simulated[0]).toBe(h.execution.builds[0]);
+  });
+
+  it('measures liquidity on the pool the router will trade, not the deepest one', async () => {
+    // minLiquidityUsd is the operator saying "not into a thin market". The
+    // builder used to answer with the deepest pool for the pair on any dex,
+    // so a thin pool on the quoted venue passed because a deep pool existed
+    // somewhere else. Price impact is the only other brake, and on a small
+    // trade into a thin pool it is a few basis points.
+    h = await harness({
+      trader: openWeth('10'),
+      execution: { allowance: 10n ** 30n },
+      chains: { base: { tokens: new Map([[USDC_BASE, 1_000_000_000n]]) } },
+      market: {
+        // The venue we quote from is thin; a different venue is deep.
+        liquidityUsd: '1000',
+        extraPools: [{ dexId: 'uniswap', liquidityUsd: '5000000' }],
+      },
+    });
+    seedPaper(h);
+
+    const report = await h.services.pipeline.runCycle({
+      chain: 'base',
+      token: WETH_BASE,
+      source: 'operator',
+    });
+
+    expect(report.outcome).toBe('rejected');
+    expect(report.risk?.code).toBe('LIQUIDITY_BELOW_MIN');
+    expect(report.execution).toBeNull();
+  });
+
+  it('refuses the trade when no provider pool matches the quoted venue', async () => {
+    // Not being able to see the pool is not a reason to measure another one.
+    // The missing reading is caught one step earlier than the size check, by
+    // freshness: no figure is stale data, and stale data does not trade.
+    h = await harness({
+      trader: openWeth('10'),
+      execution: { allowance: 10n ** 30n },
+      chains: { base: { tokens: new Map([[USDC_BASE, 1_000_000_000n]]) } },
+      market: { dexId: 'some-other-venue', liquidityUsd: '5000000' },
+    });
+    seedPaper(h);
+
+    const report = await h.services.pipeline.runCycle({
+      chain: 'base',
+      token: WETH_BASE,
+      source: 'operator',
+    });
+
+    expect(report.outcome).toBe('rejected');
+    expect(report.risk?.code).toBe('DATA_STALE');
+    expect(report.execution).toBeNull();
   });
 
   it('reconciles in-flight rows on restart by hash and never re-signs', async () => {
