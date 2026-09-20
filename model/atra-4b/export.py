@@ -107,8 +107,36 @@ def merge(adapter: Path, base: str, out: Path) -> Path:
     model = model.merge_and_unload()
     model.save_pretrained(str(merged_dir), safe_serialization=True)
 
+    # The tokenizer comes from the adapter, but its chat template may not.
+    # transformers 4.57 writes the template to a separate chat_template.jinja
+    # rather than into tokenizer_config.json, and that file does not always
+    # travel with an adapter directory. A tokenizer with no template produces
+    # a GGUF with no template, and llama-server then falls back to a built-in
+    # default that has no tools block — so the model is served a prompt shape
+    # it was never trained on, and nothing downstream says a word about it.
+    # That is how two evaluation runs were scored against the wrong prompt.
+    #
+    # The base model is where the template came from in the first place: it is
+    # the tokenizer train.py rendered all 800 training prompts with.
     tokenizer = AutoTokenizer.from_pretrained(str(adapter))
+    if not getattr(tokenizer, "chat_template", None):
+        base_tokenizer = AutoTokenizer.from_pretrained(base)
+        template = getattr(base_tokenizer, "chat_template", None)
+        if not template:
+            raise SystemExit(
+                f"neither {adapter} nor {base} carries a chat template; refusing to"
+                " export a model that cannot be served the way it was trained"
+            )
+        tokenizer.chat_template = template
+        print(f"template   : recovered from {base} ({len(template)} chars)")
+
     tokenizer.save_pretrained(str(merged_dir))
+
+    # Prove it survived the round trip rather than assuming it did.
+    written = AutoTokenizer.from_pretrained(str(merged_dir))
+    if not getattr(written, "chat_template", None):
+        raise SystemExit(f"{merged_dir} was written without a chat template")
+
     print(f"merged     : {merged_dir}")
     return merged_dir
 

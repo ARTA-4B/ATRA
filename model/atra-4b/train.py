@@ -406,6 +406,21 @@ def main() -> int:
         trainer.save_model(str(output_dir))
         tokenizer.save_pretrained(str(output_dir))
 
+        # save_pretrained writes the chat template to a separate
+        # chat_template.jinja in transformers 4.57, and that file is easy to
+        # lose when an adapter directory is copied or uploaded by pattern.
+        # Losing it is not a cosmetic problem: the template is how every one
+        # of these training prompts was rendered, so a serving stack without
+        # it feeds the model a shape it has never seen, and the failure is
+        # silent. Write it next to the adapter under its own name as well,
+        # and say so, so the omission is visible in the run log.
+        template = getattr(tokenizer, "chat_template", None)
+        if template:
+            (output_dir / "chat_template.jinja").write_text(template, encoding="utf-8")
+            print(f"template   : {len(template)} chars saved beside the adapter")
+        else:
+            print("template   : WARNING none on the tokenizer; the export must recover it")
+
     manifest = Manifest(
         run_name=str(resolve(config, "run", "name", default="atra-4b")),
         started_at=started_at,
