@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { CHAIN_IDS } from '../../chains/registry.js';
 import type { ChainId } from '../../chains/registry.js';
 import { AppError, ErrorCode, errorMessage } from '../../util/errors.js';
+import { readJsonBounded } from '../../util/http.js';
 import { childLogger } from '../../logging/logger.js';
 import type { MarketDataProvider, MarketSnapshot, ProviderHealth, TokenRef } from '../types.js';
 
@@ -21,6 +22,8 @@ import type { MarketDataProvider, MarketSnapshot, ProviderHealth, TokenRef } fro
 
 const BASE_URL = 'https://api.dexscreener.com';
 const DEFAULT_TIMEOUT_MS = 10_000;
+/** A token's pair list is a few hundred KB at most; anything larger is not market data. */
+const MAX_BODY_BYTES = 2 * 1024 * 1024;
 
 /** ATRA chain id to DexScreener slug. */
 const CHAIN_SLUGS: Record<ChainId, string> = {
@@ -201,7 +204,7 @@ export class DexScreenerProvider implements MarketDataProvider {
         );
       }
 
-      return (await response.json()) as T;
+      return (await readJsonBounded(response, MAX_BODY_BYTES)) as T;
     } catch (cause) {
       if (cause instanceof AppError) throw cause;
       const timedOut = cause instanceof Error && cause.name === 'AbortError';

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { AppError, ErrorCode, errorMessage } from '../util/errors.js';
+import { readJsonBounded } from '../util/http.js';
 import { childLogger } from '../logging/logger.js';
 import { containsSecret } from '../logging/redact.js';
 
@@ -25,6 +26,12 @@ import { containsSecret } from '../logging/redact.js';
  */
 
 export type LlmKind = 'none' | 'ollama' | 'openai-compatible';
+
+/**
+ * A completion is bounded by `max_tokens` (2,048 by default, a few KB of
+ * text); a reply larger than this is not a completion.
+ */
+const MAX_COMPLETION_BYTES = 2 * 1024 * 1024;
 
 export interface LlmMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -308,7 +315,9 @@ export class HttpLlmProvider implements LlmProvider {
         );
       }
 
-      const parsed = chatCompletionSchema.safeParse(await response.json());
+      const parsed = chatCompletionSchema.safeParse(
+        await readJsonBounded(response, MAX_COMPLETION_BYTES),
+      );
       if (!parsed.success) {
         throw new AppError(
           ErrorCode.UPSTREAM_UNAVAILABLE,

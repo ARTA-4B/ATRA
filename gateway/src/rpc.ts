@@ -34,6 +34,12 @@ const log = logger('rpc');
 
 export const MAX_BATCH = 20;
 export const UPSTREAM_TIMEOUT_MS = 10_000;
+/**
+ * Largest upstream body that is parsed. A batch of 20 eth_getLogs answers
+ * fits in a fraction of this; anything bigger is a misbehaving provider or
+ * an attempt to make the Worker allocate until it is killed.
+ */
+export const MAX_UPSTREAM_BODY_BYTES = 2 * 1024 * 1024;
 /** Sent on every upstream call; some public RPCs answer 403 to a request with no User-Agent. */
 export const USER_AGENT = `atra-gateway/${GATEWAY_VERSION}`;
 
@@ -203,7 +209,36 @@ type UpstreamResult =
   | { ok: false; kind: 'rate_limited'; retryAfter: number }
   | { ok: false; kind: 'http'; status: number }
   | { ok: false; kind: 'unreachable' }
-  | { ok: false; kind: 'not_json' };
+  | { ok: false; kind: 'not_json' }
+  | { ok: false; kind: 'too_large' };
+
+/**
+ * Read a body as text, giving up (and cancelling the stream) as soon as more
+ * than `limit` bytes have arrived. Null means too large. Content-Length is
+ * only a hint: a chunked or lying upstream is bounded by the count, not the
+ * header.
+ */
+export async function readBounded(
+  body: ReadableStream<Uint8Array> | null,
+  limit: number,
+): Promise<string | null> {
+  if (body === null) return '';
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let received = 0;
+  let text = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    received += value.byteLength;
+    if (received > limit) {
+      await reader.cancel();
+      return null;
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  return text + decoder.decode();
+}
 
 async function callUpstream(url: string, payload: unknown): Promise<UpstreamResult> {
   let response: Response;
@@ -230,8 +265,20 @@ async function callUpstream(url: string, payload: unknown): Promise<UpstreamResu
     await response.body?.cancel();
     return { ok: false, kind: 'http', status: response.status };
   }
+  const declared = Number(response.headers.get('content-length') ?? '0');
+  if (Number.isFinite(declared) && declared > MAX_UPSTREAM_BODY_BYTES) {
+    await response.body?.cancel();
+    return { ok: false, kind: 'too_large' };
+  }
+  let text: string | null;
   try {
-    return { ok: true, body: await response.json() };
+    text = await readBounded(response.body, MAX_UPSTREAM_BODY_BYTES);
+  } catch {
+    return { ok: false, kind: 'unreachable' };
+  }
+  if (text === null) return { ok: false, kind: 'too_large' };
+  try {
+    return { ok: true, body: JSON.parse(text) as unknown };
   } catch {
     return { ok: false, kind: 'not_json' };
   }
@@ -381,6 +428,13 @@ export function rpcRoutes(): Hono<AppEnv> {
             chain,
             upstreamStatus: result.status,
           },
+        );
+      }
+      if (result.kind === 'too_large') {
+        return badGateway(
+          'upstream_too_large',
+          `the ${chain} upstream answered with more than ${MAX_UPSTREAM_BODY_BYTES / (1024 * 1024)} MB; narrow the request`,
+          { chain, maxBytes: MAX_UPSTREAM_BODY_BYTES },
         );
       }
       return badGateway(

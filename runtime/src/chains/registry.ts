@@ -201,6 +201,21 @@ export function canonicalizeAddress(chain: ChainId, address: string): string {
   return chainFamily(chain) === 'evm' ? address.toLowerCase() : address;
 }
 
+/**
+ * Registry-listed stablecoins are the quote assets: the side a trade is funded
+ * from and the side an exit returns to. The list is fixed here rather than
+ * read from a provider so that nothing outside the repository can promote a
+ * token to "stable".
+ */
+const STABLE_SYMBOLS = /^(USDC|USDT|USDG|USDbC|DAI)$/i;
+export function isStablecoin(chain: ChainId, address: string): boolean {
+  const canonical = canonicalizeAddress(chain, address);
+  const entry = CHAINS[chain].tokens.find(
+    (t) => canonicalizeAddress(chain, t.address) === canonical,
+  );
+  return entry !== undefined && STABLE_SYMBOLS.test(entry.symbol);
+}
+
 export function isNativeToken(chain: ChainId, address: string): boolean {
   return canonicalizeAddress(chain, address) === CHAINS[chain].nativeSentinel;
 }

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Db } from '../db/database.js';
 import type { ChainId } from '../chains/registry.js';
-import { CHAINS, isNativeToken } from '../chains/registry.js';
+import { isNativeToken, isStablecoin } from '../chains/registry.js';
 import { AppError, ErrorCode } from '../util/errors.js';
 import { childLogger } from '../logging/logger.js';
 import {
@@ -323,7 +323,13 @@ export class LedgerService {
     // Cost of the portion sold, at average cost. Rounded up: a higher cost
     // means lower realized profit, which is the conservative direction.
     const costOfSold = held === 0n ? 0n : (basis * sold + held - 1n) / held;
-    const realized = proceedsUsd - costOfSold;
+    // Proceeds belong to the whole amount spent. When the fill spends more
+    // than the position held (a stablecoin position of 1 USDC followed by a
+    // 25 USDC purchase), only the held share's proceeds are realized against
+    // its cost; the rest was never a position and realizes nothing. Rounded
+    // down: lower proceeds mean lower realized profit.
+    const proceedsOfSold = amount === sold ? proceedsUsd : (proceedsUsd * sold) / amount;
+    const realized = proceedsOfSold - costOfSold;
 
     const remaining = held - sold;
     if (remaining === 0n) {
@@ -494,11 +500,20 @@ export class LedgerService {
     const dayStart = Math.floor(now / 86_400_000) * 86_400_000;
     const marked = this.mark(mode, price);
 
-    const startRow = this.#db
+    // The day's anchor is written the first time the day is evaluated. Until
+    // the mark is complete there is nothing trustworthy to anchor, and the
+    // engine then sees a zero unrealized move, which lets no gain offset a
+    // realized loss. Without an anchor at all, every open gain, including
+    // gains from earlier days, would offset today's losses.
+    let startRow = this.#db
       .prepare<[Mode, number], { unrealized_at_start_usd: string }>(
         'SELECT unrealized_at_start_usd FROM ledger_days WHERE mode = ? AND day_start_utc_ms = ?',
       )
       .get(mode, dayStart);
+    if (startRow === undefined && marked.unrealizedPnlUsd !== null) {
+      this.recordDayStart(mode, marked.unrealizedPnlUsd, now);
+      startRow = { unrealized_at_start_usd: marked.unrealizedPnlUsd };
+    }
 
     const positions: RiskPosition[] = marked.positions.map((position) => ({
       chain: position.chain,
@@ -513,7 +528,8 @@ export class LedgerService {
       deployedUsd: marked.deployedUsd,
       realizedPnlTodayUsd: marked.realizedPnlTodayUsd,
       unrealizedPnlUsd: marked.unrealizedPnlUsd ?? '0',
-      unrealizedPnlAtDayStartUsd: startRow?.unrealized_at_start_usd ?? '0',
+      unrealizedPnlAtDayStartUsd:
+        startRow?.unrealized_at_start_usd ?? marked.unrealizedPnlUsd ?? '0',
       positions,
       lpRebalancesToday: {},
     };
@@ -548,6 +564,5 @@ function toPosition(row: PositionRow): Position {
 
 /** Registry-listed stablecoins count as quote assets for deployment purposes. */
 function isStable(chain: ChainId, token: string): boolean {
-  const entry = CHAINS[chain].tokens.find((t) => t.address === token);
-  return entry !== undefined && /^(USDC|USDT|USDG|USDbC|DAI)$/i.test(entry.symbol);
+  return isStablecoin(chain, token);
 }

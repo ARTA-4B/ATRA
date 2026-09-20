@@ -10,6 +10,7 @@ import { createExecutionContext, waitOnExecutionContext } from 'cloudflare:test'
 import { env } from 'cloudflare:workers';
 import { vi } from 'vitest';
 import worker from '../src/index.js';
+import { storedPairHash } from '../src/pairing.js';
 import { PROTOCOL_VERSION, WS_SUBPROTOCOL } from '../src/protocol.js';
 import { mintInstallToken } from '../src/tokens.js';
 
@@ -408,12 +409,33 @@ export function settle(ms = 50): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** The pair_codes row for a wire hash (what the runtime sends), or null. */
 export async function pairCodeRow(codeHash: string) {
   return env.DB.prepare(
     'SELECT install_id, used_at, expires_at FROM pair_codes WHERE code_hash = ?',
   )
-    .bind(codeHash)
+    .bind(await storedPairHash(PEPPER, codeHash))
     .first<{ install_id: string; used_at: number | null; expires_at: number }>();
+}
+
+/** Insert a pair_codes row the way storePairOffer would, for a wire hash. */
+export async function insertPairCode(
+  codeHash: string,
+  installId: string,
+  options: { expiresAt?: number; usedAt?: number | null; createdAt?: number } = {},
+) {
+  const now = Date.now();
+  await env.DB.prepare(
+    'INSERT INTO pair_codes (code_hash, install_id, expires_at, used_at, created_at) VALUES (?, ?, ?, ?, ?)',
+  )
+    .bind(
+      await storedPairHash(PEPPER, codeHash),
+      installId,
+      options.expiresAt ?? now + 60_000,
+      options.usedAt ?? null,
+      options.createdAt ?? now,
+    )
+    .run();
 }
 
 export async function linkRow(installId: string) {

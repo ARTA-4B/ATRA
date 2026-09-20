@@ -1,3 +1,5 @@
+import { redactString } from '../logging/redact.js';
+
 /**
  * Error taxonomy for the ATRA runtime.
  *
@@ -39,6 +41,9 @@ export const ErrorCode = {
   UPSTREAM_UNAVAILABLE: 'UPSTREAM_UNAVAILABLE',
   UPSTREAM_TIMEOUT: 'UPSTREAM_TIMEOUT',
   DATA_STALE: 'DATA_STALE',
+
+  // Telegram
+  TELEGRAM_ALREADY_PAIRED: 'TELEGRAM_ALREADY_PAIRED',
 
   // Generic
   INTERNAL: 'INTERNAL',
@@ -102,6 +107,7 @@ function defaultStatusFor(code: ErrorCode): number {
     case ErrorCode.CONFLICT:
     case ErrorCode.ALREADY_INITIALIZED:
     case ErrorCode.VAULT_ALREADY_EXISTS:
+    case ErrorCode.TELEGRAM_ALREADY_PAIRED:
       return 409;
     case ErrorCode.SCHEMA_INVALID:
       return 422;
@@ -126,9 +132,38 @@ export function isAppError(value: unknown): value is AppError {
   return value instanceof AppError;
 }
 
-/** Narrow an unknown thrown value to a message without leaking object internals. */
+/**
+ * Lines a library appends to its message that describe the request rather
+ * than the failure. viem's `HttpRequestError` and `TimeoutError` quote the
+ * full RPC URL (which carries a BYOK provider key in its path) and the
+ * request body; neither belongs in a log line, an audit row or a Telegram
+ * message.
+ */
+const REQUEST_ECHO_LINE = /^\s*(?:URL|Request body):/i;
+
+/**
+ * Narrow an unknown thrown value to a message without leaking object internals.
+ *
+ * The result is safe to store or send: a library error that exposes a
+ * `shortMessage` (viem's `BaseError` does) is reduced to that one line,
+ * anything else has its request-echo lines removed, and the text is then
+ * passed through the same scrubber the logger uses. Callers that format
+ * their own text around the result still get a redacted core.
+ */
 export function errorMessage(value: unknown): string {
-  if (value instanceof Error) return value.message;
+  return redactString(rawMessage(value));
+}
+
+function rawMessage(value: unknown): string {
+  if (value instanceof Error) {
+    const short = (value as { shortMessage?: unknown }).shortMessage;
+    if (typeof short === 'string' && short.trim().length > 0) return short.trim();
+    return value.message
+      .split('\n')
+      .filter((line) => !REQUEST_ECHO_LINE.test(line))
+      .join('\n')
+      .trim();
+  }
   if (typeof value === 'string') return value;
   return 'unknown error';
 }

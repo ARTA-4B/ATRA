@@ -204,6 +204,57 @@ describe('LedgerService', () => {
     expect(risk.unrealizedPnlAtDayStartUsd).toBe('-5');
   });
 
+  it('anchors the day on the first evaluation, so old gains cannot offset new losses', () => {
+    // A WETH position bought yesterday at 2500 is worth 3000 today: +20 USD
+    // unrealized before anything happens today.
+    buy('100000000', '40000000000000000', '2500', '0');
+    const first = ledger.toRiskLedger('PAPER', () => '3000');
+    expect(first.unrealizedPnlUsd).toBe('20.000000');
+    expect(first.unrealizedPnlAtDayStartUsd).toBe('20.000000');
+    expect(db.prepare<[], { n: number }>('SELECT COUNT(*) AS n FROM ledger_days').get()?.n).toBe(1);
+
+    // Later the same day the mark moves: the anchor stays where the day began.
+    const later = ledger.toRiskLedger('PAPER', () => '3100');
+    expect(later.unrealizedPnlUsd).toBe('24.000000');
+    expect(later.unrealizedPnlAtDayStartUsd).toBe('20.000000');
+  });
+
+  it('does not anchor the day on an incomplete mark', () => {
+    buy('100000000', '40000000000000000', '2500', '0');
+    const risk = ledger.toRiskLedger('PAPER', () => '0');
+    expect(risk.unrealizedPnlUsd).toBe('0');
+    expect(risk.unrealizedPnlAtDayStartUsd).toBe('0');
+    expect(db.prepare<[], { n: number }>('SELECT COUNT(*) AS n FROM ledger_days').get()?.n).toBe(0);
+  });
+
+  it('realizes nothing on the part of a fill that exceeds the position held', () => {
+    // Buy, then sell 0.001 WETH for 1 USDC: USDC is now a 1-USDC position.
+    buy('100000000', '40000000000000000', '2500', '0');
+    ledger.recordFill({
+      tradeId: 'trade-2',
+      mode: 'PAPER',
+      chain: 'base',
+      tokenIn: { address: BASE_WETH, decimals: 18 },
+      tokenOut: { address: BASE_USDC, decimals: 6 },
+      amountIn: '400000000000000',
+      amountOut: '1000000',
+      priceInUsd: '2500',
+      priceOutUsd: '1',
+      feeUsd: '0',
+      filledAt: NOW,
+      simulated: true,
+    });
+    expect(ledger.getPosition('PAPER', 'base', BASE_USDC)?.amount).toBe('1000000');
+    const before = ledger.realizedPnlTodayUsd('PAPER');
+
+    // Spend 25 USDC: 1 USDC of it closes the position at cost, the other 24
+    // were balance, never a position. Nothing was gained.
+    const fill = buy('25000000', '10000000000000000', '2500', '0');
+    expect(fill.realizedPnlUsd).toBe('0.000000');
+    expect(ledger.realizedPnlTodayUsd('PAPER')).toBe(before);
+    expect(ledger.getPosition('PAPER', 'base', BASE_USDC)).toBeUndefined();
+  });
+
   it('never writes a fill row that can be edited', () => {
     const fill = buy('100000000', '40000000000000000', '2500');
     expect(() =>

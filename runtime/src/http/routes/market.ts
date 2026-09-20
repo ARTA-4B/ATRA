@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { AppEnv } from '../context.js';
 import { envelope } from '../respond.js';
+import { limitParam } from '../query.js';
 import { parse } from './auth.js';
 import { requireSession } from '../middleware.js';
 import { AppError, ErrorCode } from '../../util/errors.js';
@@ -133,6 +134,21 @@ export function marketRoutes(): Hono<AppEnv> {
     }
   });
 
+  // Registered before `/:chain/:poolId`, which would otherwise capture
+  // "research/history" as a chain called "research" and answer 422.
+  app.get('/research/history', (c) => {
+    const services = c.get('services');
+    const limit = limitParam(c.req.query('limit'), 20, 100);
+
+    const rows = services.db
+      .prepare<[number], Record<string, unknown>>(
+        'SELECT * FROM research_results ORDER BY created_at DESC LIMIT ?',
+      )
+      .all(limit);
+
+    return c.json(envelope(c, rows, { source: 'local' }));
+  });
+
   app.get('/:chain/:poolId', async (c) => {
     const services = c.get('services');
     const chain = assertChain(c.req.param('chain'));
@@ -199,19 +215,6 @@ export function marketRoutes(): Hono<AppEnv> {
         ...(result.status === 'INSUFFICIENT_DATA' ? { reason: result.summary } : {}),
       }),
     );
-  });
-
-  app.get('/research/history', (c) => {
-    const services = c.get('services');
-    const limit = Math.min(Number(c.req.query('limit') ?? 20), 100);
-
-    const rows = services.db
-      .prepare<[number], Record<string, unknown>>(
-        'SELECT * FROM research_results ORDER BY created_at DESC LIMIT ?',
-      )
-      .all(limit);
-
-    return c.json(envelope(c, rows, { source: 'local' }));
   });
 
   return app;

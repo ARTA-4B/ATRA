@@ -5,9 +5,12 @@
  * the gateway only sha256(code without the dash, upper-case) in a "pair.offer"
  * frame. The user sends "/pair CODE" to the bot; the gateway normalizes and
  * hashes the same way and consumes the row with one atomic UPDATE. The code
- * itself is never stored anywhere.
+ * itself is never stored anywhere, and neither is the wire hash: a code has
+ * only 40 bits, so a plain sha256 in a leaked D1 export is a brute-forceable
+ * code. What pair_codes holds is HMAC-SHA256(TOKEN_PEPPER, wire hash), like
+ * the install tokens, and the pepper never touches D1.
  */
-import { sha256Hex } from './crypto.js';
+import { hmacSha256Hex, sha256Hex } from './crypto.js';
 import { PAIR_CODE_NORMALIZED_RE, PAIR_OFFER_MAX_TTL_MS } from './protocol.js';
 import type { TelegramIdentity } from './protocol.js';
 
@@ -22,28 +25,53 @@ export function hashPairCode(normalizedCode: string): Promise<string> {
   return sha256Hex(normalizedCode);
 }
 
+/** The value kept in pair_codes.code_hash for a wire hash. */
+export function storedPairHash(pepper: string, codeHash: string): Promise<string> {
+  return hmacSha256Hex(pepper, codeHash);
+}
+
+export type StoreOfferResult =
+  | { ok: true; expiresAt: number }
+  | { ok: false; reason: 'code_in_use' };
+
 /**
  * Store an offered code, replacing any unused code for the same installation
  * so at most one code is live per install. A runtime cannot offer a code that
  * lives longer than PAIR_OFFER_MAX_TTL_MS: it is clamped, not rejected.
+ *
+ * A hash that another installation is still offering (unused, unexpired) is
+ * refused rather than taken over: code_hash is the primary key, and a plain
+ * upsert would let one runtime that learned another's hash redirect that
+ * runtime's pairing to itself. The upsert's WHERE makes the decision in the
+ * same statement, so two offers of one hash cannot both win.
  */
 export async function storePairOffer(
   db: D1Database,
+  pepper: string,
   installId: string,
   codeHash: string,
   expiresAt: number,
   now: number = Date.now(),
-): Promise<{ expiresAt: number }> {
+): Promise<StoreOfferResult> {
   const clamped = Math.min(expiresAt, now + PAIR_OFFER_MAX_TTL_MS);
-  await db.batch([
+  const stored = await storedPairHash(pepper, codeHash);
+  const [, upsert] = await db.batch([
     db.prepare('DELETE FROM pair_codes WHERE install_id = ? AND used_at IS NULL').bind(installId),
     db
       .prepare(
-        'INSERT OR REPLACE INTO pair_codes (code_hash, install_id, expires_at, used_at, created_at) VALUES (?, ?, ?, NULL, ?)',
+        `INSERT INTO pair_codes (code_hash, install_id, expires_at, used_at, created_at)
+         VALUES (?, ?, ?, NULL, ?)
+         ON CONFLICT (code_hash) DO UPDATE SET
+           install_id = excluded.install_id,
+           expires_at = excluded.expires_at,
+           used_at = NULL,
+           created_at = excluded.created_at
+         WHERE pair_codes.used_at IS NOT NULL OR pair_codes.expires_at <= excluded.created_at`,
       )
-      .bind(codeHash, installId, clamped, now),
+      .bind(stored, installId, clamped, now),
   ]);
-  return { expiresAt: clamped };
+  if ((upsert?.meta.changes ?? 0) === 0) return { ok: false, reason: 'code_in_use' };
+  return { ok: true, expiresAt: clamped };
 }
 
 /**
@@ -52,6 +80,7 @@ export async function storePairOffer(
  */
 export async function consumePairCode(
   db: D1Database,
+  pepper: string,
   codeHash: string,
   now: number = Date.now(),
 ): Promise<string | null> {
@@ -59,7 +88,7 @@ export async function consumePairCode(
     .prepare(
       'UPDATE pair_codes SET used_at = ? WHERE code_hash = ? AND used_at IS NULL AND expires_at > ? RETURNING install_id',
     )
-    .bind(now, codeHash, now)
+    .bind(now, await storedPairHash(pepper, codeHash), now)
     .first<{ install_id: string }>();
   return row?.install_id ?? null;
 }

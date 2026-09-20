@@ -51,6 +51,33 @@ export const CLOSE_NO_ATTACHMENT = 4002;
 export const CLOSE_REVOKED = 4003;
 export const CLOSE_HEARTBEAT_TIMEOUT = 4004;
 export const CLOSE_HELLO_TIMEOUT = 4005;
+/** The socket sent more frames than the budget below allows. */
+export const CLOSE_RATE_LIMITED = 4008;
+
+/**
+ * Inbound frame budget per socket. A runtime that behaves sends a frame every
+ * few seconds at most; each notify costs a Telegram call and each pair.offer
+ * a D1 write, so those two have their own, tighter caps. Fixed windows: the
+ * counters live in the socket attachment (below) so hibernation neither
+ * resets them nor costs a storage read.
+ */
+export const FRAME_LIMIT_PER_MINUTE = 60;
+export const NOTIFY_LIMIT_PER_HOUR = 30;
+export const PAIR_OFFER_LIMIT_PER_MINUTE = 5;
+const MINUTE_MS = 60_000;
+const HOUR_MS = 60 * MINUTE_MS;
+
+interface FrameBudget {
+  /** Start of the current one-minute window (all frames, pair.offer). */
+  minuteStart: number;
+  frames: number;
+  offers: number;
+  /** Start of the current one-hour window (notify). */
+  hourStart: number;
+  notifies: number;
+}
+
+type BudgetKind = 'frame' | 'notify' | 'pair.offer';
 
 interface Attachment {
   /** The installation the bearer token was minted for. Routing key. */
@@ -60,6 +87,7 @@ interface Attachment {
   runtimeVersion?: string;
   /** What the runtime itself said in hello; informational. */
   reportedInstallationId?: string;
+  budget?: FrameBudget;
 }
 
 export interface CommandPayload {
@@ -136,6 +164,45 @@ function readAttachment(ws: WebSocket): Attachment | null {
   return null;
 }
 
+/**
+ * Charge one unit of `kind` to a socket's budget. The returned budget must be
+ * stored back in the attachment by the caller; the decision is made on the
+ * count before this unit, so exactly the cap is allowed and the next one is
+ * not.
+ */
+function spendBudget(
+  budget: FrameBudget | undefined,
+  kind: BudgetKind,
+  now: number,
+): { budget: FrameBudget; allowed: boolean } {
+  let next: FrameBudget = budget ?? {
+    minuteStart: now,
+    frames: 0,
+    offers: 0,
+    hourStart: now,
+    notifies: 0,
+  };
+  if (now - next.minuteStart >= MINUTE_MS) next = { ...next, minuteStart: now, frames: 0, offers: 0 };
+  if (now - next.hourStart >= HOUR_MS) next = { ...next, hourStart: now, notifies: 0 };
+  switch (kind) {
+    case 'frame':
+      return {
+        budget: { ...next, frames: next.frames + 1 },
+        allowed: next.frames < FRAME_LIMIT_PER_MINUTE,
+      };
+    case 'notify':
+      return {
+        budget: { ...next, notifies: next.notifies + 1 },
+        allowed: next.notifies < NOTIFY_LIMIT_PER_HOUR,
+      };
+    case 'pair.offer':
+      return {
+        budget: { ...next, offers: next.offers + 1 },
+        allowed: next.offers < PAIR_OFFER_LIMIT_PER_MINUTE,
+      };
+  }
+}
+
 export class Hub extends DurableObject<Env> {
   /** requestId -> resolver for a forwarded command awaiting its reply. */
   private readonly pending = new Map<string, (text: string) => void>();
@@ -189,11 +256,17 @@ export class Hub extends DurableObject<Env> {
   // --- Hibernation handlers ------------------------------------------------
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    const attachment = readAttachment(ws);
+    let attachment = readAttachment(ws);
     if (!attachment) {
       ws.close(CLOSE_NO_ATTACHMENT, 'unknown socket');
       return;
     }
+    // Charged before the frame is even looked at, and written back before the
+    // first await: events on one socket can interleave at an await, and the
+    // count must be exact whatever the frame turns out to be.
+    const now = Date.now();
+    attachment = this.charge(ws, attachment, 'frame', now);
+    if (!attachment) return;
     if (typeof message !== 'string') {
       this.send(ws, { type: 'error', code: 'binary_not_supported', message: 'text frames only' });
       return;
@@ -212,6 +285,10 @@ export class Hub extends DurableObject<Env> {
         message: 'send a hello frame first',
       });
       return;
+    }
+    if (frame.type === 'notify' || frame.type === 'pair.offer') {
+      attachment = this.charge(ws, attachment, frame.type, now);
+      if (!attachment) return;
     }
 
     try {
@@ -507,7 +584,26 @@ export class Hub extends DurableObject<Env> {
           });
           return;
         }
-        await storePairOffer(this.env.DB, installId, frame.codeHash, frame.expiresAt, now);
+        // The Worker refuses the upgrade without a pepper, so a socket that
+        // reaches here has one; the check keeps the type honest.
+        const pepper = this.env.TOKEN_PEPPER;
+        if (!pepper) throw new Error('TOKEN_PEPPER is not configured');
+        const stored = await storePairOffer(
+          this.env.DB,
+          pepper,
+          installId,
+          frame.codeHash,
+          frame.expiresAt,
+          now,
+        );
+        if (!stored.ok) {
+          log.warn('pair.offer refused: hash is offered by another installation', { installId });
+          this.send(ws, {
+            type: 'error',
+            code: stored.reason,
+            message: 'that code is already offered by another installation; generate a new one',
+          });
+        }
         return;
       }
       case 'pair.revoke': {
@@ -569,6 +665,36 @@ export class Hub extends DurableObject<Env> {
     } catch (error) {
       log.warn('send failed', { error: errorSummary(error) });
     }
+  }
+
+  /**
+   * Charge the socket's budget and persist it. On a breach the runtime is
+   * told once and the socket is closed: a flood is a bug or an attack, and
+   * either way the reconnect backoff is the right throttle. Null means the
+   * socket is gone and the caller must stop.
+   */
+  private charge(
+    ws: WebSocket,
+    attachment: Attachment,
+    kind: BudgetKind,
+    now: number,
+  ): Attachment | null {
+    const { budget, allowed } = spendBudget(attachment.budget, kind, now);
+    const next: Attachment = { ...attachment, budget };
+    ws.serializeAttachment(next);
+    if (allowed) return next;
+    log.warn('socket rate limited', { installId: attachment.installId, kind });
+    this.send(ws, {
+      type: 'error',
+      code: 'rate_limited',
+      message: `too many ${kind === 'frame' ? 'frames' : `${kind} frames`}; reconnect after a backoff`,
+    });
+    try {
+      ws.close(CLOSE_RATE_LIMITED, 'rate limited');
+    } catch {
+      // already closing
+    }
+    return null;
   }
 
   private async ensureAlarm(): Promise<void> {

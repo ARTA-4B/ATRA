@@ -1,5 +1,10 @@
 import { createHash } from 'node:crypto';
-import { SOLANA_SYSTEM_PROGRAMS, canonicalizeAddress, isNativeToken } from '../chains/registry.js';
+import {
+  SOLANA_SYSTEM_PROGRAMS,
+  canonicalizeAddress,
+  isNativeToken,
+  isStablecoin,
+} from '../chains/registry.js';
 import type { ChainId } from '../chains/registry.js';
 import type { RiskPolicy } from './policy.js';
 import {
@@ -473,13 +478,27 @@ function runRemainingChecks(ctx: EvaluationContext): RiskDerived | null {
       .filter((p) => p.chain === chain && p.token === action.tokenIn.address)
       .reduce((total, p) => total + amountToBigint(p.amount), 0n);
     const wanted = amountToBigint(action.amountIn);
+    // An exit sells a holding back into a stablecoin. Stablecoins become
+    // ledger positions too (every fill books its output), so without this
+    // shape check a stable-to-stable swap of any size would qualify as an
+    // exit and skip the size, daily-loss, deployed and cooldown checks.
+    const sellsHolding = !isStablecoin(chain, action.tokenIn.address);
+    const returnsToStable = isStablecoin(chain, action.tokenOut.address);
+    const detail =
+      held === 0n
+        ? 'no open position for this token'
+        : !sellsHolding
+          ? 'an exit cannot sell a stablecoin'
+          : !returnsToStable
+            ? 'an exit must return to a stablecoin'
+            : undefined;
     ctx.check({
       name: 'position.reduceOnly',
       code: 'REDUCE_ONLY_MISMATCH',
-      passed: held > 0n && wanted <= held,
+      passed: held > 0n && wanted <= held && sellsHolding && returnsToStable,
       observed: action.amountIn,
       limit: held.toString(),
-      ...(held === 0n ? { detail: 'no open position for this token' } : {}),
+      ...(detail === undefined ? {} : { detail }),
     });
   } else {
     ctx.check({

@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { CHAIN_IDS } from '../../chains/registry.js';
 import type { ChainId } from '../../chains/registry.js';
 import { AppError, ErrorCode, errorMessage } from '../../util/errors.js';
+import { readJsonBounded } from '../../util/http.js';
 import { childLogger } from '../../logging/logger.js';
 import type { MarketDataProvider, MarketSnapshot, OhlcvSeries, ProviderHealth } from '../types.js';
 
@@ -21,6 +22,8 @@ import type { MarketDataProvider, MarketSnapshot, OhlcvSeries, ProviderHealth } 
 
 const BASE_URL = 'https://api.geckoterminal.com/api/v2';
 const DEFAULT_TIMEOUT_MS = 12_000;
+/** 1000 OHLCV candles is well under 100 KB; anything larger is not market data. */
+const MAX_BODY_BYTES = 2 * 1024 * 1024;
 
 const NETWORKS: Record<ChainId, string> = {
   base: 'base',
@@ -274,7 +277,7 @@ export class GeckoTerminalProvider implements MarketDataProvider {
         );
       }
 
-      return (await response.json()) as T;
+      return (await readJsonBounded(response, MAX_BODY_BYTES)) as T;
     } catch (cause) {
       if (cause instanceof AppError) throw cause;
       const timedOut = cause instanceof Error && cause.name === 'AbortError';

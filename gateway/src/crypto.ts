@@ -1,6 +1,7 @@
 /**
  * Small Web Crypto helpers. Everything the gateway stores is a hash: install
- * tokens as HMAC-SHA256(pepper, token), pair codes as SHA-256(code).
+ * tokens as HMAC-SHA256(pepper, token), pair codes as
+ * HMAC-SHA256(pepper, SHA-256(code)).
  */
 
 const encoder = new TextEncoder();

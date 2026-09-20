@@ -12,7 +12,7 @@ import {
   policyHash,
 } from '../src/risk/policy.js';
 import { marketKey } from '../src/risk/types.js';
-import type { RiskDecision } from '../src/risk/types.js';
+import type { ProposedAction, RiskDecision } from '../src/risk/types.js';
 import {
   BASE_NATIVE,
   BASE_USDC,
@@ -614,7 +614,57 @@ describe('reduce-only exits', () => {
     );
   });
 
+  /** A real exit: sell part of a WETH holding back into USDC. */
+  function exitAction(overrides: Partial<ProposedAction> = {}) {
+    return makeAction({
+      reduceOnly: true,
+      tokenIn: { address: BASE_WETH, decimals: 18 },
+      tokenOut: { address: BASE_USDC, decimals: 6 },
+      amountIn: '10000000000000000',
+      quote: {
+        expectedAmountOut: '25000000',
+        minAmountOut: '24925000',
+        slippageBps: 30,
+        priceImpactBps: 5,
+        quotedAt: NOW - 2_000,
+        source: 'uniswap-v4-quoter',
+        marketId: '0xpool',
+      },
+      ...overrides,
+    });
+  }
+
   it('allows a partial exit and skips the exposure checks', () => {
+    const state = makeState({ lastAnyActionAt: NOW - 1_000 });
+    state.ledger.positions = [
+      {
+        chain: 'base',
+        token: BASE_WETH,
+        amount: '20000000000000000',
+        costBasisUsd: '50',
+        openedAt: NOW,
+      },
+    ];
+    state.ledger.realizedPnlTodayUsd = '-1000';
+    const snapshot = makeSnapshot();
+    snapshot.balances[`base:${BASE_WETH}`] = {
+      value: '20000000000000000',
+      at: NOW - 1_000,
+      source: 'rpc',
+    };
+
+    const decision = decide({ action: exitAction(), state, snapshot });
+    expect(decision.code).toBe('OK');
+    expect(decision.checks.find((c) => c.name === 'size.amountInUsd')?.skipped).toBe(
+      'not-applicable',
+    );
+    expect(decision.checks.find((c) => c.name === 'loss.daily')?.skipped).toBe('not-applicable');
+  });
+
+  it('refuses a stablecoin "exit": selling USDC is a purchase, not a reduction', () => {
+    // The funding stablecoin is a ledger position after any exit. Letting it
+    // qualify as an exit would let a stable-to-stable swap of any size skip
+    // the size, daily-loss, deployed and cooldown checks.
     const state = makeState({ lastAnyActionAt: NOW - 1_000 });
     state.ledger.positions = [
       { chain: 'base', token: BASE_USDC, amount: '50000000', costBasisUsd: '50', openedAt: NOW },
@@ -622,11 +672,55 @@ describe('reduce-only exits', () => {
     state.ledger.realizedPnlTodayUsd = '-1000';
 
     const decision = decide({ action: makeAction({ reduceOnly: true }), state });
-    expect(decision.code).toBe('OK');
-    expect(decision.checks.find((c) => c.name === 'size.amountInUsd')?.skipped).toBe(
-      'not-applicable',
+    expect(decision.code).toBe('REDUCE_ONLY_MISMATCH');
+    expect(decision.checks.find((c) => c.name === 'position.reduceOnly')?.detail).toMatch(
+      /cannot sell a stablecoin/,
     );
-    expect(decision.checks.find((c) => c.name === 'loss.daily')?.skipped).toBe('not-applicable');
+  });
+
+  it('refuses an exit that does not return to a stablecoin', () => {
+    const state = makeState({ lastAnyActionAt: NOW - 1_000 });
+    state.ledger.positions = [
+      {
+        chain: 'base',
+        token: BASE_WETH,
+        amount: '20000000000000000',
+        costBasisUsd: '50',
+        openedAt: NOW,
+      },
+    ];
+    const snapshot = makeSnapshot();
+    snapshot.balances[`base:${BASE_WETH}`] = {
+      value: '20000000000000000',
+      at: NOW - 1_000,
+      source: 'rpc',
+    };
+    // An operator-allowlisted non-stable token on the output side.
+    const other = '0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf';
+    snapshot.prices[`base:${other}`] = { value: '60000', at: NOW - 1_000, source: 'test' };
+    const policy = makePolicy();
+    policy.tokenAllowlist.base = [
+      ...(policy.tokenAllowlist.base ?? []),
+      { address: other, symbol: 'cbBTC', decimals: 8 },
+    ];
+    const action = exitAction({
+      tokenOut: { address: other, decimals: 8 },
+      quote: {
+        expectedAmountOut: '41000',
+        minAmountOut: '40877',
+        slippageBps: 30,
+        priceImpactBps: 5,
+        quotedAt: NOW - 2_000,
+        source: 'uniswap-v4-quoter',
+        marketId: '0xpool',
+      },
+    });
+
+    const decision = decide({ action, state, snapshot, policy });
+    expect(decision.code).toBe('REDUCE_ONLY_MISMATCH');
+    expect(decision.checks.find((c) => c.name === 'position.reduceOnly')?.detail).toMatch(
+      /must return to a stablecoin/,
+    );
   });
 
   it('still enforces allowlists on an exit', () => {

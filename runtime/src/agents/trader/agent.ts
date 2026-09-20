@@ -1,3 +1,4 @@
+import { isStablecoin } from '../../chains/registry.js';
 import { z } from 'zod';
 import type { ChainId } from '../../chains/registry.js';
 import { CHAIN_IDS, CHAINS } from '../../chains/registry.js';
@@ -209,6 +210,11 @@ function deterministicSanity(decision: TradeDecision, input: TraderInput): strin
       (position) => position.chain === input.chain && position.token === decision.token,
     );
     if (!held) return `${decision.action} of a token with no open position`;
+    // The funding stablecoin is booked as a position after any exit; selling
+    // it "back" would be a stable-to-stable swap dressed as an exit.
+    if (isStablecoin(input.chain, decision.token)) {
+      return `${decision.action} of a stablecoin is not an exit`;
+    }
   }
 
   // Compare as micro-USD strings without floats.

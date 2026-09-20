@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import type { AppEnv } from '../context.js';
 import { envelope } from '../respond.js';
+import { cursorParam, limitParam } from '../query.js';
 import { parse } from './auth.js';
 import { AppError, ErrorCode } from '../../util/errors.js';
 import { REAUTH_HEADER, requireSession } from '../middleware.js';
@@ -181,8 +182,8 @@ export function activityRoutes(): Hono<AppEnv> {
 
   app.get('/', (c) => {
     const services = c.get('services');
-    const limit = Math.min(Number(c.req.query('limit') ?? 50), 500);
-    const before = c.req.query('before');
+    const limit = limitParam(c.req.query('limit'), 50, 500);
+    const before = cursorParam(c.req.query('before'), 'before');
 
     const query: Parameters<typeof services.audit.list>[0] = { limit };
     const category = c.req.query('category');
@@ -191,7 +192,7 @@ export function activityRoutes(): Hono<AppEnv> {
     if (category) query.category = category as never;
     if (chain) query.chain = chain as never;
     if (status) query.status = status as never;
-    if (before) query.before = Number(before);
+    if (before !== undefined) query.before = before;
 
     const events = services.audit.list(query);
     const nextCursor = events.length === limit ? (events.at(-1)?.id ?? null) : null;

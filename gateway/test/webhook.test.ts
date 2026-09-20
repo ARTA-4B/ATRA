@@ -14,6 +14,7 @@ import {
   linkRow,
   makeUpdate,
   mintToken,
+  insertPairCode,
   pairCodeRow,
   pairRuntime,
   postWebhook,
@@ -162,11 +163,10 @@ describe('POST /tg/webhook: pairing', () => {
   it('an expired code fails', async () => {
     const minted = await mintToken();
     const codeHash = await sha256Hex('EXPD2345');
-    await env.DB.prepare(
-      'INSERT INTO pair_codes (code_hash, install_id, expires_at, used_at, created_at) VALUES (?, ?, ?, NULL, ?)',
-    )
-      .bind(codeHash, minted.installId, Date.now() - 1_000, Date.now() - 400_000)
-      .run();
+    await insertPairCode(codeHash, minted.installId, {
+      expiresAt: Date.now() - 1_000,
+      createdAt: Date.now() - 400_000,
+    });
 
     const userId = nextUser();
     const result = await postWebhook(makeUpdate({ userId, text: '/pair EXPD-2345' }));

@@ -15,6 +15,7 @@ import type { MarketDataProvider, MarketSnapshot } from '../src/market/types.js'
 import {
   BASE_NATIVE,
   BASE_USDC,
+  BASE_WETH,
   JUPITER_V6,
   NOW,
   PERMIT2,
@@ -109,13 +110,53 @@ describe('review: exit privileges belong to swaps only', () => {
   });
 
   it('still allows reduceOnly on a swap with a matching position', () => {
+    // A real exit: sell part of a WETH holding back into the funding
+    // stablecoin. The position being sold must not itself be a stablecoin —
+    // every fill books its output, so the funding stable is a position too,
+    // and without that shape rule a stable-to-stable swap of any size would
+    // inherit an exit's exemption from the size, loss and cooldown checks.
+    const state = makeState({ lastAnyActionAt: NOW - 1_000 });
+    state.ledger.positions = [
+      {
+        chain: 'base',
+        token: BASE_WETH,
+        amount: '20000000000000000',
+        costBasisUsd: '50',
+        openedAt: NOW,
+      },
+    ];
+    const snapshot = makeSnapshot();
+    snapshot.balances[`base:${BASE_WETH}`] = {
+      value: '20000000000000000',
+      at: NOW - 1_000,
+      source: 'rpc',
+    };
+    const action = makeAction({
+      reduceOnly: true,
+      tokenIn: { address: BASE_WETH, decimals: 18 },
+      tokenOut: { address: BASE_USDC, decimals: 6 },
+      amountIn: '10000000000000000',
+      quote: {
+        expectedAmountOut: '25000000',
+        minAmountOut: '24925000',
+        slippageBps: 30,
+        priceImpactBps: 5,
+        quotedAt: NOW - 2_000,
+        source: 'uniswap-v4-quoter',
+        marketId: '0xpool',
+      },
+    });
+
+    expect(evaluate(makeInput({ action, state, snapshot })).code).toBe('OK');
+  });
+
+  it('refuses a stable-to-stable swap dressed as an exit', () => {
     const state = makeState({ lastAnyActionAt: NOW - 1_000 });
     state.ledger.positions = [
       { chain: 'base', token: BASE_USDC, amount: '50000000', costBasisUsd: '50', openedAt: NOW },
     ];
-    expect(evaluate(makeInput({ action: makeAction({ reduceOnly: true }), state })).code).toBe(
-      'OK',
-    );
+    const decision = evaluate(makeInput({ action: makeAction({ reduceOnly: true }), state }));
+    expect(decision.code).toBe('REDUCE_ONLY_MISMATCH');
   });
 });
 

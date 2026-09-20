@@ -13,6 +13,7 @@ import { HUB_NAME } from './hub.js';
 import { errorSummary, logger } from './log.js';
 import {
   consumePairCode,
+  getLinkByInstall,
   getLinkByUser,
   hashPairCode,
   linkTelegram,
@@ -42,6 +43,9 @@ export const UNPAIRED_HINT =
   'This bot is not paired with an ATRA installation. Generate a code in your dashboard and send /pair CODE.';
 export const OFFLINE_TEXT = 'ATRA runtime is offline or not responding';
 export const PAIR_FAILED_TEXT = 'Code invalid or expired';
+/** Sent to the chat that is linked when someone else redeems a code for its installation. */
+export const PAIR_REFUSED_OWNER_TEXT =
+  'Someone tried to pair this installation with a different Telegram account and was refused. If that was you, unpair from the dashboard first, then generate a new code.';
 export const REFUSED_TEXT = 'This command is not available over Telegram.';
 
 /**
@@ -81,6 +85,7 @@ export type UpdateOutcome =
   | 'help'
   | 'paired'
   | 'pair_failed'
+  | 'pair_refused'
   | 'unpaired_hint'
   | 'refused'
   | 'forwarded';
@@ -172,10 +177,32 @@ async function pair(
     return 'pair_failed';
   }
 
-  const installId = await consumePairCode(env.DB, await hashPairCode(code), now);
+  const pepper = env.TOKEN_PEPPER;
+  if (!pepper) {
+    log.error('TOKEN_PEPPER is not configured');
+    await sendMessage(env.TELEGRAM_BOT_TOKEN, identity.chatId, PAIR_FAILED_TEXT);
+    return 'pair_failed';
+  }
+
+  const installId = await consumePairCode(env.DB, pepper, await hashPairCode(code), now);
   if (!installId) {
     await sendMessage(env.TELEGRAM_BOT_TOKEN, identity.chatId, PAIR_FAILED_TEXT);
     return 'pair_failed';
+  }
+
+  // A code is redeemable by whoever holds it, and the link is keyed by the
+  // installation. Without this check a stranger who saw the code could
+  // silently take a paired installation away from its operator. The same
+  // user re-pairing (a new chat, a reinstalled app) is not a takeover.
+  const existing = await getLinkByInstall(env.DB, installId);
+  if (existing && existing.telegram.userId !== identity.userId) {
+    log.warn('pair refused: installation is linked to another user', {
+      installId,
+      userId: identity.userId,
+    });
+    await sendMessage(env.TELEGRAM_BOT_TOKEN, identity.chatId, PAIR_FAILED_TEXT);
+    await sendMessage(env.TELEGRAM_BOT_TOKEN, existing.telegram.chatId, PAIR_REFUSED_OWNER_TEXT);
+    return 'pair_refused';
   }
 
   const { displaced } = await linkTelegram(env.DB, installId, identity, now);
