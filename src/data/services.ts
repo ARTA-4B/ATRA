@@ -1,16 +1,35 @@
 import { z } from 'zod';
 import { activityFixtures, marketFixtures } from './fixtures';
+import { ageLabel, fetchLiveMarkets } from './live-market';
 export const chains = ['Base', 'BNB Smart Chain', 'Robinhood Chain', 'Solana'] as const;
 export type Chain = typeof chains[number];
-const MarketSchema = z.object({ id: z.string(), symbol: z.string(), name: z.string(), chain: z.enum(chains), price: z.number().nullable(), change: z.number().nullable(), volume: z.number().nullable(), liquidity: z.number().nullable(), pool: z.string(), history: z.array(z.number()) });
+const MarketSchema = z.object({ id: z.string(), symbol: z.string(), name: z.string(), chain: z.enum(chains), price: z.number().nullable(), change: z.number().nullable(), volume: z.number().nullable(), liquidity: z.number().nullable(), pool: z.string(), history: z.array(z.number()), source: z.enum(['dexscreener', 'fixture']).optional(), observedAt: z.number().optional(), dex: z.string().nullable().optional(), reason: z.string().nullable().optional() });
 export type Market = z.infer<typeof MarketSchema>;
 export type DataState = 'ready' | 'loading' | 'empty' | 'stale' | 'error';
 export type Research = { observed: string; interpretation: string; risks: string; missing: string; action: 'NO ACTION' };
 export interface MarketService { list(state?: DataState): Promise<Market[]>; research(market: Market): Promise<Research> }
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 export const marketService: MarketService = {
-  async list(state = 'ready') { await delay(400); if (state === 'error') throw new Error('Market provider unavailable. Check your connection and try again.'); return state === 'empty' ? [] : z.array(MarketSchema).parse(marketFixtures); },
-  async research(market) { await delay(750); return { observed: `${market.symbol} on ${market.chain}. ${market.price === null ? 'Price and liquidity are unavailable.' : 'The preview contains a static price and liquidity snapshot.'}`, interpretation: 'This is a sample research structure, not model-generated financial advice.', risks: 'Price volatility, execution slippage, and liquidity changes are not modeled in this preview.', missing: 'Live provider data, verified contract metadata, and a connected reasoning model.', action: 'NO ACTION' }; },
+  // 'ready' is live data from DexScreener; the other states exist for the
+  // preview selector and are deliberately simulated, with the fixtures
+  // labelled as such by the UI.
+  async list(state = 'ready') { if (state === 'ready') return z.array(MarketSchema).parse(await fetchLiveMarkets()); await delay(400); if (state === 'error') throw new Error('Market provider unavailable. Check your connection and try again.'); return state === 'empty' ? [] : z.array(MarketSchema).parse(marketFixtures.map(m => ({ ...m, source: 'fixture' as const }))); },
+  async research(market) {
+    await delay(750);
+    const live = market.source === 'dexscreener' && market.price !== null;
+    const observed = market.price === null
+      ? `${market.symbol} on ${market.chain}. Price and liquidity are unavailable${market.reason ? ` (${market.reason})` : ''}.`
+      : live
+        ? `${market.symbol} on ${market.chain}. Price ${money(market.price)}, 24h change ${market.change === null ? 'unknown' : `${market.change >= 0 ? '+' : ''}${market.change.toFixed(2)}%`}, liquidity ${compactMoney(market.liquidity)}, 24h volume ${compactMoney(market.volume)} — DexScreener, ${market.pool}, ${market.observedAt ? ageLabel(market.observedAt) : 'just now'}.`
+        : `${market.symbol} on ${market.chain}. The preview contains a static price and liquidity snapshot.`;
+    return {
+      observed,
+      interpretation: 'No reasoning model is connected in this preview; the observation above is the data as the provider reported it, not an assessment.',
+      risks: 'Price volatility, execution slippage, and liquidity changes are not modeled here. A pool figure is the deepest pool for the asset, not the whole market.',
+      missing: live ? 'A second price provider for cross-checking, verified contract metadata, and a connected reasoning model.' : 'Live provider data, verified contract metadata, and a connected reasoning model.',
+      action: 'NO ACTION',
+    };
+  },
 };
 export const RiskSchema = z.object({ trade: z.coerce.number().min(1).max(1000000), loss: z.coerce.number().min(1).max(1000000), capital: z.coerce.number().min(1).max(10000000), slippage: z.coerce.number().min(0.01).max(5), fee: z.coerce.number().min(0).max(1000), cooldown: z.coerce.number().int().min(1).max(1440), liquidity: z.coerce.number().min(1000), tokens: z.string(), protocols: z.string() }).refine(v => v.trade <= v.capital, { message: 'Maximum trade size cannot exceed maximum deployed capital.', path: ['trade'] });
 export type RiskLimits = z.infer<typeof RiskSchema>;
