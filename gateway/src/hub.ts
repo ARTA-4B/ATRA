@@ -182,7 +182,8 @@ function spendBudget(
     hourStart: now,
     notifies: 0,
   };
-  if (now - next.minuteStart >= MINUTE_MS) next = { ...next, minuteStart: now, frames: 0, offers: 0 };
+  if (now - next.minuteStart >= MINUTE_MS)
+    next = { ...next, minuteStart: now, frames: 0, offers: 0 };
   if (now - next.hourStart >= HOUR_MS) next = { ...next, hourStart: now, notifies: 0 };
   switch (kind) {
     case 'frame':

@@ -31,8 +31,7 @@ export function storedPairHash(pepper: string, codeHash: string): Promise<string
 }
 
 export type StoreOfferResult =
-  | { ok: true; expiresAt: number }
-  | { ok: false; reason: 'code_in_use' };
+  { ok: true; expiresAt: number } | { ok: false; reason: 'code_in_use' };
 
 /**
  * Store an offered code, replacing any unused code for the same installation
