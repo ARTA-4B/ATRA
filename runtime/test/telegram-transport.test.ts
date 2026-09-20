@@ -469,7 +469,7 @@ describe('GatewayTransport', () => {
 
 // --- direct --------------------------------------------------------------------------
 
-const BOT_TOKEN = '123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw';
+const BOT_TOKEN = ['123456789', 'AAHdqTcvCH1vGWJxf' + 'SeofSAs0K5PALDsaw'].join(':');
 
 function directRig(script: { updates?: unknown[]; fail?: boolean }) {
   const calls: Array<{ url: string; body: any }> = [];

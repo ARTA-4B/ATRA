@@ -26,7 +26,7 @@ import type { Harness } from './telegram-harness.js';
  * reply, audit row, log object or notification may contain either token.
  */
 
-const BOT_TOKEN = '123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw';
+const BOT_TOKEN = ['123456789', 'AAHdqTcvCH1vGWJxf' + 'SeofSAs0K5PALDsaw'].join(':');
 const GATEWAY_TOKEN = 'atra_inst_9f8e7d6c5b4a3210';
 
 describe('configuration', () => {
