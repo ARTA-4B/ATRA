@@ -17,6 +17,7 @@ import { marketRoutes, watchlistRoutes } from './routes/market.js';
 import { tradingRoutes } from './routes/trading.js';
 import { liquidityRoutes } from './routes/liquidity.js';
 import { telegramRoutes } from './routes/telegram.js';
+import { treasuryRoutes } from './routes/treasury.js';
 import { childLogger } from '../logging/logger.js';
 import { AppError, ErrorCode } from '../util/errors.js';
 import { toProblem } from './respond.js';
@@ -84,6 +85,7 @@ export function createApp(services: Services): Hono<AppEnv> {
   app.route('/api/v1/trading', tradingRoutes());
   app.route('/api/v1/liquidity', liquidityRoutes(services.liquidity));
   app.route('/api/v1/telegram', telegramRoutes(services.telegram));
+  app.route('/api/v1/treasury', treasuryRoutes(services.treasury));
   app.route('/api/v1', overviewRoutes());
 
   app.all('/api/*', (c) => {

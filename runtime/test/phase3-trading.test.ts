@@ -995,6 +995,96 @@ describe('Phase 3: LIVE executor', () => {
     expect(h.execution.broadcasts).toHaveLength(0);
   });
 
+  it('keeps a signed row with its hash when broadcast fails, and settles it on the next start', async () => {
+    h = await harness({
+      trader: openWeth('10'),
+      execution: { allowance: 10n ** 30n },
+      chains: { base: { tokens: new Map([[USDC_BASE, 1_000_000_000n]]) } },
+    });
+    await activateLive(h.services);
+
+    // The node rejects the raw transaction after it has been signed: the
+    // outcome is unknown, so nothing may be re-signed and the hash must stay
+    // on disk for the reconciler.
+    const original = h.execution.broadcast.bind(h.execution);
+    let attempts = 0;
+    h.execution.broadcast = (signed) => {
+      attempts += 1;
+      h.execution.broadcasts.push(signed); // the node may have kept it
+      return Promise.reject(new Error('RPC down mid-broadcast'));
+    };
+
+    const report = await h.services.pipeline.runCycle({
+      chain: 'base',
+      token: WETH_BASE,
+      source: 'operator',
+    });
+    expect(report.outcome).toBe('failed');
+    expect(report.execution?.error).toMatch(/broadcast failed; transaction state unknown/);
+    expect(report.execution?.txHash).toMatch(/^0x[0-9a-f]{64}$/);
+
+    const trade = h.services.trades.get(report.trade!.tradeId)!;
+    expect(trade.status).toBe('signed');
+    expect(trade.txHash).toBe(report.execution?.txHash);
+    expect(attempts).toBe(1);
+    expect(
+      h.services.audit
+        .list({ correlationId: report.cycleId })
+        .find((row) => row.action === 'trade.broadcast' && row.status === 'failed')?.detail
+        .unresolved,
+    ).toBe(true);
+
+    // Next start: the chain has the transaction, so the row is settled from
+    // the receipt without a second signature.
+    h.execution.broadcast = original;
+    const signingBefore = h.execution.signingContexts.length;
+    await startBackgroundServices(h.services);
+    expect(h.services.trades.get(trade.id)?.status).toBe('filled');
+    expect(h.execution.signingContexts).toHaveLength(signingBefore);
+  });
+
+  it('leaves LP rows to the liquidity reconciler', async () => {
+    h = await harness({ trader: openWeth('10') });
+    const action = {
+      schemaVersion: 1 as const,
+      actionId: randomUUID(),
+      decisionCycleId: randomUUID(),
+      idempotencyKey: 'c'.repeat(64),
+      proposedAt: Date.now(),
+      mode: 'LIVE' as const,
+      source: 'test' as const,
+      chain: 'base' as const,
+      kind: 'lp_add' as const,
+      protocol: 'aerodrome-v2',
+      contract: AERODROME,
+      reduceOnly: false,
+      tokenIn: { address: USDC_BASE, decimals: 6 },
+      tokenOut: { address: WETH_BASE, decimals: 18 },
+      amountIn: '10000000',
+      quote: {
+        expectedAmountOut: '1000',
+        minAmountOut: '990',
+        slippageBps: 50,
+        priceImpactBps: 1,
+        quotedAt: Date.now(),
+        source: 'fake',
+        marketId: 'm',
+      },
+      feeEstimate: {
+        estimatedAt: Date.now(),
+        detail: { family: 'evm' as const, gasLimit: '250000', maxFeePerGas: '1000000000' },
+      },
+    };
+    const row = h.services.trades.propose(action, 'open', { route: { lp: true } });
+    h.services.trades.decide(row.id, { allowed: true, code: 'OK' } as never);
+    h.services.trades.markDispatched(row.id);
+    h.services.trades.markSigned(row.id, '0x' + 'ab'.repeat(32));
+
+    const report = await h.services.live.reconcile();
+    expect(report.checked).toBe(0);
+    expect(h.services.trades.get(row.id)?.status).toBe('signed');
+  });
+
   it('reconciles in-flight rows on restart by hash and never re-signs', async () => {
     h = await harness({ trader: openWeth('10'), execution: { allowance: 10n ** 30n } });
     // A signed-but-unresolved row, as a crash between sign and confirm leaves it.

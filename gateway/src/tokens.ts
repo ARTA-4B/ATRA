@@ -7,10 +7,12 @@
  * HMAC-SHA256(TOKEN_PEPPER, token): a leaked D1 export cannot be replayed
  * without the pepper, and the pepper (a Worker secret) never touches D1.
  *
- * TODO(phase-5): rotation. POST /v1/installs/{id}/rotate mints a new token
- * whose rotated_from is the old hash and sets the old row's expires_at to
- * now + 300 s, so a runtime mid-restart still connects during the grace
- * window. Until then a compromised token is revoked by setting revoked_at.
+ * TODO(phase-5): rotation. POST /v1/admin/installs/{id}/rotate should mint a
+ * new token whose rotated_from is the old hash and set the old row's
+ * expires_at to now + 300 s, so a runtime mid-restart still connects during
+ * the grace window. Until then a compromised token is revoked through
+ * POST /v1/admin/installs/{id}/revoke (admin.ts), which sets revoked_at, and
+ * the installation gets a fresh token from the mint endpoint.
  */
 import { bytesToBase64Url, hmacSha256Hex, randomBytes, uuidv7 } from './crypto.js';
 
@@ -18,7 +20,12 @@ export const TOKEN_PREFIX = 'atra_';
 export const TOKEN_RE =
   /^atra_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/;
 
-export const DEFAULT_SCOPES = ['telegram'] as const;
+/**
+ * What a runtime token carries unless the admin endpoint says otherwise:
+ * Telegram routing plus the two read-only proxies. `inference` is opt-in
+ * because the route is off by default and costs the project money when on.
+ */
+export const DEFAULT_SCOPES = ['telegram', 'rpc', 'market'] as const;
 /** Tokens expire after a year unless the admin endpoint is told otherwise. */
 export const DEFAULT_TOKEN_TTL_MS = 365 * 24 * 60 * 60_000;
 

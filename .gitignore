@@ -24,3 +24,7 @@ model/atra-4b/.pytest_cache/
 
 # Test scratch databases
 runtime/.test-data/
+
+# Runtime data directories from probe runs; never commit a database
+runtime/.live/
+/backups/

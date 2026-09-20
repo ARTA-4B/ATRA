@@ -32,6 +32,7 @@ import type { LpAdapter } from '../liquidity/types.js';
 import { TelegramService } from '../telegram/service.js';
 import type { TelegramTransport } from '../telegram/transport.js';
 import { readTelegramSecrets } from '../config/env.js';
+import { TreasuryService } from '../treasury/service.js';
 import type { LlmProvider } from '../llm/provider.js';
 import type { ChainId } from '../chains/registry.js';
 import type { ChainAdapter } from '../chains/types.js';
@@ -77,6 +78,8 @@ export interface Services {
   // Phase 4
   liquidity: LiquidityService;
   telegram: TelegramService;
+  // Phase 5
+  treasury: TreasuryService;
   startedAt: Date;
 }
 
@@ -229,12 +232,32 @@ export function buildServices(config: RuntimeConfig, options: BuildOptions = {})
     startedAt: new Date(),
   });
 
-  // An emergency stop disarms both schedules outright and tells the operator's
-  // phone; the operator re-enables them deliberately after clearing the stop.
+  // --- Phase 5: treasury ---------------------------------------------------
+  // Built from the database, the audit log, the read-only chain adapters, the
+  // market service and the model provider, and nothing else. No wallet, no
+  // vault, no ledger, no state: the treasury cannot sign, broadcast or read a
+  // user balance because it was never handed the objects that could, and
+  // test/treasury.test.ts asserts that the deps type rejects them.
+  const treasury = new TreasuryService({
+    db,
+    audit,
+    adapters,
+    market,
+    llm,
+    ...(options.kdfParams ? { kdfParams: options.kdfParams } : {}),
+  });
+
+  // An emergency stop disarms both schedules outright, tells the operator's
+  // phone, and freezes the treasury — clearing that freeze is a separate
+  // treasury-admin action, deliberately. The operator re-enables the
+  // schedules after clearing the stop.
   state.onEmergencyStop((active, reason) => {
     if (active) {
       scheduler.disableForEmergency(reason ?? 'emergency stop');
       liquidity.onEmergencyStop(active, reason);
+      if (!treasury.isFrozen()) {
+        treasury.freeze(`emergency stop: ${reason ?? 'no reason given'}`, 'system');
+      }
     }
     telegram.onEmergencyStop(active, reason);
   });
@@ -280,6 +303,7 @@ export function buildServices(config: RuntimeConfig, options: BuildOptions = {})
     withdrawals,
     liquidity,
     telegram,
+    treasury,
     startedAt: new Date(),
   };
 }

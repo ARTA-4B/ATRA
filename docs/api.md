@@ -6,9 +6,9 @@ Base URL in production: same origin as the dashboard (the runtime serves both).
 In development the Vite dev server proxies `/api` and `/health` to
 `http://127.0.0.1:3000`.
 
-This documents what is **implemented**, not what is planned. Phase 4–5 routes
-(trading, liquidity, telegram, settings) are not listed because they do not
-exist yet. The full intended contract is in
+This documents what is **implemented**, not what is planned. Phase 5 routes
+(settings) and SSE events are not listed because they do not exist yet. The
+full intended contract is in
 [`specs/dashboard-api-contract.md`](specs/dashboard-api-contract.md).
 
 ---
@@ -75,6 +75,7 @@ form fields.
 | `LIVE_ACTIVATION_INCOMPLETE` | 403 | Checklist not complete |
 | `SCHEMA_INVALID` | 422 | Body failed validation; see `errors[]` |
 | `ALREADY_INITIALIZED` / `CONFLICT` | 409 | Already done |
+| `TELEGRAM_NOT_CONFIGURED` | 409 | No Telegram transport is configured; see [Telegram](#telegram) |
 | `NOT_FOUND` | 404 | |
 | `CHAIN_UNSUPPORTED` | 503 | Not one of the four chains |
 | `UPSTREAM_UNAVAILABLE` / `UPSTREAM_TIMEOUT` | 503 / 504 | RPC or provider failed |
@@ -123,8 +124,9 @@ Password minimum is 12 characters. There are no composition rules.
 | `GET /api/v1/overview` | `{ mode, switches, wallets[], balances[], portfolio: { totalValueUsd: null, reason }, warnings[], recentActivity[] }` |
 
 `balances[].native` is `null` with `error` set when a chain could not be read.
-`portfolio.totalValueUsd` is `null` until pricing is wired to balances
-(Phase 4). `warnings[]` includes `gasLow` per chain.
+`portfolio.totalValueUsd` is still `null`: pricing is not wired to wallet
+balances in this build (Phase 4 did not change that). `warnings[]` includes
+`gasLow` per chain.
 
 `chains[]` entries: `{ chain, healthy, height, latencyMs, endpoint, error, identity, identityMatches }`.
 
@@ -215,7 +217,9 @@ allowlists are per chain.
 | `GET /api/v1/activity/:eventId` | | one event |
 
 Categories: `setup auth wallet risk mode control trade liquidity market research telegram system`.
-Statuses: `ok rejected failed pending`.
+Statuses: `ok rejected failed pending hold`. `hold` is the trader's
+`NO_ACTION` and the Liquidity Manager's `HOLD`: the agent looked and chose
+not to act.
 
 ## Market
 
@@ -318,7 +322,214 @@ rule, `trade.signed`, `trade.filled` / `trade.failed`, and a closing
 
 ---
 
+## Liquidity
+
+The dashboard **observes** liquidity management, exactly as it observes
+trading. There is no route that takes a pool and an amount and adds
+liquidity: actions are proposed by the Liquidity Manager and gated by the
+risk engine, and the only operator action is "run a cycle now", which walks
+the same read → decide → build → gate → execute path as the scheduler.
+Every route needs a session; the writes need the `x-atra-client` header.
+
+| Route | Body | Returns |
+|---|---|---|
+| `GET /api/v1/liquidity` | — | `LiquidityView` (below): summary, positions for the current mode, the last 50 actions, protocols, adapters, example pools, automation |
+| `GET /api/v1/liquidity/positions` | — | `LpPositionView[]` for the current mode |
+| `GET /api/v1/liquidity/actions?limit=` | — | `LpActionView[]` newest first across **both** modes (each row carries `mode`; the view's `actions` are the current mode only), `limit` clamped to 1..500 (default 50) |
+| `GET /api/v1/liquidity/adapters` | — | `{ adapters: [{ chain, available, protocol, reason }], protocols: [{ id, name, chains[] }] }` — Solana and Robinhood Chain are `available: false` with the reason |
+| `POST /api/v1/liquidity/run` | `{ chain, poolId }` | `LpCycleReport`, 202; 409 while paused, under emergency stop, or while a cycle or scheduled pass is running |
+| `GET /api/v1/liquidity/automation` | — | `LpAutomationView` |
+| `PUT /api/v1/liquidity/automation` | `{ enabled, intervalSeconds: 60..86400 }` | `LpAutomationView`; 409 when enabling under an emergency stop |
+
+`LiquidityView`:
+
+```json
+{
+  "summary": {
+    "totalValueUsd": "0.000000" | null,
+    "activePositions": 0,
+    "unclaimedFeesUsd": "0.000000" | null,
+    "requiresAttention": 0,
+    "reason": "1 position(s) not yet observed by a cycle"
+  },
+  "positions": [
+    {
+      "id": "…", "pool": "WETH/USDC", "poolId": "0xcdac…5c43", "chain": "Base", "chainId": "base",
+      "protocol": "aerodrome-v2", "mode": "PAPER",
+      "valueUsd": "19.980000" | null, "capitalUsd": "20.000000", "unrealizedUsd": "-0.020000" | null,
+      "range": null,
+      "feesUsd": "0.000000" | null, "feesNote": "fee accrual is not simulated in PAPER",
+      "lpTokens": "190881115445",
+      "amounts": {
+        "token0": { "address": "0x4200…0006", "symbol": "WETH", "amount": "3805175039258298", "decimals": 18 },
+        "token1": { "address": "0x8335…2913", "symbol": "USDC", "amount": "10000000", "decimals": 6 }
+      },
+      "lastAction": "ADD", "lastActionAt": "…", "lastRebalanceAt": null,
+      "rebalance": { "today": 0, "max": 4, "nextEligibleAt": null },
+      "status": "SIMULATED" | "ACTIVE", "source": "paper-sim" | "chain",
+      "openedAt": "…", "markedAt": "…" | null
+    }
+  ],
+  "actions": [
+    {
+      "id": "…", "at": "…", "pool": "WETH/USDC", "poolId": "0xcdac…5c43", "chain": "Base", "chainId": "base",
+      "protocol": "aerodrome-v2", "mode": "PAPER",
+      "action": "HOLD" | "ADD" | "REMOVE" | "REBALANCE" | "COLLECT FEES" | "EXIT",
+      "status": "hold" | "rejected" | "filled" | "failed",
+      "note": "…", "txHash": null, "lpTokens": "…" | null, "feeUsd": "…" | null, "capitalUsd": "…" | null,
+      "activityId": "<cycle id; every audit row of the cycle has it as correlationId>"
+    }
+  ],
+  "supportedProtocols": [
+    { "id": "aerodrome-v2", "name": "Aerodrome v2", "chains": ["base"] },
+    { "id": "pancakeswap-v2", "name": "PancakeSwap v2", "chains": ["bsc"] }
+  ],
+  "adapters": [
+    { "chain": "base", "available": true, "protocol": "aerodrome-v2", "reason": "aerodrome-v2 adapter" },
+    { "chain": "solana", "available": false, "protocol": null, "reason": "Solana has no LP adapter in this build: …" }
+  ],
+  "verifiedExamplePools": [
+    { "chain": "base", "protocol": "aerodrome-v2", "poolId": "0xcdac0d6c6c59727a65f871236188350531885c43", "label": "Aerodrome vAMM-WETH/USDC (volatile)" },
+    { "chain": "bsc", "protocol": "pancakeswap-v2", "poolId": "0x16b9a82891338f9ba80e2d6970fdda79d1eb0dae", "label": "PancakeSwap v2 USDT/WBNB" }
+  ],
+  "automation": {
+    "enabled": false, "intervalSeconds": 1800, "running": false, "paused": false,
+    "nextRunAt": null, "lastCycleAt": null, "lastCycleStatus": null
+  },
+  "modelStatus": "UNTRAINED"
+}
+```
+
+Rules for rendering it:
+
+- `summary.totalValueUsd` and `unclaimedFeesUsd` are `null` when any
+  position could not be valued, and `summary.reason` says which. Never
+  add up what is there and show it as a total.
+- A position's `valueUsd`, `feesUsd` and `unrealizedUsd` are `null` until a
+  cycle has observed it (`markedAt` says when). `feesNote` explains a `null`
+  or a zero: PancakeSwap fees compound into the reserves, PAPER does not
+  simulate accrual.
+- `range` is `null` on every position in this build (v2 pools have no
+  range). `requiresAttention` counts positions whose value or fees are
+  unknown, and out-of-range ones.
+- `status: "SIMULATED"` / `source: "paper-sim"` is a paper position;
+  `ACTIVE` / `chain` is real. Show the difference.
+- `adapters[].reason` is the text to show on a chain that cannot manage
+  liquidity. `verifiedExamplePools` are addresses that were verified on
+  chain; they are **not** in the policy until the operator lists them.
+- The default policy lists no pools and caps LP capital at zero, so every
+  cycle ends `rejected` or `hold` until the operator edits `risk.lp`.
+
+`LpCycleReport` (from `POST /run`):
+
+```json
+{
+  "cycleId": "…", "chain": "base", "poolId": "0xcdac…5c43", "mode": "PAPER", "startedAt": "…", "finishedAt": "…",
+  "outcome": "blocked | skipped | hold | rejected | filled | failed",
+  "reason": "…",
+  "decision": { "action": "ADD_LIQUIDITY", "chain": "base", "poolId": "…", "capitalUsd": "20", "reason": "…", "confidence": 0.8, "evidence": ["…"] } | null,
+  "modelStatus": "UNTRAINED | UNAVAILABLE" | null,
+  "trade": { "tradeId": "…", "actionId": "…" } | null,
+  "risk": { "allowed": false, "code": "POOL_NOT_ALLOWLISTED", "reason": "…" } | null,
+  "execution": { "actionId": "…", "mode": "PAPER", "status": "filled | failed", "lpTokens": "…" | null, "amount0": "…" | null, "amount1": "…" | null, "feeUsd": "…", "txHash": null, "error": null, "filledAt": 0 } | null,
+  "position": <LpPositionRecord> | null,
+  "notes": ["pool 0xcdac… WETH/USDC reserves …", "token0 price 2500 USD via …", "…"]
+}
+```
+
+`outcome` meanings: `blocked` — a switch or a missing policy stopped the
+cycle before anything was read; `skipped` — the chain is not enabled, has no
+adapter, the pool could not be read, or the proposal could not be built (the
+`reason` says which); `hold` — the agent chose `HOLD`; `rejected` — the risk
+engine refused (`risk.code`); `filled` / `failed` — the executor's result.
+
+Every cycle writes audit rows correlated by `cycleId`: `liquidity.decision`
+(`hold` for HOLD), `liquidity.proposal` (`hold`, when a build fails),
+`risk.allowed` / `risk.rejected` with the failing rule, and in LIVE
+`liquidity.signed` and `liquidity.broadcast`, then `liquidity.filled` /
+`liquidity.failed`, and a closing `liquidity.cycle`. `GET /api/v1/activity`
+shows them. The LP trade rows (`kind: lp_add | lp_remove | lp_claim`, and
+the `approve` rows that precede them in LIVE) appear in
+`GET /api/v1/trading/trades` like any other.
+
+## Telegram
+
+The dashboard side of pairing and notification settings. Nothing here sends
+a message or runs a command: Telegram reaches the runtime through the
+transport (the official gateway over WebSocket, or the operator's own bot by
+long polling), never through this HTTP surface. Every route needs a session;
+the writes need the `x-atra-client` header.
+
+| Route | Body | Returns |
+|---|---|---|
+| `GET /api/v1/telegram` | — | `TelegramView` |
+| `POST /api/v1/telegram/pair` | `{}` | `PairCode`, 201; `409 TELEGRAM_NOT_CONFIGURED` when no transport is configured |
+| `GET /api/v1/telegram/pair/:code` | — | `{ status: "pending" \| "confirmed" \| "expired" }`; `422 SCHEMA_INVALID` when `code` cannot be a code |
+| `POST /api/v1/telegram/unpair` | `{}` | `TelegramView` |
+| `PUT /api/v1/telegram/notifications` | `Partial<{ riskRejections, tradeDecisions, liquidityUpdates, runtimeAlerts }>` (booleans, no other keys) | `TelegramView` |
+| `PATCH /api/v1/telegram/notifications` | same | same — `PATCH` per the dashboard contract, `PUT` kept for symmetry |
+
+`TelegramView`:
+
+```json
+{
+  "configured": false,
+  "paired": false,
+  "botUrl": "https://t.me/<bot-username>" | null,
+  "botUsername": "<bot-username>" | null,
+  "account": { "displayName": "Rizky", "userIdMasked": "******789", "pairedAt": "…" } | null,
+  "installation": "<installation name>",
+  "notifications": { "riskRejections": true, "tradeDecisions": true, "liquidityUpdates": true, "runtimeAlerts": true },
+  "transport": "gateway" | "direct" | null,
+  "connected": false,
+  "alertsEnabled": true
+}
+```
+
+`transport`, `connected` and `alertsEnabled` are additive to the contract's
+`TelegramView`: which transport is in use, whether it is up right now, and
+the master switch the operator toggles with `/alerts on|off`. `account`
+carries public Telegram identifiers only — a display name and a masked user
+id (last three digits). No phone number, no token, ever.
+
+`PairCode`:
+
+```json
+{ "code": "K7ZQ-4MWD", "command": "/pair K7ZQ-4MWD", "expiresAt": "…", "botUrl": "https://t.me/<bot-username>" | null }
+```
+
+The pairing flow:
+
+1. `POST /api/v1/telegram/pair`. Without a transport (`ATRA_GATEWAY_URL` +
+   `ATRA_GATEWAY_TOKEN`, or `ATRA_TELEGRAM_BOT_TOKEN`) this is
+   `409 TELEGRAM_NOT_CONFIGURED`: the runtime does not hand out a code that
+   could never be redeemed. Otherwise a code like `K7ZQ-4MWD` (alphabet
+   without `0/1/O/I`) is shown **once**; the runtime keeps only its
+   `sha256`. It expires at `expiresAt`, five minutes after issue, is single
+   use, and issuing a new one retires every older unused code.
+2. The operator opens `botUrl` and sends `command` to the bot.
+3. Poll `GET /api/v1/telegram/pair/:code` (the contract says every 3 s).
+   `pending` until the bot confirms, then `confirmed`. Unknown codes read as
+   `expired`, deliberately: there is nothing to learn from probing them.
+   The code may be sent lower-case or without the dash.
+4. `GET /api/v1/telegram` now has `paired: true` and `account` set.
+
+`POST /unpair` deletes the link, retires unused codes and tells the gateway
+to drop its side. The notification toggles are per category; `alertsEnabled`
+is the master switch and is only changed from Telegram. Delivery is never
+reported by this API: a notification's outcome is recorded in the audit log,
+but whether Telegram showed it to a human is not something the runtime can
+know.
+
+What Telegram can and cannot do is enforced in the runtime, not by the bot:
+`/status /portfolio /positions /trades /lp /risk /pause /resume /alerts
+/emergency /help` work; export, withdrawal, key and seed words get one fixed
+refusal; clearing an emergency stop needs the dashboard and re-authentication.
+`skills/telegram/SKILL.md` has the whole surface.
+
 ## Not yet implemented
 
-Liquidity, telegram, settings, SSE events. Calling any of these returns
-`404 NOT_FOUND`. Do not mock them as working.
+Settings, SSE events. Calling either returns `404 NOT_FOUND`. Do not mock
+them as working. The dashboard contract's `PATCH /api/v1/telegram/notifications`
+and `GET /api/v1/liquidity` exist as documented above; the contract's SSE
+`telegram` event for pairing confirmation does not, so poll.

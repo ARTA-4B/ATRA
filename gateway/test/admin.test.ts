@@ -2,6 +2,7 @@ import { createExecutionContext, waitOnExecutionContext } from 'cloudflare:test'
 import { env } from 'cloudflare:workers';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import worker from '../src/index.js';
+import { GATEWAY_VERSION } from '../src/env.js';
 import { TOKEN_RE } from '../src/tokens.js';
 import { ADMIN_TOKEN, BASE, connectRuntime, stubTelegram } from './helpers.js';
 import type { TelegramStub } from './helpers.js';
@@ -34,7 +35,7 @@ describe('GET /health', () => {
   it('reports ok with the version', async () => {
     const { response, body } = await call('/health');
     expect(response.status).toBe(200);
-    expect(body).toMatchObject({ status: 'ok', version: '0.1.0', env: 'dev' });
+    expect(body).toMatchObject({ status: 'ok', version: GATEWAY_VERSION, env: 'dev' });
   });
 
   it('answers unknown paths with 404 json', async () => {
@@ -73,7 +74,7 @@ describe('POST /v1/admin/installs', () => {
     expect(response.status).toBe(201);
     expect(body.token).toMatch(TOKEN_RE);
     expect(body.installId).toMatch(/^[0-9a-f-]{36}$/);
-    expect(body.scopes).toEqual(['telegram']);
+    expect(body.scopes).toEqual(['telegram', 'rpc', 'market']);
     expect(typeof body.expiresAt).toBe('number');
 
     // Only the HMAC is stored.
@@ -84,7 +85,7 @@ describe('POST /v1/admin/installs', () => {
       .first<{ token_hash: string; scopes: string }>();
     expect(row?.token_hash).toMatch(/^[0-9a-f]{64}$/);
     expect(row?.token_hash).not.toContain(body.token);
-    expect(row?.scopes).toBe('["telegram"]');
+    expect(row?.scopes).toBe('["telegram","rpc","market"]');
 
     const runtime = await connectRuntime(body.token, body.installId);
     const welcome = await runtime.hello();

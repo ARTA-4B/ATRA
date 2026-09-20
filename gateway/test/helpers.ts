@@ -79,6 +79,110 @@ export function stubTelegram(options: { status?: number } = {}): TelegramStub {
   };
 }
 
+// --- Upstream stub (RPC providers, market providers, inference) ------------
+
+export interface UpstreamCall {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body: any;
+}
+
+export type UpstreamHandler = (call: UpstreamCall) => Response | Promise<Response>;
+
+export interface UpstreamStub {
+  calls: UpstreamCall[];
+  /** Calls whose URL starts with `prefix`. */
+  callsTo(prefix: string): UpstreamCall[];
+  restore(): void;
+}
+
+/**
+ * Replace global fetch with a router keyed by URL prefix. Anything that does
+ * not match a handler is refused loudly: the suite must never touch the
+ * network. Telegram's sendMessage is refused too unless a handler is given.
+ */
+export function stubUpstreams(handlers: Record<string, UpstreamHandler>): UpstreamStub {
+  const calls: UpstreamCall[] = [];
+  const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const url = request.url;
+    const headers: Record<string, string> = {};
+    request.headers.forEach((value, key) => {
+      headers[key] = value;
+    });
+    const text = await request.text();
+    const call: UpstreamCall = {
+      url,
+      method: request.method,
+      headers,
+      body: parseMaybeJson(text),
+    };
+    const prefix = Object.keys(handlers).find((p) => url.startsWith(p));
+    if (prefix === undefined) {
+      throw new Error(`unexpected outbound request in tests: ${url}`);
+    }
+    calls.push(call);
+    return handlers[prefix]!(call);
+  });
+  return {
+    calls,
+    callsTo: (prefix) => calls.filter((c) => c.url.startsWith(prefix)),
+    restore: () => spy.mockRestore(),
+  };
+}
+
+export function jsonResponse(body: unknown, status = 200, headers: Record<string, string> = {}) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json', ...headers },
+  });
+}
+
+// --- Authenticated HTTP calls ------------------------------------------------
+
+export interface CallResult {
+  response: Response;
+  body: any;
+}
+
+/** Call the Worker with an optional bearer token and env override. */
+export async function call(
+  path: string,
+  init: RequestInit & { token?: string | null; env?: typeof env } = {},
+): Promise<CallResult> {
+  const { token, env: envOverride, ...rest } = init;
+  const headers = new Headers(rest.headers);
+  if (token) headers.set('authorization', `Bearer ${token}`);
+  const request = new Request(`${BASE}${path}`, { ...rest, headers });
+  const ctx = createExecutionContext();
+  const response = await worker.fetch(request, envOverride ?? env, ctx);
+  await waitOnExecutionContext(ctx);
+  const text = await response.text();
+  return { response, body: parseMaybeJson(text) };
+}
+
+export function adminCall(path: string, init: RequestInit & { env?: typeof env } = {}) {
+  return call(path, { ...init, token: ADMIN_TOKEN });
+}
+
+/** POST a JSON body with a bearer token. */
+export function postJson(
+  path: string,
+  token: string | null,
+  body: unknown,
+  options: { env?: typeof env } = {},
+) {
+  const init: RequestInit & { token?: string | null; env?: typeof env } = {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+    token,
+  };
+  if (options.env) init.env = options.env;
+  return call(path, init);
+}
+
 // --- Telegram updates ------------------------------------------------------
 
 let nextUpdateId = 1_000_000 + Math.floor(Math.random() * 1_000_000);
@@ -150,7 +254,9 @@ export function parseMaybeJson(text: string): any {
 
 // --- Installation tokens -------------------------------------------------
 
-export async function mintToken(options: { installId?: string; ttlMs?: number | null } = {}) {
+export async function mintToken(
+  options: { installId?: string; ttlMs?: number | null; scopes?: readonly string[] } = {},
+) {
   return mintInstallToken(env.DB, PEPPER, options);
 }
 

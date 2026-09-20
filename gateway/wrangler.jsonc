@@ -1,13 +1,24 @@
 // ATRA hosted gateway: one Worker, one Hub Durable Object, one D1 database per
-// environment. Deploy ONLY with `--env staging` or `--env production`; the
-// top-level (no env) block exists for `wrangler dev` and the test suite, and
-// its D1 id is a local placeholder.
+// environment, plus (optional) one KV namespace for the market cache and one
+// Analytics Engine dataset for metering. Deploy ONLY with `--env staging` or
+// `--env production`; the top-level (no env) block exists for `wrangler dev`
+// and the test suite, and its D1/KV ids are local placeholders.
 //
 // Secrets (never in this file; set with `wrangler secret put <NAME> --env <env>`):
 //   TELEGRAM_BOT_TOKEN        the bot token from @BotFather
 //   TELEGRAM_WEBHOOK_SECRET   random string passed to setWebhook(secret_token)
 //   TOKEN_PEPPER              HMAC key for installation tokens (32+ random bytes)
-//   ADMIN_TOKEN               bearer token for POST /v1/admin/installs
+//   ADMIN_TOKEN               bearer token for /v1/admin/*
+//   RPC_URL_BASE, RPC_URL_BSC, RPC_URL_ROBINHOOD, RPC_URL_SOLANA
+//                             optional keyed JSON-RPC URLs; the public endpoint
+//                             in src/rpc.ts is used for any that is unset
+//   INFERENCE_URL, INFERENCE_API_KEY, INFERENCE_MODEL
+//                             optional; POST /v1/inference answers 501 without
+//                             INFERENCE_MODEL plus either INFERENCE_URL or an AI binding
+//
+// Vars that tune the per-install daily quotas (decimal strings; defaults in
+// src/quota.ts): QUOTA_RPC_PER_DAY, QUOTA_MARKET_PER_DAY,
+// QUOTA_INFERENCE_PER_DAY, QUOTA_WS_CONNECTS_PER_DAY.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "atra-gateway",
@@ -24,7 +35,8 @@
     "head_sampling_rate": 0.2,
   },
   "triggers": {
-    // Purges tg_updates rows older than 24 h and stale pair codes.
+    // Purges tg_updates rows older than 24 h and stale pair codes; hourly,
+    // quota rows older than 7 days.
     "crons": ["*/5 * * * *"],
   },
   // Legacy `migrations` form on purpose: the local wrangler (4.110) predates
@@ -47,6 +59,10 @@
       "migrations_dir": "migrations",
     },
   ],
+  // Local KV and Analytics Engine: miniflare backs both, nothing is created
+  // on the account. The test suite exercises the KV cache path through this.
+  "kv_namespaces": [{ "binding": "KV", "id": "atra-gateway-local-kv" }],
+  "analytics_engine_datasets": [{ "binding": "AE", "dataset": "atra_usage" }],
 
   "env": {
     "staging": {
@@ -67,12 +83,22 @@
           "migrations_dir": "migrations",
         },
       ],
-      // Namespace ids 2101-2103. Ids 1001-1004 belong to another Worker on
+      // HUMAN STEP: `wrangler kv namespace create atra-gateway-staging-market`
+      // and paste the id. Optional: delete this block and the market proxy
+      // falls back to the per-colo Cache API.
+      "kv_namespaces": [{ "binding": "KV", "id": "REPLACE_WITH_STAGING_KV_ID" }],
+      // HUMAN STEP: Analytics Engine may need enabling once in the dashboard
+      // (Workers & Pages -> Analytics Engine) before the first deploy
+      // succeeds. Optional: delete this block and metering is skipped.
+      "analytics_engine_datasets": [{ "binding": "AE", "dataset": "atra_usage" }],
+      // Namespace ids 2101-2104. Ids 1001-1004 belong to another Worker on
       // this account and would share counters: never use them.
       "ratelimits": [
         { "name": "RL_WEBHOOK", "namespace_id": "2101", "simple": { "limit": 20, "period": 60 } },
         { "name": "RL_WS", "namespace_id": "2102", "simple": { "limit": 10, "period": 60 } },
         { "name": "RL_UNPAIRED", "namespace_id": "2103", "simple": { "limit": 5, "period": 60 } },
+        // Burst guard for the proxies, per install: 60 requests per 10 s.
+        { "name": "RL_PROXY", "namespace_id": "2104", "simple": { "limit": 60, "period": 10 } },
       ],
     },
     "production": {
@@ -92,10 +118,16 @@
           "migrations_dir": "migrations",
         },
       ],
+      // HUMAN STEP: `wrangler kv namespace create atra-gateway-production-market`
+      // and paste the id. Optional, see staging.
+      "kv_namespaces": [{ "binding": "KV", "id": "REPLACE_WITH_PRODUCTION_KV_ID" }],
+      // HUMAN STEP: see staging. Same dataset name; rows carry the env.
+      "analytics_engine_datasets": [{ "binding": "AE", "dataset": "atra_usage" }],
       "ratelimits": [
         { "name": "RL_WEBHOOK", "namespace_id": "2001", "simple": { "limit": 20, "period": 60 } },
         { "name": "RL_WS", "namespace_id": "2002", "simple": { "limit": 10, "period": 60 } },
         { "name": "RL_UNPAIRED", "namespace_id": "2003", "simple": { "limit": 5, "period": 60 } },
+        { "name": "RL_PROXY", "namespace_id": "2004", "simple": { "limit": 60, "period": 10 } },
       ],
     },
   },

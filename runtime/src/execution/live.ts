@@ -186,6 +186,15 @@ export class LiveExecutor {
     };
 
     for (const trade of this.#trades.listInFlight()) {
+      // LP rows (and the approvals that precede an LP add) are the liquidity
+      // executor's to settle: it books the position, this one would only
+      // mark the row. The two reconcilers run in either order safely.
+      if (
+        trade.kind.startsWith('lp_') ||
+        (trade.kind === 'approve' && trade.route['lp'] === true)
+      ) {
+        continue;
+      }
       report.checked += 1;
 
       if (trade.status === 'dispatched') {

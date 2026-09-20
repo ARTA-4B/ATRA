@@ -14,8 +14,10 @@
  *   - the object trusts the X-ATRA-Install-Id header because only the Worker,
  *     after authenticating the bearer token, can reach it
  *
- * Everything the object persists lives in D1 (the link, the pair codes); its
- * own storage holds only the alarm. One hub at launch, name "global".
+ * The link and the pair codes live in D1; the object's own SQLite storage
+ * holds the alarm and the per-install daily quota counters (table
+ * quota_usage), which must survive eviction and be exact: one object, one
+ * writer, one statement per increment. One hub at launch, name "global".
  */
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from './env.js';
@@ -28,6 +30,8 @@ import {
   encodeFrame,
 } from './protocol.js';
 import type { GatewayFrame, RuntimeFrame, TelegramIdentity } from './protocol.js';
+import { QUOTA_KINDS, utcDayEnd, utcDayKey, utcDayStart } from './quota.js';
+import type { QuotaDecision, QuotaKind } from './quota.js';
 import { sendMessage } from './telegram.js';
 
 const log = logger('hub');
@@ -43,6 +47,8 @@ export const HELLO_GRACE_MS = 30_000;
 // Close codes in the 4000-4999 application range.
 export const CLOSE_SUPERSEDED = 4001;
 export const CLOSE_NO_ATTACHMENT = 4002;
+/** The installation's tokens were revoked by the operator. */
+export const CLOSE_REVOKED = 4003;
 export const CLOSE_HEARTBEAT_TIMEOUT = 4004;
 export const CLOSE_HELLO_TIMEOUT = 4005;
 
@@ -66,6 +72,53 @@ export interface CommandPayload {
 
 export type DispatchResult =
   { status: 'ok'; text: string } | { status: 'offline' } | { status: 'timeout' };
+
+export type UsageCounts = Record<QuotaKind, { used: number; rejected: number }>;
+
+export interface InstallUsage {
+  installId: string;
+  counts: UsageCounts;
+  online: boolean;
+}
+
+export interface UsageSummary {
+  day: string;
+  windowStart: number;
+  resetAt: number;
+  installs: InstallUsage[];
+  totals: UsageCounts;
+  /** Sockets open right now, all installations. */
+  openSockets: number;
+}
+
+/** Days of quota_usage rows kept for the admin summary. */
+export const USAGE_RETENTION_DAYS = 7;
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS quota_usage (
+  day        TEXT    NOT NULL,
+  install_id TEXT    NOT NULL,
+  kind       TEXT    NOT NULL,
+  used       INTEGER NOT NULL DEFAULT 0,
+  rejected   INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (day, install_id, kind)
+);
+CREATE INDEX IF NOT EXISTS quota_usage_day ON quota_usage (day);
+`;
+
+function emptyCounts(): UsageCounts {
+  return {
+    rpc: { used: 0, rejected: 0 },
+    market: { used: 0, rejected: 0 },
+    inference: { used: 0, rejected: 0 },
+    ws: { used: 0, rejected: 0 },
+  };
+}
+
+function isQuotaKind(value: string): value is QuotaKind {
+  return (QUOTA_KINDS as readonly string[]).includes(value);
+}
 
 function tag(installId: string): string {
   return `install:${installId}`;
@@ -92,6 +145,8 @@ export class Hub extends DurableObject<Env> {
     // Heartbeats never wake a hibernating object. Idempotent, so it is simply
     // set on every construction.
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'));
+    // Synchronous and idempotent: the schema exists before the first RPC.
+    ctx.storage.sql.exec(SCHEMA);
   }
 
   // --- WebSocket upgrade ---------------------------------------------------
@@ -268,6 +323,147 @@ export class Hub extends DurableObject<Env> {
 
   isOnline(installId: string): boolean {
     return this.liveSocket(installId) !== null;
+  }
+
+  /** Installation ids with an open socket that has completed hello. */
+  onlineInstalls(): string[] {
+    const ids = new Set<string>();
+    for (const ws of this.ctx.getWebSockets()) {
+      if (ws.readyState !== WebSocket.READY_STATE_OPEN) continue;
+      const attachment = readAttachment(ws);
+      if (attachment?.hello) ids.add(attachment.installId);
+    }
+    return [...ids];
+  }
+
+  /**
+   * Close every socket of an installation (revocation). The token check on
+   * the next connect is what keeps it out; this only ends the current session.
+   */
+  closeSockets(installId: string, code: number = CLOSE_REVOKED, reason = 'revoked'): number {
+    let closed = 0;
+    for (const ws of this.ctx.getWebSockets(tag(installId))) {
+      try {
+        ws.close(code, reason);
+        closed += 1;
+      } catch {
+        // already closing
+      }
+    }
+    return closed;
+  }
+
+  // --- Quotas (SQLite-backed, per install, per UTC day) --------------------
+
+  /**
+   * Count one request of `kind` against today's quota. The limit is passed
+   * by the Worker (it reads the vars) so the object stays configuration-free.
+   * A limit of 0 refuses everything of that kind. Durable Object events run
+   * one at a time and sql.exec is synchronous, so read-then-write here is
+   * atomic without a transaction.
+   */
+  consumeQuota(
+    installId: string,
+    kind: QuotaKind,
+    limit: number,
+    now: number = Date.now(),
+  ): QuotaDecision {
+    const day = utcDayKey(now);
+    const cap = Number.isFinite(limit) && limit >= 0 ? Math.floor(limit) : 0;
+    const row = this.ctx.storage.sql
+      .exec<{ used: number; rejected: number }>(
+        'SELECT used, rejected FROM quota_usage WHERE day = ? AND install_id = ? AND kind = ?',
+        day,
+        installId,
+        kind,
+      )
+      .toArray()[0];
+    const used = row?.used ?? 0;
+    const rejected = row?.rejected ?? 0;
+    const base = { kind, limit: cap, day, windowStart: utcDayStart(now), resetAt: utcDayEnd(now) };
+
+    if (used >= cap) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO quota_usage (day, install_id, kind, used, rejected, updated_at)
+         VALUES (?, ?, ?, 0, 1, ?)
+         ON CONFLICT (day, install_id, kind)
+         DO UPDATE SET rejected = rejected + 1, updated_at = excluded.updated_at`,
+        day,
+        installId,
+        kind,
+        now,
+      );
+      return { ...base, allowed: false, used, rejected: rejected + 1 };
+    }
+    this.ctx.storage.sql.exec(
+      `INSERT INTO quota_usage (day, install_id, kind, used, rejected, updated_at)
+       VALUES (?, ?, ?, 1, 0, ?)
+       ON CONFLICT (day, install_id, kind)
+       DO UPDATE SET used = used + 1, updated_at = excluded.updated_at`,
+      day,
+      installId,
+      kind,
+      now,
+    );
+    return { ...base, allowed: true, used: used + 1, rejected };
+  }
+
+  /** Today's counters for one installation (all kinds, zero when unused). */
+  usageFor(installId: string, now: number = Date.now()): UsageCounts {
+    const counts = emptyCounts();
+    const rows = this.ctx.storage.sql
+      .exec<{ kind: string; used: number; rejected: number }>(
+        'SELECT kind, used, rejected FROM quota_usage WHERE day = ? AND install_id = ?',
+        utcDayKey(now),
+        installId,
+      )
+      .toArray();
+    for (const r of rows) {
+      if (isQuotaKind(r.kind)) counts[r.kind] = { used: r.used, rejected: r.rejected };
+    }
+    return counts;
+  }
+
+  /** Every installation that made a request on `day` (default today), with totals. */
+  usageSummary(now: number = Date.now(), day: string = utcDayKey(now)): UsageSummary {
+    const rows = this.ctx.storage.sql
+      .exec<{ install_id: string; kind: string; used: number; rejected: number }>(
+        'SELECT install_id, kind, used, rejected FROM quota_usage WHERE day = ? ORDER BY install_id',
+        day,
+      )
+      .toArray();
+    const byInstall = new Map<string, UsageCounts>();
+    const totals = emptyCounts();
+    for (const r of rows) {
+      if (!isQuotaKind(r.kind)) continue;
+      const counts = byInstall.get(r.install_id) ?? emptyCounts();
+      counts[r.kind] = { used: r.used, rejected: r.rejected };
+      byInstall.set(r.install_id, counts);
+      totals[r.kind].used += r.used;
+      totals[r.kind].rejected += r.rejected;
+    }
+    const installs: InstallUsage[] = [];
+    for (const [installId, counts] of byInstall) {
+      installs.push({ installId, counts, online: this.isOnline(installId) });
+    }
+    const dayStart = Date.parse(`${day}T00:00:00.000Z`);
+    return {
+      day,
+      windowStart: dayStart,
+      resetAt: dayStart + 24 * 60 * 60_000,
+      installs,
+      totals,
+      openSockets: this.ctx
+        .getWebSockets()
+        .filter((ws) => ws.readyState === WebSocket.READY_STATE_OPEN).length,
+    };
+  }
+
+  /** Drop counters older than the retention window. Called from the cron. */
+  purgeUsage(now: number = Date.now(), retentionDays: number = USAGE_RETENTION_DAYS): number {
+    const cutoff = utcDayKey(now - retentionDays * 24 * 60 * 60_000);
+    const cursor = this.ctx.storage.sql.exec('DELETE FROM quota_usage WHERE day < ?', cutoff);
+    return cursor.rowsWritten;
   }
 
   // --- internals -------------------------------------------------------------
