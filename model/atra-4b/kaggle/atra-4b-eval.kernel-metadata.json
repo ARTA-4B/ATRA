@@ -1,0 +1,18 @@
+{
+  "id": "atra12/atra-4b-eval",
+  "title": "ATRA-4B eval",
+  "code_file": "atra-4b-eval.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "true",
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [
+    "atra12/atra-4b-adapter-v0"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

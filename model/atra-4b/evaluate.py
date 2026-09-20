@@ -91,15 +91,36 @@ class EndpointModel:
             if message.role != "assistant"
         ]
 
-        payload = json.dumps(
+        # The tools go with the prompt, in the same OpenAI shape train.py
+        # hands to apply_chat_template. Leaving them out was scoring the model
+        # on a prompt it had never seen: every training example carried the
+        # tool block, so a run without it measured how the model behaves when
+        # its tools have vanished — and then judged the answer against
+        # example.tools anyway, which is what `_score_tool_call` reads. Train
+        # and eval have to render the same prompt or the number means nothing.
+        tools = [
             {
-                "model": self.name,
-                "messages": messages,
-                "temperature": 0.0,
-                "max_tokens": 512,
-                "stream": False,
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                },
             }
-        ).encode("utf-8")
+            for tool in example.tools
+        ]
+
+        body: dict[str, Any] = {
+            "model": self.name,
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": 512,
+            "stream": False,
+        }
+        if tools:
+            body["tools"] = tools
+
+        payload = json.dumps(body).encode("utf-8")
 
         request = urllib.request.Request(
             f"{self.endpoint}/v1/chat/completions",
