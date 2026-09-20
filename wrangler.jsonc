@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "atra-web",
+  "compatibility_date": "2026-09-20",
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "single-page-application"
+  },
+  // The site is served from its own domain; a workers.dev subdomain would be a
+  // second public address for the same thing, on a hostname we do not control.
+  "workers_dev": false,
+  "account_id": "b89eab17d3f48d0e1c3414ca91c721dc",
+  // Custom Domains: Cloudflare provisions the DNS record and the certificate
+  // for each hostname. The apex and www both serve the same site.
+  "routes": [
+    { "pattern": "artallm.org", "custom_domain": true },
+    { "pattern": "www.artallm.org", "custom_domain": true }
+  ]
+}
