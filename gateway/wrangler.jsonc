@@ -25,11 +25,14 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-04-07",
   "compatibility_flags": ["nodejs_compat"],
-  "workers_dev": true,
-  "limits": {
-    "cpu_ms": 10,
-    "subrequests": 25,
-  },
+  // Off: this account has no workers.dev subdomain registered, and the
+  // gateway is reached at its own hostname. A second public address for a
+  // webhook endpoint is not something to publish by accident.
+  "workers_dev": false,
+  // No explicit "limits": the Free plan refuses cpu_ms ("CPU limits are not
+  // supported for the Free plan") and already enforces its own ceiling. Put
+  // this back on a paid plan, where a tight budget is a real guard rail:
+  //   "limits": { "cpu_ms": 10, "subrequests": 25 },
   "observability": {
     "enabled": true,
     "head_sampling_rate": 0.2,
@@ -104,8 +107,12 @@
     "production": {
       "vars": {
         "GATEWAY_ENV": "production",
-        "BOT_USERNAME": "",
+        "BOT_USERNAME": "artallm_bot",
       },
+      // The webhook needs a stable public URL. workers.dev is unavailable on
+      // this account (the subdomain was never registered), and a hostname we
+      // own is better anyway.
+      "routes": [{ "pattern": "gw.artallm.org", "custom_domain": true }],
       "durable_objects": {
         "bindings": [{ "name": "HUB", "class_name": "Hub" }],
       },
@@ -114,15 +121,18 @@
           "binding": "DB",
           "database_name": "atra-gateway-production",
           // Fill in from `wrangler d1 create atra-gateway-production`.
-          "database_id": "REPLACE_WITH_PRODUCTION_D1_ID",
+          "database_id": "c5f7dde8-18e3-4c9c-840b-302da9fb4d13",
           "migrations_dir": "migrations",
         },
       ],
-      // HUMAN STEP: `wrangler kv namespace create atra-gateway-production-market`
-      // and paste the id. Optional, see staging.
-      "kv_namespaces": [{ "binding": "KV", "id": "REPLACE_WITH_PRODUCTION_KV_ID" }],
-      // HUMAN STEP: see staging. Same dataset name; rows carry the env.
-      "analytics_engine_datasets": [{ "binding": "AE", "dataset": "atra_usage" }],
+      // No KV binding: the market cache falls back to the Cache API when KV is
+      // absent (src/cache.ts). Add one later with
+      // `wrangler kv namespace create atra-gateway-production-market` if a
+      // cache shared across colos is wanted.
+      // No Analytics Engine binding: it must be enabled on the account first,
+      // and usage.ts treats env.AE as optional, so its absence costs the
+      // per-install usage rows and nothing else. Enable it in the dashboard
+      // and restore this line to get them back.
       "ratelimits": [
         { "name": "RL_WEBHOOK", "namespace_id": "2001", "simple": { "limit": 20, "period": 60 } },
         { "name": "RL_WS", "namespace_id": "2002", "simple": { "limit": 10, "period": 60 } },
