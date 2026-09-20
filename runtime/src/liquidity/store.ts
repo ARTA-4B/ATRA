@@ -182,6 +182,30 @@ export interface LpRangeEventRecord {
   at: string;
 }
 
+/**
+ * The half of a range fill this store cannot work out for itself.
+ *
+ * Cost basis is this layer's own arithmetic and it releases the right amount
+ * unaided, but what the chain actually handed back and what the gas cost are
+ * facts only the executor that sent the transaction holds. They are demanded
+ * rather than defaulted to zero because a defaulted zero is the bug this type
+ * exists to prevent: an exit whose impermanent loss and gas are booked as
+ * nothing still passes `loss.daily`, and the next entry sails through the cap
+ * — which is precisely what migration 007 was written to stop for v2.
+ */
+export interface RangeRealizedInput {
+  tradeId?: string | null;
+  /**
+   * Micro-USD the burn returned, at the prices the fill used. Zero for a mint
+   * or an increase, which hand nothing back.
+   */
+  proceedsUsd: bigint;
+  /** Micro-USD of gas. Always a cost, never a credit. */
+  feeUsd: bigint;
+  /** Whether this was a simulated fill, as `lp_pnl.simulated` records it. */
+  simulated: boolean;
+}
+
 export interface OpenRangePositionInput {
   mode: Mode;
   chain: ChainId;
@@ -196,6 +220,13 @@ export interface OpenRangePositionInput {
   liquidity: string;
   /** Micro-USD paid in. */
   capitalUsd: bigint;
+  /**
+   * The token id this mint replaces, when it is the second half of a
+   * rebalance. Present makes the mint count against `maxRebalancePerDay` and
+   * books it as a REBALANCE; absent is an ordinary entry.
+   */
+  rebalancedFrom?: string;
+  realized: RangeRealizedInput;
   at: number;
 }
 
@@ -208,6 +239,7 @@ export interface AdjustRangePositionInput {
   liquidityDelta: bigint;
   /** Micro-USD paid in. Only an increase pays anything in. */
   capitalUsd?: bigint;
+  realized: RangeRealizedInput;
   at: number;
 }
 
@@ -216,6 +248,7 @@ export interface CloseRangePositionInput {
   chain: ChainId;
   protocol: string;
   tokenId: string;
+  realized: RangeRealizedInput;
   at: number;
 }
 
@@ -228,6 +261,8 @@ export interface RangeAdjustResult {
   /** Micro-USD of cost basis the burn released; zero for an increase. */
   costReleasedUsd: bigint;
   closed: boolean;
+  /** Micro-USD realized, as written to `lp_pnl`: proceeds less basis less gas. */
+  realizedPnlUsd: bigint;
 }
 
 /** What a cycle observed about a range position. Every field is dated by `at`. */
@@ -480,6 +515,11 @@ export class LiquidityStore {
    * burn can only under-report profit — because the difference between a v2
    * and a v3 position is what it is made of, not how it is paid for.
    *
+   * Every path that moves liquidity also writes the `lp_pnl` row for it, in
+   * the same transaction, from the `realized` block its caller must supply.
+   * That is not convenience: the daily-loss cap reads `lp_pnl` and nothing
+   * else, so a v3 exit booked without one is a loss the engine cannot see.
+   *
    * Nothing here builds, signs or values anything: an executor writes what it
    * already did, and a cycle writes what it already read.
    */
@@ -545,11 +585,15 @@ export class LiquidityStore {
    * adding to it: an ERC-721 is minted once, so a second open for the same id
    * is two rows' worth of capital claiming one position. Adding to a position
    * that exists is `adjustRangePosition`.
+   *
+   * `rebalancedFrom` names the position this one replaces, and is the only
+   * thing that makes a v3 rebalance countable; see `#countRangeRebalance`.
    */
   openRangePosition(input: OpenRangePositionInput): LpRangePositionRecord {
     const at = new Date(input.at).toISOString();
     const tokenId = canonicalTokenId(input.tokenId);
     const liquidity = amountToBigint(input.liquidity);
+    assertRealized(input.realized, false);
     if (liquidity <= 0n) {
       throw new AppError(
         ErrorCode.SCHEMA_INVALID,
@@ -572,6 +616,7 @@ export class LiquidityStore {
           details: { chain: input.chain, protocol: input.protocol, tokenId },
         });
       }
+      const replaced = this.#resolveRebalancedFrom(input, tokenId);
       this.#db
         .prepare(
           'INSERT INTO lp_range_positions (id, mode, chain, protocol, pool_id, token_id, token0,' +
@@ -600,9 +645,46 @@ export class LiquidityStore {
         );
       const position = this.getRangePosition(input.mode, input.chain, input.protocol, tokenId)!;
       this.#recordRangeEvent(position, 'ADD', liquidity, input.capitalUsd, at);
+      if (replaced) this.#countRangeRebalance(position, replaced, input.at, at);
+      // An entry realizes nothing but its gas, exactly as an opening swap
+      // realizes only its fee. A rebalance's gas belongs to the rebalance.
+      this.#recordRangePnl(position, replaced ? 'REBALANCE' : 'ADD', 0n, input.realized, input.at);
       return position;
     });
     return write();
+  }
+
+  /**
+   * The position a mint says it replaces, or nothing when it replaces none.
+   *
+   * Refuses a token id this ledger has never booked rather than recording a
+   * link that dangles: a burn the store did not book is a burn it cannot have
+   * released cost basis for, so an executor claiming one is an executor whose
+   * books are already wrong. It does not require the old position to be closed
+   * first — minting the new range before withdrawing the old one is a
+   * perfectly ordinary way round, and refusing it would push the executor into
+   * the ordering that leaves it out of the market for longer.
+   */
+  #resolveRebalancedFrom(
+    input: OpenRangePositionInput,
+    tokenId: string,
+  ): LpRangePositionRecord | undefined {
+    if (input.rebalancedFrom === undefined) return undefined;
+    const from = canonicalTokenId(input.rebalancedFrom);
+    if (from === tokenId) {
+      throw new AppError(
+        ErrorCode.SCHEMA_INVALID,
+        'A rebalance replaces one position with another, not with itself',
+        { details: { tokenId } },
+      );
+    }
+    const replaced = this.getRangePosition(input.mode, input.chain, input.protocol, from);
+    if (!replaced) {
+      throw new AppError(ErrorCode.CONFLICT, 'No range position to rebalance out of', {
+        details: { chain: input.chain, protocol: input.protocol, tokenId: from },
+      });
+    }
+    return replaced;
   }
 
   /**
@@ -639,6 +721,7 @@ export class LiquidityStore {
         'A decrease pays no capital in; it releases cost basis instead',
       );
     }
+    assertRealized(input.realized, delta < 0n);
 
     const write = this.#db.transaction(() => {
       const existing = this.getRangePosition(input.mode, input.chain, input.protocol, tokenId);
@@ -675,7 +758,14 @@ export class LiquidityStore {
 
       const position = this.getRangePosition(input.mode, input.chain, input.protocol, tokenId)!;
       this.#recordRangeEvent(position, action, delta, delta > 0n ? capital : -costReleased, at);
-      return { position, costReleasedUsd: costReleased, closed: remaining === 0n };
+      const realizedPnlUsd = this.#recordRangePnl(
+        position,
+        action,
+        costReleased,
+        input.realized,
+        input.at,
+      );
+      return { position, costReleasedUsd: costReleased, closed: remaining === 0n, realizedPnlUsd };
     });
     return write();
   }
@@ -702,6 +792,7 @@ export class LiquidityStore {
         protocol: input.protocol,
         tokenId,
         liquidityDelta: -held,
+        realized: input.realized,
         at: input.at,
       });
     });
@@ -811,6 +902,39 @@ export class LiquidityStore {
     );
   }
 
+  /**
+   * The `lp_pnl` row belonging to a range change this store has just applied.
+   *
+   * Private, and reached from every path that moves a range position's
+   * liquidity, so there is no arrangement of calls that books a v3 fill
+   * without one. The store fills in everything it knows from the row it has in
+   * hand — mode, chain, protocol, pool, which of ADD/REMOVE/EXIT this was, and
+   * the cost basis it just released — and the caller supplies only the two
+   * figures the chain told it. `recordPnl` is reached unchanged, which is what
+   * puts the figure in front of `loss.daily`.
+   */
+  #recordRangePnl(
+    position: LpRangePositionRecord,
+    action: LpRecordedAction,
+    costReleasedUsd: bigint,
+    realized: RangeRealizedInput,
+    at: number,
+  ): bigint {
+    return this.recordPnl({
+      tradeId: realized.tradeId ?? null,
+      mode: position.mode,
+      chain: position.chain,
+      protocol: position.protocol,
+      poolId: position.poolId,
+      action,
+      proceedsUsd: realized.proceedsUsd,
+      costReleasedUsd,
+      feeUsd: realized.feeUsd,
+      at,
+      simulated: realized.simulated,
+    });
+  }
+
   // --- realized P&L --------------------------------------------------------
 
   /**
@@ -883,7 +1007,113 @@ export class LiquidityStore {
       .run(mode, chain, poolId, dayStart, new Date(now).toISOString());
   }
 
-  /** The LP slice of the risk snapshot for one mode. */
+  /**
+   * v3 rebalances counted against one pool today. The sibling of
+   * `rebalancesToday`, and deliberately a second figure rather than an
+   * addition to the first: `lp_rebalances` goes on meaning exactly what it has
+   * always meant, and the two are added in `toRiskSnapshot`, which is the one
+   * place the engine reads.
+   */
+  rangeRebalancesToday(
+    mode: Mode,
+    chain: ChainId,
+    poolId: string,
+    now: number = this.#now(),
+  ): number {
+    const dayStart = Math.floor(now / 86_400_000) * 86_400_000;
+    const row = this.#db
+      .prepare<[Mode, string, string, number], { count: number }>(
+        'SELECT COUNT(*) AS count FROM lp_range_rebalances WHERE mode = ? AND chain = ?' +
+          ' AND pool_id = ? AND day_start_utc_ms = ?',
+      )
+      .get(mode, chain, poolId, dayStart);
+    return row?.count ?? 0;
+  }
+
+  /**
+   * Record the mint half of a v3 rebalance, which is the whole of it.
+   *
+   * A v3 position cannot be moved: its tick range is fixed at mint, so a
+   * rebalance burns one tokenId and mints another — one operator decision
+   * expressed as two transactions against two positions. Counting both halves
+   * would halve `maxRebalancePerDay` without ever telling the operator their
+   * limit had changed. Counting the burn would charge a rebalance to a run
+   * that burned and then failed to mint, leaving the operator out of the
+   * market *and* out of a rebalance they never got. So the pair counts once,
+   * at the mint, where the new exposure appears — which is also where v2
+   * counts it, `bookAdd({ rebalance: true })`, so a pool's daily figure means
+   * the same thing whichever family of position it holds.
+   *
+   * It lands on the *new* position's pool, so a rebalance into another fee
+   * tier counts against the pool the operator now stands in.
+   */
+  #countRangeRebalance(
+    opened: LpRangePositionRecord,
+    replaced: LpRangePositionRecord,
+    now: number,
+    at: string,
+  ): void {
+    const dayStart = Math.floor(now / 86_400_000) * 86_400_000;
+    this.#db
+      .prepare(
+        'INSERT INTO lp_range_rebalances (id, mode, chain, protocol, pool_id, closed_token_id,' +
+          ' opened_token_id, closed_position_id, opened_position_id, day_start_utc_ms, at)' +
+          ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(
+        randomUUID(),
+        opened.mode,
+        opened.chain,
+        opened.protocol,
+        opened.poolId,
+        replaced.tokenId,
+        opened.tokenId,
+        replaced.id,
+        opened.id,
+        dayStart,
+        at,
+      );
+    this.#log.debug(
+      { tokenId: opened.tokenId, replaced: replaced.tokenId, poolId: opened.poolId },
+      'range rebalance counted',
+    );
+  }
+
+  /**
+   * Today's v3 rebalances per pool, read from the rows rather than from the
+   * positions: a range that was rebalanced and then exited on the same day is
+   * still a rebalance that happened, and counting off the open positions would
+   * let a pool's figure fall back to zero the moment it holds nothing.
+   */
+  #rangeRebalanceCountsToday(mode: Mode, now: number): RangeRebalanceCountRow[] {
+    const dayStart = Math.floor(now / 86_400_000) * 86_400_000;
+    return this.#db
+      .prepare<[Mode, number], RangeRebalanceCountRow>(
+        'SELECT chain, pool_id, COUNT(*) AS count FROM lp_range_rebalances' +
+          ' WHERE mode = ? AND day_start_utc_ms = ? GROUP BY chain, pool_id',
+      )
+      .all(mode, dayStart);
+  }
+
+  /**
+   * The LP slice of the risk snapshot for one mode.
+   *
+   * Both families' capital, because `deployed.total` is a cap on the
+   * operator's money and money in a range position is money at risk. A
+   * snapshot that reported `lp_positions` alone would let a v3 book breach
+   * `maxTotalDeployedUsd` by the whole of its own size without anything
+   * noticing.
+   *
+   * `positions` stays v2-only on purpose, and that is not an oversight. The
+   * engine reads `lpTokens` out of it to judge a burn against what is held,
+   * and a range position has no LP tokens — its size is liquidity, in units no
+   * v2 burn is denominated in — while several of them share one pool key, so
+   * there is no single entry that could honestly stand for them. A row written
+   * there would make `lp.position` compare a v2 exit against v3 liquidity. The
+   * consequence is that the per-pool cap, `lp.maxCapitalPerLpUsd`, still sees
+   * only v2; closing that needs a v3-shaped field on `LpSnapshot`, which is
+   * the risk engine's vocabulary to extend, not this store's.
+   */
   toRiskSnapshot(mode: Mode, now: number = this.#now()): LpSnapshot {
     const positions: LpSnapshot['positions'] = {};
     const rebalancesToday: Record<string, number> = {};
@@ -894,6 +1124,18 @@ export class LiquidityStore {
       deployed += usdToMicros(position.capitalUsd);
       const count = this.rebalancesToday(mode, position.chain, position.poolId, now);
       if (count > 0) rebalancesToday[key] = count;
+    }
+    // Open positions only: a closed one released its whole basis on the way
+    // out and is carrying nothing to deploy.
+    for (const range of this.listRangePositions(mode)) {
+      deployed += range.capitalUsd;
+    }
+    // Added to the v2 figure rather than maxed with it: a v2 rebalance and a
+    // v3 rebalance in one pool on one day are two rebalances, and a limit that
+    // took the larger of the two would let a mixed book have both.
+    for (const row of this.#rangeRebalanceCountsToday(mode, now)) {
+      const key = lpPoolKey(row.chain, row.pool_id);
+      rebalancesToday[key] = (rebalancesToday[key] ?? 0) + row.count;
     }
     return { deployedUsd: microsToUsd(deployed), rebalancesToday, positions };
   }
@@ -1072,6 +1314,12 @@ interface RangeEventRow {
   at: string;
 }
 
+interface RangeRebalanceCountRow {
+  chain: ChainId;
+  pool_id: string;
+  count: number;
+}
+
 interface ActionRow {
   id: string;
   cycle_id: string;
@@ -1198,6 +1446,30 @@ function canonicalTokenId(tokenId: string): string {
       cause,
       details: { tokenId },
     });
+  }
+}
+
+/**
+ * Check a realized block before anything is written against it.
+ *
+ * `proceedsAllowed` is false on a mint and on an increase, which hand nothing
+ * back. Refusing proceeds there rather than ignoring them is the mirror of the
+ * refusal a decrease gets for carrying capital: both mean the caller has
+ * confused what it paid with what it got, and a figure booked under the wrong
+ * heading is a wrong daily loss, not a harmless one.
+ */
+function assertRealized(realized: RangeRealizedInput, proceedsAllowed: boolean): void {
+  if (realized.feeUsd < 0n) {
+    throw new AppError(ErrorCode.SCHEMA_INVALID, 'Gas is a cost; it cannot be negative');
+  }
+  if (realized.proceedsUsd < 0n) {
+    throw new AppError(ErrorCode.SCHEMA_INVALID, 'A burn cannot return a negative amount');
+  }
+  if (!proceedsAllowed && realized.proceedsUsd !== 0n) {
+    throw new AppError(
+      ErrorCode.SCHEMA_INVALID,
+      'Adding liquidity returns no proceeds; it pays capital in',
+    );
   }
 }
 

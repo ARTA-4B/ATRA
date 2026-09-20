@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { closeDatabase, openDatabase } from '../src/db/database.js';
 import type { Db } from '../src/db/database.js';
 import { LiquidityStore } from '../src/liquidity/store.js';
-import type { OpenRangePositionInput } from '../src/liquidity/store.js';
+import type { OpenRangePositionInput, RangeRealizedInput } from '../src/liquidity/store.js';
 import { BASE_USDC, BASE_WETH, NOW } from './helpers/risk-fixtures.js';
 
 /**
@@ -31,6 +31,13 @@ const AT = new Date(NOW).toISOString();
 const LIQUIDITY = 3_000_000_000_000_000_000n;
 const CAPITAL = 10_000_000n; // 10 USD
 
+/**
+ * A free fill that returned nothing. The cost-basis assertions below are about
+ * what the store computes for itself, so the figures only the executor knows
+ * are held at zero here and exercised in range-risk.test.ts instead.
+ */
+const FREE: RangeRealizedInput = { proceedsUsd: 0n, feeUsd: 0n, simulated: true };
+
 function openInput(overrides: Partial<OpenRangePositionInput> = {}): OpenRangePositionInput {
   return {
     mode: 'PAPER',
@@ -45,6 +52,7 @@ function openInput(overrides: Partial<OpenRangePositionInput> = {}): OpenRangePo
     tickUpper: -199_000,
     liquidity: LIQUIDITY.toString(),
     capitalUsd: CAPITAL,
+    realized: FREE,
     at: NOW,
     ...overrides,
   };
@@ -146,6 +154,7 @@ describe('LiquidityStore range positions', () => {
       tokenId: TOKEN_ID,
       liquidityDelta: 1_000_000_000_000_000_000n,
       capitalUsd: 5_000_000n,
+      realized: FREE,
       at: NOW,
     });
 
@@ -175,6 +184,7 @@ describe('LiquidityStore range positions', () => {
       protocol: PROTOCOL,
       tokenId: TOKEN_ID,
       liquidityDelta: -1_000_000_000_000_000_000n,
+      realized: FREE,
       at: NOW,
     });
 
@@ -205,6 +215,7 @@ describe('LiquidityStore range positions', () => {
       protocol: PROTOCOL,
       tokenId: TOKEN_ID,
       liquidityDelta: -1_000_000_000_000_000_000n,
+      realized: FREE,
       at: NOW,
     });
     const closed = store.closeRangePosition({
@@ -212,6 +223,7 @@ describe('LiquidityStore range positions', () => {
       chain: 'base',
       protocol: PROTOCOL,
       tokenId: TOKEN_ID,
+      realized: FREE,
       at: NOW,
     });
 
@@ -242,6 +254,7 @@ describe('LiquidityStore range positions', () => {
       chain: 'base',
       protocol: PROTOCOL,
       tokenId: TOKEN_ID,
+      realized: FREE,
       at: NOW,
     } as const;
 
@@ -278,6 +291,7 @@ describe('LiquidityStore range positions', () => {
         chain: 'base',
         protocol: PROTOCOL,
         tokenId: TOKEN_ID,
+        realized: FREE,
         at: NOW,
       });
     expect(close().costReleasedUsd).toBe(CAPITAL);
@@ -292,6 +306,7 @@ describe('LiquidityStore range positions', () => {
       chain: 'base',
       protocol: PROTOCOL,
       tokenId: TOKEN_ID,
+      realized: FREE,
       at: NOW,
     });
 
@@ -304,6 +319,7 @@ describe('LiquidityStore range positions', () => {
       tokenId: TOKEN_ID,
       liquidityDelta: LIQUIDITY,
       capitalUsd: 4_000_000n,
+      realized: FREE,
       at: NOW,
     });
 
@@ -343,6 +359,7 @@ describe('LiquidityStore range positions', () => {
       chain: 'base',
       protocol: PROTOCOL,
       tokenId: '2',
+      realized: FREE,
       at: NOW,
     });
 
@@ -375,6 +392,7 @@ describe('LiquidityStore range positions', () => {
       chain: 'base',
       protocol: PROTOCOL,
       tokenId: TOKEN_ID,
+      realized: FREE,
       at: NOW,
     });
     expect(store.getRangePosition('LIVE', 'base', PROTOCOL, TOKEN_ID)).toMatchObject({
@@ -473,12 +491,21 @@ describe('LiquidityStore range positions', () => {
     expect(store.listRangePositions('PAPER').map((p) => p.tokenId)).toEqual([TOKEN_ID]);
     expect(store.getPosition('PAPER', 'base', PROTOCOL, POOL)?.capitalUsd).toBe('100.000000');
 
+    // Two rows, one pool key, one figure: the snapshot adds both families'
+    // capital without either row learning about the other.
+    expect(store.toRiskSnapshot('PAPER').deployedUsd).toBe('110.000000');
+    expect(store.toRiskSnapshot('PAPER').positions[`base:${POOL}`]).toEqual({
+      lpTokens: '1000000000000000000',
+      capitalUsd: '100.000000',
+    });
+
     // Closing the range position leaves the v2 row exactly as it was.
     store.closeRangePosition({
       mode: 'PAPER',
       chain: 'base',
       protocol: PROTOCOL,
       tokenId: TOKEN_ID,
+      realized: FREE,
       at: NOW,
     });
     expect(store.getPosition('PAPER', 'base', PROTOCOL, POOL)).toMatchObject({
@@ -487,6 +514,8 @@ describe('LiquidityStore range positions', () => {
       lastAction: 'ADD',
     });
     expect(store.listPositions('PAPER')).toHaveLength(1);
+    // The range capital left with the range position; the v2 figure did not move.
+    expect(store.toRiskSnapshot('PAPER').deployedUsd).toBe('100.000000');
 
     // And burning the v2 position out entirely leaves the range row alone.
     const burned = store.bookRemove({
@@ -506,8 +535,11 @@ describe('LiquidityStore range positions', () => {
     });
     expect(store.listRangePositions('PAPER', { includeClosed: true })).toHaveLength(1);
 
-    // The v2 risk snapshot never saw any of it: a range position's capital is
-    // not deployed capital until something wires it in deliberately.
-    expect(store.toRiskSnapshot('PAPER').deployedUsd).toBe('0.000000');
+    // Nothing open on either side, so nothing deployed on either side.
+    expect(store.toRiskSnapshot('PAPER')).toEqual({
+      deployedUsd: '0.000000',
+      rebalancesToday: {},
+      positions: {},
+    });
   });
 });
