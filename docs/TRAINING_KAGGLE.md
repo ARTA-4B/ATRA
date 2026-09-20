@@ -43,6 +43,16 @@ them. The base model is Apache-2.0 and downloads anonymously from Hugging Face.
 > dtypes it actually observes, and it picks the `dtype` / `torch_dtype`
 > keyword from the installed transformers' signature instead of assuming.
 >
+> Run 5 printed `trainable dtype: torch.float32` and failed with the same
+> bfloat16 unscale error, which rules the parameters out too: mixed precision
+> is owned by **accelerate**, not by `SFTConfig`, so autocast can run in a
+> dtype the Trainer's scaler was not built for. `train.py` now decides the AMP
+> mode once, exports it as `ACCELERATE_MIXED_PRECISION`, prints it, and takes
+> an `ATRA_AMP` override (`fp16` / `bf16` / `off`). The notebook runs `off`:
+> plain float32 with no scaler and no autocast, which cannot disagree with
+> itself. It is slower, and the 4-bit matmuls still run in float16 inside
+> bitsandbytes.
+>
 > Training itself is still unproven. Do not edit the UNTRAINED label until a
 > run completes **and** `evaluate.py` passes.
 

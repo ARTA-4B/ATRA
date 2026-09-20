@@ -314,7 +314,9 @@ def main() -> int:
             parameter.data = parameter.data.to(torch.float32)
 
     observed = sorted({str(p.dtype) for p in model.parameters() if p.requires_grad})
+    frozen = sorted({str(p.dtype) for p in model.parameters() if not p.requires_grad})
     print(f"trainable dtype: {', '.join(observed)}")
+    print(f"frozen dtype   : {', '.join(frozen)}")
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -326,6 +328,34 @@ def main() -> int:
 
     output_dir = args.output
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Accelerate, not the Trainer, owns mixed precision.
+    #
+    # `SFTConfig(fp16=...)` only asks; if an accelerate default config or an
+    # environment variable says otherwise, autocast runs in that dtype while
+    # the Trainer still builds an fp16 GradScaler — and the scaler then meets
+    # bfloat16 gradients:
+    #   "_amp_foreach_non_finite_check_and_unscale_cuda" not implemented for 'BFloat16'
+    # That error survived loading the model in float16 (run 4) and casting
+    # every trainable parameter to float32 (run 5) on Kaggle, 2026-09-20,
+    # which leaves the autocast dtype as the only remaining source.
+    #
+    # ATRA_AMP forces the answer: fp16, bf16, or off (plain float32, no
+    # scaler, no autocast — slower, but it cannot disagree with itself).
+    amp_mode = os.environ.get("ATRA_AMP", "auto").lower()
+    if amp_mode == "auto":
+        amp_mode = ("bf16" if supports_bf16(torch) else "fp16") if use_cuda else "off"
+    if amp_mode not in {"fp16", "bf16", "off"}:
+        raise SystemExit(f"ATRA_AMP must be fp16, bf16 or off (got {amp_mode!r})")
+    os.environ["ACCELERATE_MIXED_PRECISION"] = "no" if amp_mode == "off" else amp_mode
+    print(f"amp            : {amp_mode}")
+
+    try:
+        from accelerate.state import AcceleratorState
+
+        AcceleratorState._reset_state()
+    except Exception as error:  # noqa: BLE001 - diagnostics only
+        print(f"accelerate state not reset ({error})")
 
     sft_config = SFTConfig(
         output_dir=str(output_dir),
@@ -347,8 +377,8 @@ def main() -> int:
         max_length=seq_length,
         seed=seed,
         report_to=[],
-        bf16=use_cuda and supports_bf16(torch),
-        fp16=use_cuda and not supports_bf16(torch),
+        bf16=amp_mode == "bf16",
+        fp16=amp_mode == "fp16",
         optim=str(resolve(config, "training", "optimizer", default="paged_adamw_8bit"))
         if use_cuda
         else "adamw_torch",
