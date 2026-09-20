@@ -73,7 +73,22 @@ current stylesheet.
 - Status semantics: a `Blocked` badge stays negative, `Hold` stays warning, `Simulated` stays accent-soft, `Completed`/`Executed` positive.
 - Accessibility: every text/background pair above is ≥ 4.5:1 in both themes (`--muted` `#64748B` on `--bg` `#F3F7FB` is 4.6:1; `#8A9BB5` on `#0B1220` is 6.3:1).
 
-## 6. Acceptance
+## 6. Dark theme
+
+Both palettes ship in `src/styles.css`: the light tokens on `:root`, the dark
+tokens under `:root[data-theme="dark"]` and, for a page without JavaScript,
+under `@media (prefers-color-scheme: dark)` guarded by `:root:not([data-theme="light"])`.
+`index.html` sets `data-theme` before first paint from `localStorage`
+(`atra.theme`, `light` or `dark`) or the system preference, so there is no
+flash. `ThemeToggle` in `src/components.tsx` flips it and stores the choice;
+while nothing is stored, the page follows the system setting live.
+
+Only two things change with the theme besides the tokens: the heron (a CSS
+`invert(1)` on the engraving, which is black ink on transparency) and the
+Robinhood feather, which switches between Robinhood's own black and white
+files (`docs/brand/THIRD_PARTY_MARKS.md`). No other mark is recoloured.
+
+## 7. Acceptance
 
 Take the same screenshots as `artifacts/desktop--app-*.png` and
 `mobile--app-*.png` and check: no lime or green anywhere except the positive status; one accent; all badges read

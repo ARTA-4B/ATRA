@@ -20,6 +20,9 @@ acting is rare and deliberate. The bird is the behaviour.
 | `../../public/brand/heron.png` | the same engraving at 320 px for the web app's logo |
 | `../../public/favicon.png`, `apple-touch-icon.png`, `brand/icon-512.png` | the heron on white at icon sizes |
 
+The network and token logos in the interface (`public/logos/`) are not ours:
+`THIRD_PARTY_MARKS.md` records where each file came from and the terms.
+
 Regenerate the rendered files with `node docs/brand/render.mjs` from the
 repository root (uses the repository's Playwright Chromium). Sources are in
 `src/`.

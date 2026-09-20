@@ -1,12 +1,36 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { ArrowUpRight, Check, ChevronRight, Copy, Database, LoaderCircle, TriangleAlert, X } from 'lucide-react';
+import { ArrowUpRight, Check, ChevronRight, Copy, Database, LoaderCircle, Moon, Sun, TriangleAlert, X } from 'lucide-react';
 import { chains } from './data/services';
 import type { Chain, DataState } from './data/services';
 
 export function Logo({ small = false }: { small?: boolean }) { return <a className={`logo ${small ? 'small' : ''}`} href="#/" aria-label="ATRA home"><img src="/brand/heron.png" alt="" width="26" height="38" decoding="async"/><span>ATRA</span></a>; }
 export function Badge({ children, tone = '' }: { children: ReactNode; tone?: string }) { return <span className={`badge ${tone}`}>{children}</span>; }
-export function ChainMark({ chain }: { chain: string }) { return <span className={`chain-mark ${chain === 'Base' ? 'base' : chain === 'Solana' ? 'solana' : chain === 'BNB Smart Chain' ? 'bnb' : 'robinhood'}`} aria-hidden="true">{chain === 'Base' ? '—' : chain === 'Solana' ? '≋' : chain === 'BNB Smart Chain' ? '◇' : '↗'}</span>; }
+/** The networks' own marks (see docs/brand/THIRD_PARTY_MARKS.md); Robinhood publishes a black and a white feather, so both ship and CSS picks one per theme. */
+const CHAIN_LOGO: Record<string, { src: string; dark?: string; slug: string }> = {
+  'Base': { src: '/logos/base.svg', slug: 'base' },
+  'BNB Smart Chain': { src: '/logos/bnb.svg', slug: 'bnb' },
+  'Solana': { src: '/logos/solana.svg', slug: 'solana' },
+  'Robinhood Chain': { src: '/logos/robinhood.svg', dark: '/logos/robinhood-white.svg', slug: 'robinhood' },
+};
+const TOKEN_LOGO: Record<string, string> = { ETH: '/logos/eth.svg', WETH: '/logos/eth.svg', SOL: '/logos/solana.svg', BNB: '/logos/bnb.svg', WBNB: '/logos/bnb.svg', USDC: '/logos/usdc.svg' };
+export function tokenLogo(symbol: string): string | undefined { return TOKEN_LOGO[symbol.toUpperCase()]; }
+export function ChainMark({ chain }: { chain: string }) { const logo = CHAIN_LOGO[chain]; if (!logo) return <span className="chain-mark" aria-hidden="true"/>; return <span className={`chain-mark ${logo.slug}`} aria-hidden="true"><img className={logo.dark ? 'light-only' : ''} src={logo.src} alt="" width="19" height="19" decoding="async"/>{logo.dark && <img className="dark-only" src={logo.dark} alt="" width="19" height="19" decoding="async"/>}</span>; }
+export function TokenMark({ symbol }: { symbol: string }) { const src = tokenLogo(symbol); return <span className="asset-icon" aria-hidden="true">{src ? <img src={src} alt="" width="29" height="29" decoding="async"/> : symbol.slice(0, 1)}</span>; }
+
+/** Light / dark theme. The choice is per browser (localStorage) and defaults to the system setting; index.html applies it before first paint so there is no flash. */
+export type Theme = 'light' | 'dark';
+const THEME_KEY = 'atra.theme';
+function systemTheme(): Theme { return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; }
+export function readTheme(): Theme { try { const stored = localStorage.getItem(THEME_KEY); if (stored === 'light' || stored === 'dark') return stored; } catch { /* storage blocked: follow the system */ } return systemTheme(); }
+export function applyTheme(theme: Theme) { document.documentElement.dataset.theme = theme; document.querySelector('meta[name="theme-color"]')?.setAttribute('content', theme === 'dark' ? '#0b1220' : '#f3f7fb'); }
+export function ThemeToggle() {
+  const [theme, setTheme] = useState<Theme>(() => readTheme());
+  useEffect(() => { applyTheme(theme); }, [theme]);
+  useEffect(() => { const mq = window.matchMedia('(prefers-color-scheme: dark)'); const follow = () => { try { if (localStorage.getItem(THEME_KEY)) return; } catch { /* fall through */ } setTheme(mq.matches ? 'dark' : 'light'); }; mq.addEventListener('change', follow); return () => mq.removeEventListener('change', follow); }, []);
+  const next: Theme = theme === 'dark' ? 'light' : 'dark';
+  return <button type="button" className="icon-button theme-toggle" aria-label={`Switch to ${next} mode`} title={`Switch to ${next} mode`} onClick={() => { try { localStorage.setItem(THEME_KEY, next); } catch { /* not persisted */ } setTheme(next); }}>{theme === 'dark' ? <Sun size={17}/> : <Moon size={17}/>}</button>;
+}
 export function ChainBadge({ chain }: { chain: string }) { return <span className="chain-label"><ChainMark chain={chain}/>{chain}</span>; }
 export function Button({ children, onClick, variant = '', disabled = false, type = 'button', className = '' }: { children: ReactNode; onClick?: () => void; variant?: string; disabled?: boolean; type?: 'button' | 'submit'; className?: string }) { return <button type={type} className={`button ${variant} ${className}`} onClick={onClick} disabled={disabled}>{children}</button>; }
 export function Panel({ title, eyebrow, action, children, className = '' }: { title?: string; eyebrow?: string; action?: ReactNode; children: ReactNode; className?: string }) { return <section className={`panel ${className}`}>{title && <div className="panel-head"><div>{eyebrow && <span className="eyebrow">{eyebrow}</span>}<h3>{title}</h3></div>{action}</div>}{children}</section>; }
