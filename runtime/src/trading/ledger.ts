@@ -392,14 +392,23 @@ export class LedgerService {
 
   // --- P&L -----------------------------------------------------------------
 
-  /** Realized P&L for the UTC day containing `now`, fees included. */
+  /**
+   * Realized P&L for the UTC day containing `now`, fees included.
+   *
+   * Swaps and LP actions are summed together. An LP add or burn is not a swap
+   * and has no row in `fills` — it is written to `lp_pnl` by the LP executors
+   * instead — but its impermanent loss and its gas are money lost today just
+   * the same, and the daily-loss check reads this number.
+   */
   realizedPnlTodayUsd(mode: Mode, now: number = this.#now()): bigint {
     const dayStart = new Date(Math.floor(now / 86_400_000) * 86_400_000).toISOString();
     const rows = this.#db
-      .prepare<[Mode, string], { realized_pnl_usd: string }>(
-        'SELECT realized_pnl_usd FROM fills WHERE mode = ? AND filled_at >= ?',
+      .prepare<[Mode, string, Mode, string], { realized_pnl_usd: string }>(
+        'SELECT realized_pnl_usd FROM fills WHERE mode = ? AND filled_at >= ?' +
+          ' UNION ALL' +
+          ' SELECT realized_pnl_usd FROM lp_pnl WHERE mode = ? AND at >= ?',
       )
-      .all(mode, dayStart);
+      .all(mode, dayStart, mode, dayStart);
 
     return rows.reduce((total, row) => total + usdToMicros(row.realized_pnl_usd), 0n);
   }

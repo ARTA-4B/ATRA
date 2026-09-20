@@ -8,7 +8,7 @@ import type { Services } from '../src/core/services.js';
 import type { ChainId } from '../src/chains/registry.js';
 import { CHAINS, EVM_NATIVE_SENTINEL } from '../src/chains/registry.js';
 import type { ChainAdapter, SignedTransaction, SigningContext } from '../src/chains/types.js';
-import type { UnsignedTransaction } from '../src/execution/types.js';
+import type { SimulationResult, UnsignedTransaction } from '../src/execution/types.js';
 import type { LlmProvider, LlmRequest, LlmResponse } from '../src/llm/provider.js';
 import type { MarketDataProvider, MarketSnapshot } from '../src/market/types.js';
 import type { FeeDetail, ProposedAction } from '../src/risk/types.js';
@@ -204,6 +204,8 @@ interface FakeLpOptions {
   allowance?: bigint;
   /** Whether broadcast mutates the pool as a real fill would. */
   settle?: boolean;
+  /** Make every simulation revert with this message, as a moved pool would. */
+  simulationError?: string;
 }
 
 interface Prepared {
@@ -222,7 +224,12 @@ class FakeLpAdapter implements LpAdapter {
   readonly pool: FakePool;
   readonly broadcasts: SignedTransaction[] = [];
   readonly signingContexts: SigningContext[] = [];
+  readonly simulations: UnsignedTransaction[] = [];
+  /** Every simulate/prepare/broadcast, in order, so the executor's order is testable. */
+  readonly calls: string[] = [];
   readonly receipts = new Map<string, LpReceipt>();
+  /** Park a cycle inside its first chain read, for the cycle-lock tests. */
+  beforeReadPool: (() => Promise<void>) | null = null;
   #options: FakeLpOptions;
   #lastPrepared: Prepared | null = null;
 
@@ -265,11 +272,12 @@ class FakeLpAdapter implements LpAdapter {
     };
   }
 
-  readPool(poolId: string): Promise<LpPoolState> {
+  async readPool(poolId: string): Promise<LpPoolState> {
+    if (this.beforeReadPool) await this.beforeReadPool();
     if (poolId.toLowerCase() !== POOL) {
-      return Promise.reject(new Error(`${poolId} is not a pool according to the factory`));
+      throw new Error(`${poolId} is not a pool according to the factory`);
     }
-    return Promise.resolve(this.#state());
+    return this.#state();
   }
 
   async readPosition(owner: string, poolId: string): Promise<LpPositionState> {
@@ -415,7 +423,26 @@ class FakeLpAdapter implements LpAdapter {
     return Promise.resolve(this.#fee(60_000n));
   }
 
+  /**
+   * The executor asks for this structurally (LpAdapter does not declare it),
+   * so the double offers it exactly as V2PoolLpAdapter does: the transaction
+   * that was built, answered from the same payload that will be signed.
+   */
+  simulate(tx: UnsignedTransaction): Promise<SimulationResult> {
+    this.calls.push('simulate');
+    this.simulations.push(tx);
+    const error = this.#options.simulationError ?? null;
+    return Promise.resolve({
+      ok: error === null,
+      amountOut: null,
+      unitsUsed: error === null ? Number((tx.payload as { gasLimit: string }).gasLimit) : null,
+      error,
+      simulatedAt: Date.now(),
+    });
+  }
+
   prepareSigning(tx: UnsignedTransaction, from: string): Promise<SigningContext> {
+    this.calls.push('prepare');
     const payload = tx.payload as {
       to: string;
       data: string;
@@ -440,6 +467,7 @@ class FakeLpAdapter implements LpAdapter {
   }
 
   broadcast(signed: SignedTransaction): Promise<void> {
+    this.calls.push('broadcast');
     this.broadcasts.push(signed);
     const prepared = this.#lastPrepared;
     const received: Record<string, string> = {};
@@ -619,6 +647,10 @@ async function harness(options: {
     registry: new LiquidityRegistry([lp]),
     sleep: () => Promise.resolve(),
   });
+  // The composition root shares one cycle lock between the trade pipeline and
+  // the liquidity pipeline; this harness builds its own LiquidityService over
+  // the fake adapter, so it repeats that wiring rather than losing it.
+  liquidity.pipeline.shareLock(services.lock);
   services.state.onEmergencyStop((active, reason) => {
     liquidity.onEmergencyStop(active, reason);
   });
@@ -1128,6 +1160,82 @@ describe('Phase 4: LP pipeline (PAPER)', () => {
     expect(Number(record.feeUsd)).toBeGreaterThan(0);
   });
 
+  it('counts LP impermanent loss and gas in the day, so the next add meets the cap', async () => {
+    h = await harness({
+      model: [
+        decide('ADD_LIQUIDITY', '20'),
+        decide('REMOVE_LIQUIDITY'),
+        decide('EXIT'),
+        decide('ADD_LIQUIDITY', '20'),
+      ],
+      // Pacing off, so the last cycle is judged on the day's loss alone.
+      policy: { maxDailyLossUsd: '10', cooldownSeconds: 0, globalMinIntervalSeconds: 0 },
+    });
+    seedPaper(h);
+    expect((await run(h)).outcome).toBe('filled');
+
+    // The pool loses 60% of its depth at an unchanged price: the 0.2 LP that
+    // 20 USD bought is now a share worth 8.
+    h.lp.pool.reserve0 = 400n * 10n ** 18n;
+    h.lp.pool.reserve1 = 1_000_000n * 10n ** 6n;
+
+    expect((await run(h)).outcome).toBe('filled');
+    expect((await run(h)).outcome).toBe('filled');
+    expect(h.liquidity.store.listPositions('PAPER')).toHaveLength(0);
+
+    // Twice 4 USD returned against a 10 USD basis is 12 of impermanent loss,
+    // plus 0.65 of gas on the add and 0.55 on each exit.
+    expect(h.services.ledger.realizedPnlTodayUsd('PAPER')).toBe(-13_750_000n);
+    expect(h.services.ledger.toRiskLedger('PAPER', priceLookup).realizedPnlTodayUsd).toBe(
+      '-13.750000',
+    );
+
+    // Which is the figure the engine reads: 13.75 lost is past a 10 USD cap,
+    // so the next add is refused rather than waved through on "today 0".
+    const blocked = await run(h);
+    expect(blocked.outcome).toBe('rejected');
+    expect(blocked.risk?.code).toBe('DAILY_LOSS_BREACHED');
+    expect(h.liquidity.store.listPositions('PAPER')).toHaveLength(0);
+  });
+
+  it('rolls back a paper add that overdraws the second asset', async () => {
+    h = await harness({ model: [decide('HOLD')] });
+    // Enough WETH for the first debit; the second wants 10 USDC and finds 1.
+    h.services.ledger.setPaperBalance('base', WETH, 18, (10n ** 18n).toString());
+    h.services.ledger.setPaperBalance('base', USDC, 6, '1000000');
+
+    const action = lpAction(h, 'lp_add');
+    const decision = h.services.gate.preview(action, lpSnapshot(h), priceLookup);
+    expect(decision.allowed).toBe(true);
+    const trade = h.services.trades.propose(action, 'open');
+    h.services.trades.decide(trade.id, decision);
+
+    const quote = await h.lp.quoteAdd({
+      poolId: POOL,
+      amount0Desired: '4000000000000000',
+      amount1Desired: '10000000',
+      slippageBps: 50,
+      from: h.services.wallets.depositAddress('base'),
+    });
+    const outcome = h.liquidity.paper.execute(
+      trade.id,
+      action,
+      { kind: 'add', quote },
+      await h.lp.readPool(POOL),
+      { token0Usd: '2500', token1Usd: '1', nativeUsd: '2500' },
+    );
+
+    expect(outcome.status).toBe('failed');
+    expect(outcome.error).toMatch(/negative/);
+    // The first debit goes back with the rest: no assets spent, no position,
+    // nothing realized.
+    expect(h.services.ledger.getPaperBalance('base', WETH)?.amount).toBe((10n ** 18n).toString());
+    expect(h.services.ledger.getPaperBalance('base', USDC)?.amount).toBe('1000000');
+    expect(h.liquidity.store.listPositions('PAPER')).toEqual([]);
+    expect(h.services.ledger.realizedPnlTodayUsd('PAPER')).toBe(0n);
+    expect(h.services.trades.get(trade.id)?.status).toBe('failed');
+  });
+
   it('REMOVE_LIQUIDITY on paper takes half and keeps the rest', async () => {
     h = await harness({ model: [decide('ADD_LIQUIDITY', '20'), decide('REMOVE_LIQUIDITY')] });
     seedPaper(h);
@@ -1225,6 +1333,11 @@ describe('Phase 4: LIVE LP executor', () => {
     expect(report.execution?.txHash).toMatch(/^0x[0-9a-f]{64}$/);
     expect(h.lp.broadcasts).toHaveLength(1);
 
+    // Built, then simulated, then signed — and what was simulated is the
+    // transaction that was signed, not a second one built for the occasion.
+    expect(h.lp.calls).toEqual(['simulate', 'prepare', 'broadcast']);
+    expect(h.lp.simulations[0]?.summary).toBe('fake addLiquidity');
+
     const trade = h.services.trades.get(report.trade!.tradeId)!;
     expect(trade.kind).toBe('lp_add');
     expect(trade.status).toBe('filled');
@@ -1251,6 +1364,34 @@ describe('Phase 4: LIVE LP executor', () => {
     expect(actions.indexOf('liquidity.signed')).toBeGreaterThan(
       actions.indexOf('liquidity.filled'),
     );
+  });
+
+  it('never signs an ADD whose simulation reverts', async () => {
+    h = await harness({
+      model: [decide('ADD_LIQUIDITY', '20')],
+      lp: {
+        allowance: 10n ** 30n,
+        simulationError: 'execution reverted: INSUFFICIENT_B_AMOUNT',
+      },
+      chains: liveChains,
+    });
+    await activateLive(h.services);
+
+    const report = await run(h);
+    expect(report.outcome).toBe('failed');
+    expect(report.reason).toMatch(/INSUFFICIENT_B_AMOUNT/);
+
+    // The reserves moved under the quote: the key is never used, no gas is
+    // spent, and the LP ledger is untouched.
+    expect(h.lp.calls).toEqual(['simulate']);
+    expect(h.lp.signingContexts).toHaveLength(0);
+    expect(h.lp.broadcasts).toHaveLength(0);
+    expect(h.liquidity.store.listPositions('LIVE')).toHaveLength(0);
+
+    const trade = h.services.trades.get(report.trade!.tradeId)!;
+    expect(trade.status).toBe('failed');
+    expect(trade.txHash).toBeNull();
+    expect(h.liquidity.store.listActions()[0]?.status).toBe('failed');
   });
 
   it('routes an exact approval of each pool asset through the risk engine before the add', async () => {
@@ -1364,6 +1505,77 @@ describe('Phase 4: LIVE LP executor', () => {
     expect(position?.lpTokens).toBe('200000000000000000');
     expect(position?.capitalUsd).toBe('0.000000');
     h.liquidity.stop();
+  });
+});
+
+describe('Phase 4: the runtime cycle lock', () => {
+  let h: Harness;
+  afterEach(() => {
+    if (h) shutdownServices(h.services);
+  });
+
+  /** A promise the test opens by hand, to park a cycle inside a chain read. */
+  function gate(): { promise: Promise<void>; open: () => void } {
+    let open!: () => void;
+    const promise = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    return { promise, open };
+  }
+
+  it('does not let a trade cycle interleave with a liquidity cycle', async () => {
+    h = await harness({ model: [decide('ADD_LIQUIDITY', '20')] });
+    seedPaper(h);
+    const parked = gate();
+    h.lp.beforeReadPool = () => parked.promise;
+
+    const finished: string[] = [];
+    const lpCycle = run(h);
+    const tradeCycle = h.services.pipeline
+      .runCycle({ chain: 'base', token: WETH, source: 'operator' })
+      .then((report) => {
+        finished.push(report.outcome);
+        return report;
+      });
+
+    // The liquidity cycle is parked in its first chain read and holds the
+    // lock. Without it the trade cycle would research, decide and write its
+    // own rows here, against balances the LP cycle is about to spend.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(finished).toEqual([]);
+    expect(h.services.audit.list({ category: 'trade' })).toHaveLength(0);
+
+    parked.open();
+    expect((await lpCycle).outcome).toBe('filled');
+    await tradeCycle;
+    expect(finished).toHaveLength(1);
+
+    // Newest first: every row of the liquidity cycle was written before the
+    // first row of the trade cycle.
+    const lastLpRow = h.services.audit.list({ category: 'liquidity' })[0]!;
+    const firstTradeRow = h.services.audit.list({ category: 'trade' }).at(-1)!;
+    expect(firstTradeRow.id).toBeGreaterThan(lastLpRow.id);
+  });
+
+  it('hands the next holder the capital the liquidity cycle just deployed', async () => {
+    h = await harness({ model: [decide('ADD_LIQUIDITY', '20')] });
+    seedPaper(h);
+
+    const seen: Array<string | undefined> = [];
+    const cycle = run(h);
+    // Queued the instant the cycle took the lock. Whatever runs next — the
+    // trade pipeline, in the runtime — reads a ledger that already has the
+    // add in it, instead of sizing itself against capital that is spent.
+    const next = h.services.lock.run(() => {
+      seen.push(h.liquidity.store.listPositions('PAPER')[0]?.capitalUsd);
+      return Promise.resolve();
+    });
+
+    expect((await cycle).outcome).toBe('filled');
+    await next;
+    const booked = h.liquidity.store.listPositions('PAPER')[0]!.capitalUsd;
+    expect(seen[0]).toBeDefined();
+    expect(seen).toEqual([booked]);
   });
 });
 

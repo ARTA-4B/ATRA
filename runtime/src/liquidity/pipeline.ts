@@ -20,6 +20,7 @@ import { deriveIdempotencyKey } from '../risk/engine.js';
 import { amountToBigint, microsToUsd, nativeToUsdMicros, priceToAtto } from '../risk/money.js';
 import { childLogger } from '../logging/logger.js';
 import { errorMessage } from '../util/errors.js';
+import { AsyncMutex } from '../util/mutex.js';
 import type { LiquidityStore, LpPositionRecord } from './store.js';
 import type { LiquidityRegistry } from './registry.js';
 import type { BuiltLpProposal, LpProposalBuilder, PriceMap } from './proposal.js';
@@ -87,6 +88,12 @@ export interface LiquidityPipelineDeps {
   paper: PaperLpExecutor;
   live: LiveLpExecutor;
   now?: () => number;
+  /**
+   * The runtime-wide cycle lock, shared with the auto-trade pipeline. The
+   * composition root usually installs it with {@link LiquidityPipeline.shareLock}
+   * instead, because this pipeline is constructed one level down.
+   */
+  lock?: AsyncMutex;
 }
 
 interface CycleBase {
@@ -101,34 +108,61 @@ export class LiquidityPipeline {
   readonly #deps: LiquidityPipelineDeps;
   readonly #now: () => number;
   readonly #log = childLogger('lp-pipeline');
+  #lock: AsyncMutex;
   #running = false;
 
   constructor(deps: LiquidityPipelineDeps) {
     this.#deps = deps;
     this.#now = deps.now ?? (() => Date.now());
+    this.#lock = deps.lock ?? new AsyncMutex();
   }
 
   get running(): boolean {
     return this.#running;
   }
 
+  /**
+   * Take the runtime's cycle lock instead of this pipeline's own.
+   *
+   * The composition root owns the lock, but LiquidityService builds this
+   * pipeline itself, so the root hands it over here rather than threading it
+   * through a service that has no use for it. Called once, at construction
+   * time, before anything is scheduled.
+   */
+  shareLock(lock: AsyncMutex): void {
+    this.#lock = lock;
+  }
+
   async runCycle(request: LpCycleRequest): Promise<LpCycleReport> {
-    const base: CycleBase = {
+    if (this.#running) {
+      return this.#report(
+        request,
+        this.#base(request),
+        'blocked',
+        'a liquidity cycle is already running',
+      );
+    }
+    this.#running = true;
+    try {
+      // The lock is taken after the "already running" answer, so a second
+      // liquidity cycle is still refused outright rather than queued; only
+      // the trade pipeline's cycle waits here. The cycle is stamped inside,
+      // because `startedAt` and the mode must be the ones it ran with, not
+      // the ones it queued with.
+      return await this.#lock.run(() => this.#run(request, this.#base(request)));
+    } finally {
+      this.#running = false;
+    }
+  }
+
+  #base(request: LpCycleRequest): CycleBase {
+    return {
       cycleId: randomUUID(),
       startedAt: this.#now(),
       mode: this.#deps.state.getMode(),
       poolId: canonicalizeAddress(request.chain, request.poolId),
       notes: [],
     };
-    if (this.#running) {
-      return this.#report(request, base, 'blocked', 'a liquidity cycle is already running');
-    }
-    this.#running = true;
-    try {
-      return await this.#run(request, base);
-    } finally {
-      this.#running = false;
-    }
   }
 
   async #run(request: LpCycleRequest, base: CycleBase): Promise<LpCycleReport> {

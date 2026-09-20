@@ -39,6 +39,7 @@ import type { ChainAdapter } from '../chains/types.js';
 import type { MarketDataProvider } from '../market/types.js';
 import type { RuntimeConfig } from '../config/env.js';
 import { childLogger } from '../logging/logger.js';
+import { AsyncMutex } from '../util/mutex.js';
 import { join } from 'node:path';
 import type { KdfParams } from '../wallet/crypto.js';
 
@@ -63,6 +64,8 @@ export interface Services {
   market: MarketService;
   llm: LlmProvider;
   research: ResearchAgent;
+  /** The runtime-wide cycle lock: one pipeline at a time may decide and dispatch. */
+  lock: AsyncMutex;
   // Phase 3
   ledger: LedgerService;
   trades: TradeStore;
@@ -148,6 +151,11 @@ export function buildServices(config: RuntimeConfig, options: BuildOptions = {})
   const research = new ResearchAgent(market, llm, { db, audit });
 
   // --- Phase 3: trading ----------------------------------------------------
+  // One lock for the whole runtime. The trade cycle and the liquidity cycle
+  // both read the free balances and the deployed capital and then spend
+  // against what they read, so the two may never be inside that window at the
+  // same time — see util/mutex.ts.
+  const cycleLock = new AsyncMutex();
   const ledger = new LedgerService(db);
   const trades = new TradeStore(db);
   const gate = new RiskGate({ db, audit, state, policy: riskPolicy, ledger });
@@ -184,6 +192,7 @@ export function buildServices(config: RuntimeConfig, options: BuildOptions = {})
     registry: execution,
     paper,
     live,
+    lock: cycleLock,
   });
   const scheduler = new AutoTradeScheduler({ db, state, audit, pipeline });
   const withdrawals = new WithdrawalService({ db, audit, wallets, state, market, adapters });
@@ -208,6 +217,9 @@ export function buildServices(config: RuntimeConfig, options: BuildOptions = {})
     llm,
     registry: liquidityRegistry,
   });
+  // The LP pipeline is built inside the service, so the shared lock reaches it
+  // here rather than through a service that has no use for it.
+  liquidity.pipeline.shareLock(cycleLock);
 
   // --- Phase 4: Telegram ---------------------------------------------------
   const telegram = new TelegramService({
@@ -290,6 +302,7 @@ export function buildServices(config: RuntimeConfig, options: BuildOptions = {})
     market,
     llm,
     research,
+    lock: cycleLock,
     ledger,
     trades,
     gate,
@@ -401,12 +414,14 @@ export async function startBackgroundServices(services: Services): Promise<void>
       detail: { ...report },
     });
   }
-  services.scheduler.start();
-
+  // The LP rows settle before the trade schedule is armed: reconciling books
+  // positions, and a trade cycle that started first would size itself against
+  // capital the ledger had not yet been told about.
   const lp = await services.liquidity.start();
   if (lp.checked > 0) {
     log.warn(lp, 'reconciled in-flight LP actions from a previous run');
   }
+  services.scheduler.start();
 
   await services.telegram.start();
 }

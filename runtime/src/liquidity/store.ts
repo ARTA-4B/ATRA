@@ -108,6 +108,23 @@ export interface BookRemoveInput {
   at: number;
 }
 
+export interface RecordPnlInput {
+  tradeId?: string | null;
+  mode: Mode;
+  chain: ChainId;
+  protocol: string;
+  poolId: string;
+  action: LpRecordedAction;
+  /** Micro-USD returned by the burn, at fill-time prices. Zero for an add. */
+  proceedsUsd: bigint;
+  /** Micro-USD of cost basis the burn released, from `bookRemove`. Zero for an add. */
+  costReleasedUsd: bigint;
+  /** Micro-USD of gas, always a cost. */
+  feeUsd: bigint;
+  at: number;
+  simulated: boolean;
+}
+
 export interface LpSchedulerRow {
   enabled: boolean;
   intervalSeconds: number;
@@ -125,6 +142,18 @@ export class LiquidityStore {
     this.#db = db;
     this.#now = now;
     this.#ensureSchedulerRow();
+  }
+
+  /**
+   * Run `fn` as one write.
+   *
+   * An LP fill is several rows — a balance, a position, the realized figure —
+   * and an executor that writes them one at a time can be interrupted between
+   * them, leaving assets spent with nothing booked. Nested calls reuse the
+   * outer transaction, so the methods below still work unchanged inside one.
+   */
+  transaction<T>(fn: () => T): T {
+    return this.#db.transaction(fn)();
   }
 
   // --- positions -----------------------------------------------------------
@@ -303,6 +332,55 @@ export class LiquidityStore {
         protocol,
         poolId,
       );
+  }
+
+  // --- realized P&L --------------------------------------------------------
+
+  /**
+   * Record what an LP fill realized, and return the figure in micro-USD.
+   *
+   * This is the LP half of "how much have I lost today":
+   * `LedgerService.realizedPnlTodayUsd` sums `lp_pnl` alongside `fills`, so an
+   * LP exit's impermanent loss and every LP action's gas reach the daily-loss
+   * cap. Without a row here an LP loss is invisible to the engine, whatever
+   * the audit trail says about it.
+   *
+   * Realized is proceeds minus the cost basis released minus the fee, in
+   * micro-USD throughout. An add releases no basis and returns no proceeds, so
+   * it realizes its gas as a loss — the same treatment `recordFill` gives a
+   * swap fee on an opening trade.
+   */
+  recordPnl(input: RecordPnlInput): bigint {
+    const realized = input.proceedsUsd - input.costReleasedUsd - input.feeUsd;
+    const at = new Date(input.at).toISOString();
+
+    this.#db
+      .prepare(
+        'INSERT INTO lp_pnl (id, trade_id, mode, chain, protocol, pool_id, action, proceeds_usd,' +
+          ' cost_released_usd, fee_usd, realized_pnl_usd, at, simulated)' +
+          ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(
+        randomUUID(),
+        input.tradeId ?? null,
+        input.mode,
+        input.chain,
+        input.protocol,
+        input.poolId,
+        input.action,
+        microsToUsd(input.proceedsUsd),
+        microsToUsd(input.costReleasedUsd),
+        microsToUsd(input.feeUsd),
+        microsToUsd(realized),
+        at,
+        input.simulated ? 1 : 0,
+      );
+
+    this.#log.debug(
+      { mode: input.mode, action: input.action, realizedUsd: microsToUsd(realized) },
+      'lp realized p&l recorded',
+    );
+    return realized;
   }
 
   // --- rebalances ----------------------------------------------------------

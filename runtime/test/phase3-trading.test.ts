@@ -916,6 +916,48 @@ describe('Phase 3: LIVE executor', () => {
     await services.vault.unlock(PASSWORD);
   }
 
+  /**
+   * A LIVE swap on base, stated rather than produced by a cycle.
+   *
+   * Tests that drive the executor directly are asking about the executor, not
+   * about how the builder arrived at the action, so the action is written out.
+   */
+  function baseSwapAction(
+    tokenOut: { address: string; decimals: number },
+    amounts: { expectedOut: string; minOut: string },
+  ): ProposedAction {
+    return {
+      schemaVersion: 1,
+      actionId: randomUUID(),
+      decisionCycleId: randomUUID(),
+      idempotencyKey: randomUUID().replace(/-/g, '').repeat(2),
+      proposedAt: Date.now(),
+      mode: 'LIVE',
+      source: 'test',
+      chain: 'base',
+      kind: 'swap',
+      protocol: 'aerodrome-v2',
+      contract: AERODROME,
+      reduceOnly: false,
+      tokenIn: { address: USDC_BASE, decimals: 6 },
+      tokenOut,
+      amountIn: '10000000',
+      quote: {
+        expectedAmountOut: amounts.expectedOut,
+        minAmountOut: amounts.minOut,
+        slippageBps: 50,
+        priceImpactBps: 5,
+        quotedAt: Date.now(),
+        source: 'fake',
+        marketId: 'm',
+      },
+      feeEstimate: {
+        estimatedAt: Date.now(),
+        detail: { family: 'evm', gasLimit: '250000', maxFeePerGas: '1000000000' },
+      },
+    };
+  }
+
   it('never signs while the runtime is in PAPER, even for a LIVE-mode action', async () => {
     h = await harness({
       trader: openWeth('10'),
@@ -995,6 +1037,51 @@ describe('Phase 3: LIVE executor', () => {
       .map((row) => row.action);
     expect(actions.indexOf('trade.signed')).toBeGreaterThan(-1);
     expect(actions.indexOf('trade.signed')).toBeGreaterThan(actions.indexOf('trade.filled'));
+  });
+
+  it('books a LIVE fill with the decimals the operator allowlisted, not the registry default', async () => {
+    // The chain registry lists the three tokens ATRA ships with. An operator's
+    // allowlist is mostly other tokens, and the action carries their decimals;
+    // reading the registry instead answers 18 for a 6-decimal token, so 10 of
+    // it is booked as 0.00000000001 — a position worth nothing, an unrealized
+    // loss of the whole notional, and a later sell booked 10^12 too small.
+    const offRegistry = { address: '0xdac17f958d2ee523a2206206994597c13d831ec7', decimals: 6 };
+    h = await harness({
+      trader: openWeth('10'),
+      // 1 USDC in, 1 unit of the 6-decimal token out.
+      execution: { allowance: 10n ** 30n, outPerIn: (amountIn) => amountIn },
+      chains: { base: { tokens: new Map([[USDC_BASE, 1_000_000_000n]]) } },
+    });
+    await activateLive(h.services);
+
+    const quote = await h.execution.quote({
+      chain: 'base',
+      tokenIn: { address: USDC_BASE, decimals: 6 },
+      tokenOut: offRegistry,
+      amountIn: '10000000',
+      slippageBps: 50,
+      from: h.services.wallets.depositAddress('base'),
+    });
+    const action = baseSwapAction(offRegistry, {
+      expectedOut: quote.expectedAmountOut,
+      minOut: quote.minAmountOut,
+    });
+    const row = h.services.trades.propose(action, 'open');
+    h.services.trades.decide(row.id, { allowed: true, code: 'OK' } as never);
+
+    const outcome = await h.services.live.execute(row.id, action, quote, {
+      tokenInUsd: '1',
+      tokenOutUsd: '1',
+      nativeUsd: '2500',
+    });
+
+    expect(outcome.status).toBe('filled');
+    const position = h.services.ledger.getPosition('LIVE', 'base', offRegistry.address);
+    expect(position?.decimals).toBe(6);
+    expect(position?.amount).toBe('10000000');
+    // 10 USDC bought 10 units of a 1 USD token, so the holding is worth what
+    // was paid for it and the daily-loss gate sees no drawdown.
+    expect(position?.costBasisUsd).toBe('10.000000');
   });
 
   it('routes an exact ERC-20 approval through the risk engine before the swap', async () => {
@@ -1441,6 +1528,76 @@ describe('Phase 3: LIVE executor', () => {
       .list({ category: 'system' })
       .find((row) => row.action === 'trades.reconciled');
     expect(reconciled?.summary).toMatch(/1 filled, 1 failed/);
+  });
+
+  it('books a fill that confirmed while the process was down, at the quote-time prices', async () => {
+    h = await harness({
+      trader: openWeth('10'),
+      execution: { allowance: 10n ** 30n },
+      chains: { base: { tokens: new Map([[USDC_BASE, 1_000_000_000n]]) } },
+    });
+    await activateLive(h.services);
+
+    // The node keeps the transaction but answers with an error, so this
+    // process never sees the confirmation: the row stays `signed` and the
+    // holding exists on chain without the ledger knowing about it.
+    h.execution.broadcast = (signed) => {
+      h.execution.broadcasts.push(signed);
+      return Promise.reject(new Error('RPC down mid-broadcast'));
+    };
+
+    const report = await h.services.pipeline.runCycle({
+      chain: 'base',
+      token: WETH_BASE,
+      source: 'operator',
+    });
+    expect(report.outcome).toBe('failed');
+    const tradeId = report.trade!.tradeId;
+    expect(h.services.ledger.getPosition('LIVE', 'base', WETH_BASE)).toBeUndefined();
+
+    await startBackgroundServices(h.services);
+
+    const trade = h.services.trades.get(tradeId)!;
+    expect(trade.status).toBe('filled');
+    // The row used to be marked filled and left out of the ledger: deployed
+    // capital read low, so the gate admitted an extra trade, and a CLOSE had
+    // no position to reduce.
+    const position = h.services.ledger.getPosition('LIVE', 'base', WETH_BASE);
+    expect(position?.amount).toBe(trade.filledOut);
+    const filled = h.services.audit
+      .list({ correlationId: report.cycleId })
+      .find((row) => row.action === 'trade.filled');
+    expect(filled?.detail.pricedAt).toBe('quote-time');
+    expect(filled?.detail.note).toMatch(/not at fill time/);
+  });
+
+  it('settles a reconciled row that has no persisted prices without booking it, and says why', async () => {
+    h = await harness({ trader: openWeth('10'), execution: { allowance: 10n ** 30n } });
+    // A row written before the prices were persisted: it never passed through
+    // execute(), so there is nothing to value the fill with. Guessing one
+    // would put a made-up cost basis in the ledger, which is worse than a gap
+    // the audit names.
+    const action = baseSwapAction(
+      { address: WETH_BASE, decimals: 18 },
+      { expectedOut: '4000000000000000', minOut: '3980000000000000' },
+    );
+    const row = h.services.trades.propose(action, 'open');
+    h.services.trades.decide(row.id, { allowed: true, code: 'OK' } as never);
+    h.services.trades.markDispatched(row.id);
+    const hash = '0x' + 'dd'.repeat(32);
+    h.services.trades.markSigned(row.id, hash);
+    h.execution.broadcasts.push({ raw: '0x', hash });
+
+    const report = await h.services.live.reconcile();
+
+    expect(report.filled).toBe(1);
+    expect(h.services.trades.get(row.id)?.status).toBe('filled');
+    expect(h.services.ledger.getPosition('LIVE', 'base', WETH_BASE)).toBeUndefined();
+    const filled = h.services.audit
+      .list({ correlationId: action.decisionCycleId })
+      .find((entry) => entry.action === 'trade.filled');
+    expect(filled?.detail.ledger).toMatch(/not booked/);
+    expect(filled?.detail.note).toMatch(/predates persisted prices/);
   });
 });
 

@@ -1,5 +1,5 @@
 import type { SignedTransaction, SigningContext } from '../chains/types.js';
-import type { UnsignedTransaction } from '../execution/types.js';
+import type { SimulationResult, UnsignedTransaction } from '../execution/types.js';
 import type { ProposedAction } from '../risk/types.js';
 import type { TradeRecord, TradeStore } from '../trading/trades.js';
 import type { RiskGate } from '../risk/gate.js';
@@ -36,11 +36,15 @@ import { feeInNativeUnits } from '../risk/engine.js';
  *     nonce and fee caps. The adapter's `to` must equal the contract the engine
  *     approved (the router, or the pool for a claim, or the token for an
  *     approval).
- *  3. **Sign** inside the vault's synchronous callback.
- *  4. **Record the hash** in the trade row, `signed` state, before anything is
+ *  3. **Simulate** what was built — not a freshly built copy — and refuse when
+ *     it reverts. Reserves that moved, a deadline that passed, an allowance
+ *     that is not there: signing those burns the gas and the cooldown for a
+ *     transaction the chain was always going to reject.
+ *  4. **Sign** inside the vault's synchronous callback.
+ *  5. **Record the hash** in the trade row, `signed` state, before anything is
  *     sent.
- *  5. **Broadcast**, then poll the receipt for a bounded time.
- *  6. **Book** from what the chain reports: LP tokens minted, assets pulled or
+ *  6. **Broadcast**, then poll the receipt for a bounded time.
+ *  7. **Book** from what the chain reports: LP tokens minted, assets pulled or
  *     returned, fees claimed — read from the transaction's ERC-20 transfers,
  *     never from the quote.
  *
@@ -51,6 +55,22 @@ import { feeInNativeUnits } from '../risk/engine.js';
 
 const RECEIPT_POLL_MS = 3_000;
 const RECEIPT_TIMEOUT_MS = 90_000;
+
+/**
+ * An LP adapter that can simulate a transaction it built.
+ *
+ * `LpAdapter` does not require it, and that interface is shared with code
+ * this file has no business changing, so the capability is asked for
+ * structurally: an adapter that offers it has every transaction simulated
+ * before the key is used, and one that does not is signed as it was before.
+ */
+interface SimulatingLpAdapter {
+  simulate(tx: UnsignedTransaction): Promise<SimulationResult>;
+}
+
+function canSimulate(adapter: LpAdapter): adapter is LpAdapter & SimulatingLpAdapter {
+  return typeof (adapter as Partial<SimulatingLpAdapter>).simulate === 'function';
+}
 
 export interface LiveLpExecutorDeps {
   trades: TradeStore;
@@ -127,6 +147,9 @@ export class LiveLpExecutor {
       return this.#fail(tradeId, action, `build failed: ${errorMessage(error)}`, startedAt);
     }
 
+    const reverted = await this.#simulate(adapter, tx);
+    if (reverted) return this.#fail(tradeId, action, reverted, startedAt);
+
     const sent = await this.#signAndSend(tradeId, action, adapter, tx);
     if (!sent.ok) return sent.outcome;
 
@@ -151,6 +174,9 @@ export class LiveLpExecutor {
 
     this.#trades.markDispatched(tradeId);
     this.#gate.markDispatched(action);
+
+    const reverted = await this.#simulate(adapter, tx);
+    if (reverted) return this.#fail(tradeId, action, reverted, startedAt);
 
     const sent = await this.#signAndSend(tradeId, action, adapter, tx);
     if (!sent.ok) return sent.outcome;
@@ -250,6 +276,25 @@ export class LiveLpExecutor {
       report.filled += 1;
     }
     return report;
+  }
+
+  /**
+   * Run the built transaction past the chain before the key is used.
+   *
+   * Returns the refusal reason, or null when the transaction may proceed. A
+   * simulation that throws is a simulation that did not say yes, so it
+   * refuses too: the cost of a false refusal is one skipped cycle, the cost
+   * of a false yes is the gas and the cooldown.
+   */
+  async #simulate(adapter: LpAdapter, tx: UnsignedTransaction): Promise<string | null> {
+    if (!canSimulate(adapter)) return null;
+    let result: SimulationResult;
+    try {
+      result = await adapter.simulate(tx);
+    } catch (error) {
+      return `simulation failed: ${errorMessage(error)}`;
+    }
+    return result.ok ? null : `simulation failed: ${result.error ?? 'unknown'}`;
   }
 
   #refusal(action: ProposedAction): string | null {

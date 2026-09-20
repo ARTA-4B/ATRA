@@ -1,4 +1,4 @@
-import { DEFAULT_PROTOCOLS } from '../chains/registry.js';
+import { DEFAULT_PROTOCOLS, INSPECT_ONLY_PROTOCOLS } from '../chains/registry.js';
 import type { ChainId } from '../chains/registry.js';
 
 /**
@@ -45,6 +45,12 @@ import type { ChainId } from '../chains/registry.js';
  *
  * Solana (Orca, Raydium, Meteora concentrated liquidity) and Robinhood Chain
  * (Uniswap v4) have no LP adapter in this build. The registry says so.
+ *
+ * `V3_INSPECT_PROTOCOLS` at the foot of this file is a different kind of
+ * entry: concentrated-liquidity deployments the runtime can read and refuses
+ * to touch. They are listed separately, and asserted never to be executable,
+ * so that "we can tell you what this pool is" cannot be mistaken for "we can
+ * put money in it".
  */
 
 export type LpDialect = 'aerodrome' | 'uniswap-v2';
@@ -113,5 +119,95 @@ export function assertRegisteredRouter(chain: ChainId, info: LpProtocolInfo): vo
     throw new Error(
       `${info.router} is not a registered ${info.protocol} contract on ${chain}; refusing to build an LP adapter for it`,
     );
+  }
+}
+
+// --- concentrated liquidity: inspection only ---------------------------------
+
+/**
+ * Uniswap-v3-lineage protocols the runtime can READ.
+ *
+ * A v3 position is an ERC-721 holding a tick range, not a fungible LP-token
+ * balance. The ledger, the risk checks, the executor and the reconciler are
+ * built on the fungible assumption, so this build reads v3 and builds nothing:
+ * the interface can say what a pool really is on chain instead of repeating a
+ * provider's label, and the management path has arithmetic to stand on later.
+ *
+ * The addresses live in `INSPECT_ONLY_PROTOCOLS`, with their on-chain
+ * verification recorded there, and are never copied into this file: one place
+ * to check, one place to be wrong.
+ */
+export type V3Dialect = 'uniswap-v3' | 'pancakeswap-v3';
+
+export interface V3ProtocolInfo {
+  protocol: string;
+  dialect: V3Dialect;
+  factory: string;
+  positionManager: string;
+  quoter: string;
+  displayName: string;
+  /** Fee tiers the factory reports, in hundredths of a basis point. */
+  feeTiers: readonly number[];
+  /** Always true in this build; there is no code that sets it false. */
+  inspectOnly: true;
+}
+
+export const V3_INSPECT_UNIMPLEMENTED =
+  'Uniswap-v3-style position management is not implemented in this build: a v3 position is an ERC-721 with a tick range, and the ledger, the risk checks and the executor all assume fungible LP tokens. This adapter reads pools and positions and builds nothing.';
+
+function v3Info(
+  chain: ChainId,
+  key: string,
+  protocol: string,
+  dialect: V3Dialect,
+  displayName: string,
+): V3ProtocolInfo {
+  const entry = INSPECT_ONLY_PROTOCOLS[chain][key];
+  if (!entry) {
+    throw new Error(`${key} is not an inspect-only protocol on ${chain}`);
+  }
+  const { factory, positionManager, quoter } = entry.contracts;
+  if (!factory || !positionManager || !quoter) {
+    throw new Error(`${key} on ${chain} is missing a v3 contract address`);
+  }
+  return {
+    protocol,
+    dialect,
+    factory,
+    positionManager,
+    quoter,
+    displayName,
+    feeTiers: entry.feeTiers,
+    inspectOnly: true,
+  };
+}
+
+export const V3_INSPECT_PROTOCOLS: Partial<Record<ChainId, V3ProtocolInfo>> = {
+  base: v3Info('base', 'uniswap-v3', 'uniswap-v3', 'uniswap-v3', 'Uniswap v3'),
+  bsc: v3Info('bsc', 'pancakeswap-v3-lp', 'pancakeswap-v3-lp', 'pancakeswap-v3', 'PancakeSwap v3'),
+};
+
+/**
+ * The mirror image of `assertRegisteredRouter`: an inspect-only contract must
+ * *not* be one the execution registry trusts.
+ *
+ * An LP router has to be a contract swaps already use, so the two registries
+ * cannot drift apart. A v3 contract has the opposite requirement — the moment
+ * one of these addresses appears in `DEFAULT_PROTOCOLS`, a policy could
+ * allowlist it and something could send it a transaction, which is exactly
+ * what this increment promises not to do.
+ */
+export function assertInspectOnly(chain: ChainId, info: V3ProtocolInfo): void {
+  const executable = new Set<string>();
+  for (const entry of Object.values(DEFAULT_PROTOCOLS[chain])) {
+    for (const contract of entry.contracts) executable.add(contract.toLowerCase());
+    for (const spender of entry.approveSpenders) executable.add(spender.toLowerCase());
+  }
+  for (const address of [info.factory, info.positionManager, info.quoter]) {
+    if (executable.has(address.toLowerCase())) {
+      throw new Error(
+        `${address} is a registered executable contract on ${chain}; refusing to treat ${info.protocol} as inspect-only`,
+      );
+    }
   }
 }

@@ -71,6 +71,22 @@ export interface LivePrices {
   nativeUsd: string;
 }
 
+/** What the booking path needs beyond the trade row and the chain's receipt. */
+interface BookingContext {
+  /**
+   * Decimals as the operator allowlisted them, or null to take them from the
+   * row. The chain registry's seed list knows only the handful of tokens ATRA
+   * ships with, so a token the operator added is absent from it and would be
+   * booked at the family default — 10^12 out for a 6-decimal token.
+   */
+  decimals: { in: number; out: number } | null;
+  /** Whether the prices are from the fill itself or from the quote before it. */
+  pricedAt: 'fill-time' | 'quote-time';
+  note: string | null;
+}
+
+const NO_PRICES: LivePrices = { tokenInUsd: '0', tokenOutUsd: '0', nativeUsd: '0' };
+
 export interface ReconcileReport {
   checked: number;
   filled: number;
@@ -119,6 +135,11 @@ export class LiveExecutor {
     const refusal = this.#refusal(action);
     if (refusal) return this.#fail(tradeId, action, refusal, startedAt);
 
+    // On disk before the transaction exists: if this process dies between the
+    // broadcast and the confirmation, these are the only prices the next one
+    // will have to book the fill with.
+    this.#trades.recordQuotePrices(tradeId, prices);
+
     // Dispatch: cooldowns start now, for a live trade exactly as for paper.
     this.#trades.markDispatched(tradeId);
     this.#gate.markDispatched(action);
@@ -145,6 +166,9 @@ export class LiveExecutor {
     return this.#signAndSend(tradeId, action, adapter, tx, {
       tokenOut: action.tokenOut.address,
       prices,
+      // The action carries the decimals the operator allowlisted; the trade
+      // row's copy of them is for the reconciler, which has no action.
+      decimals: { in: action.tokenIn.decimals, out: action.tokenOut.decimals },
     });
   }
 
@@ -169,6 +193,7 @@ export class LiveExecutor {
     return this.#signAndSend(tradeId, action, adapter, tx, {
       tokenOut: null,
       prices: { tokenInUsd: '0', tokenOutUsd: '0', nativeUsd },
+      decimals: null,
     });
   }
 
@@ -254,19 +279,21 @@ export class LiveExecutor {
         continue;
       }
 
-      // Confirmed. Prices at fill time are unknown after a restart, so the
-      // fill is booked with what the chain reports and zero USD prices, and
-      // the audit row says the valuation is missing rather than inventing one.
-      this.#bookFill(
-        trade,
-        receipt,
-        {
-          tokenInUsd: '0',
-          tokenOutUsd: '0',
-          nativeUsd: '0',
-        },
-        'reconciled after restart; fill-time prices unavailable',
-      );
+      // Confirmed. The price at the moment it landed is gone with the process
+      // that was watching, but the prices the decision was made on are on the
+      // row, and a position the wallet really holds must reach the ledger:
+      // without it, deployed capital is under-reported and the holding cannot
+      // be closed, because there is nothing to reduce. A row written before
+      // those columns existed has nothing to value the fill with, and an
+      // invented price in the ledger is worse than a gap the audit names.
+      const quoted = trade.quotePrices;
+      this.#bookFill(trade, receipt, quoted ?? NO_PRICES, {
+        decimals: null,
+        pricedAt: 'quote-time',
+        note: quoted
+          ? 'reconciled after restart; valued at the quote-time prices on the row, not at fill time'
+          : 'reconciled after restart; the row predates persisted prices, so nothing is booked',
+      });
       report.filled += 1;
     }
 
@@ -333,7 +360,11 @@ export class LiveExecutor {
     action: ProposedAction,
     adapter: ExecutionAdapter,
     tx: UnsignedTransaction,
-    booking: { tokenOut: string | null; prices: LivePrices },
+    booking: {
+      tokenOut: string | null;
+      prices: LivePrices;
+      decimals: { in: number; out: number } | null;
+    },
   ): Promise<ExecutionOutcome> {
     const startedAt = this.#now();
     const from = this.#walletFor(action.chain);
@@ -500,7 +531,11 @@ export class LiveExecutor {
     }
 
     const trade = this.#trades.get(tradeId)!;
-    const feeUsd = this.#bookFill(trade, receipt, booking.prices, null);
+    const feeUsd = this.#bookFill(trade, receipt, booking.prices, {
+      decimals: booking.decimals,
+      pricedAt: 'fill-time',
+      note: null,
+    });
 
     return {
       actionId: action.actionId,
@@ -542,12 +577,16 @@ export class LiveExecutor {
    * could not expose it the fill is recorded as *unquantified* — filled with
    * `minAmountOut` as the lower bound the contract enforced, and the audit
    * row says so explicitly.
+   *
+   * The ledger is only written when there are prices to write it with; with
+   * none, the row still settles and the audit row says the fill is unbooked
+   * rather than recording a position valued at nothing.
    */
   #bookFill(
     trade: TradeRecord,
     receipt: ExecutionReceipt,
     prices: LivePrices,
-    note: string | null,
+    booking: BookingContext,
   ): string {
     const chain = trade.chain;
     const feeNative = receipt.feeNative ? BigInt(receipt.feeNative) : 0n;
@@ -579,7 +618,7 @@ export class LiveExecutor {
         actor: 'system',
         mode: 'LIVE',
         correlationId: trade.decisionCycleId,
-        detail: { tradeId: trade.id, txHash: trade.txHash, feeUsd, note },
+        detail: { tradeId: trade.id, txHash: trade.txHash, feeUsd, note: booking.note },
       });
       return feeUsd;
     }
@@ -587,11 +626,16 @@ export class LiveExecutor {
     const quantified = receipt.amountOut !== null;
     const amountOut = receipt.amountOut ?? trade.minOut ?? '0';
 
-    const tokenIn = tokenRef(chain, trade.tokenIn);
-    const tokenOut = tokenRef(chain, trade.tokenOut);
+    const tokenIn = tokenRef(chain, trade.tokenIn, booking.decimals?.in ?? trade.tokenInDecimals);
+    const tokenOut = tokenRef(
+      chain,
+      trade.tokenOut,
+      booking.decimals?.out ?? trade.tokenOutDecimals,
+    );
     const filledAt = this.#now();
 
-    if (prices.tokenInUsd !== '0' && prices.tokenOutUsd !== '0') {
+    const booked = prices.tokenInUsd !== '0' && prices.tokenOutUsd !== '0';
+    if (booked) {
       this.#ledger.recordFill({
         tradeId: trade.id,
         mode: 'LIVE',
@@ -631,10 +675,10 @@ export class LiveExecutor {
         amountOutSource: quantified ? 'chain' : 'min-out-lower-bound',
         feeUsd,
         height: receipt.height,
-        ...(note ? { note } : {}),
-        ...(prices.tokenInUsd === '0'
-          ? { ledger: 'not booked: fill-time prices unavailable' }
-          : {}),
+        ...(booking.note ? { note: booking.note } : {}),
+        ...(booked
+          ? { pricedAt: booking.pricedAt }
+          : { ledger: 'not booked: no USD prices for this fill' }),
       },
     });
 
@@ -682,10 +726,21 @@ export class LiveExecutor {
   }
 }
 
+/**
+ * The token as the ledger must record it.
+ *
+ * `decimals` is what the operator allowlisted. The registry seed list is only
+ * the last resort, for a row that predates the persisted decimals: it lists
+ * the few tokens ATRA ships with, and answering 18 for an allowlisted
+ * 6-decimal token books the position 10^12 too small — which reads as a total
+ * loss on the way in and hides a real one on the way out.
+ */
 function tokenRef(
   chain: ProposedAction['chain'],
   address: string,
+  decimals: number | null,
 ): { address: string; decimals: number } {
+  if (decimals !== null) return { address, decimals };
   const known = CHAINS[chain].tokens.find((token) => token.address === address);
   return { address, decimals: known?.decimals ?? (chain === 'solana' ? 9 : 18) };
 }

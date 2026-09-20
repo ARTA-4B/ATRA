@@ -23,6 +23,7 @@ import { deriveIdempotencyKey } from '../risk/engine.js';
 import { amountToBigint } from '../risk/money.js';
 import { childLogger } from '../logging/logger.js';
 import { errorMessage } from '../util/errors.js';
+import { AsyncMutex } from '../util/mutex.js';
 
 /**
  * One auto-trade cycle, end to end.
@@ -83,11 +84,19 @@ export interface PipelineDeps {
   paper: PaperExecutor;
   live: LiveExecutor;
   now?: () => number;
+  /**
+   * The runtime-wide cycle lock, shared with the liquidity pipeline: the two
+   * spend the same capital and must not decide against the same balances at
+   * the same time. Defaults to one of this pipeline's own, which is the
+   * behaviour a pipeline constructed on its own always had.
+   */
+  lock?: AsyncMutex;
 }
 
 export class AutoTradePipeline {
   readonly #deps: PipelineDeps;
   readonly #now: () => number;
+  readonly #lock: AsyncMutex;
   readonly #log = childLogger('pipeline');
   readonly #cycleHandlers: Array<(report: CycleReport) => void> = [];
   #running = false;
@@ -95,6 +104,7 @@ export class AutoTradePipeline {
   constructor(deps: PipelineDeps) {
     this.#deps = deps;
     this.#now = deps.now ?? (() => Date.now());
+    this.#lock = deps.lock ?? new AsyncMutex();
   }
 
   get running(): boolean {
@@ -118,7 +128,10 @@ export class AutoTradePipeline {
     }
     this.#running = true;
     try {
-      return await this.#run(request);
+      // The lock is taken after the "already running" answer, not before it:
+      // a second cycle of this pipeline is still refused outright rather than
+      // queued, and only the other pipeline's cycle waits here.
+      return await this.#lock.run(() => this.#run(request));
     } finally {
       this.#running = false;
     }

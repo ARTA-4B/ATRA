@@ -184,6 +184,87 @@ export const DEFAULT_PROTOCOLS: Record<
   },
 };
 
+/**
+ * Concentrated-liquidity (Uniswap v3 lineage) deployments this build may READ,
+ * and nothing else.
+ *
+ * A deliberately separate map from `DEFAULT_PROTOCOLS`. Policy seeding, the
+ * contract allowlist and every execution adapter read that one, so nothing
+ * here can be selected for a swap, an approval or a liquidity action however a
+ * policy is edited: there is no code path from this constant to a transaction.
+ * A v3 position is an ERC-721 with a tick range, and the ledger, the risk
+ * checks and the reconciler all assume fungible LP tokens, so the honest
+ * capability today is inspection.
+ *
+ * Every address was verified on 2026-09-21 against the protocol's own
+ * published deployment list and then with read-only `eth_call`:
+ *
+ *  - Base / Uniswap v3, block 51569133. Published list:
+ *    developers.uniswap.org/contracts/v3/reference/deployments/base-deployments.
+ *    `eth_getCode` is non-empty for all three; `positionManager.factory()` and
+ *    `quoter.factory()` both return `0x3312…FDfD`; the position manager is
+ *    `name() = "Uniswap V3 Positions NFT-V1"`, `symbol() = "UNI-V3-POS"`;
+ *    `factory.feeAmountTickSpacing` = 1 / 10 / 60 / 200 for the 100 / 500 /
+ *    3000 / 10000 fee tiers. `factory.getPool(WETH, USDC, 500)` =
+ *    `0xd0b53d9277642d899df5c87a3966a349a798f224`, whose `token0` is WETH,
+ *    `token1` USDC, `fee` 500, `tickSpacing` 10 and `factory()` the factory
+ *    above.
+ *  - BNB Smart Chain / PancakeSwap v3, block 123034328. Published list:
+ *    developer.pancakeswap.finance/contracts/v3/addresses. Same checks:
+ *    `positionManager.factory()` and `quoter.factory()` both return
+ *    `0x0BFb…1865`, `name() = "Pancake V3 Positions NFT-V1"`, `symbol() =
+ *    "PCS-V3-POS"`, `feeAmountTickSpacing` = 1 / 10 / 50 / 200 for the 100 /
+ *    500 / 2500 / 10000 tiers (2500 is PancakeSwap's tier and has no Uniswap
+ *    equivalent). `factory.getPool(USDT, WBNB, 500)` =
+ *    `0x36696169c63e42cd08ce11f5deebbcebae652050`, `token0` USDT, `token1`
+ *    WBNB, `fee` 500, `tickSpacing` 10, `factory()` the factory above.
+ *    The same page lists the Smart Router `0x13f4…8Dd4` that `DEFAULT_PROTOCOLS`
+ *    already carries for swaps, which cross-checks the source.
+ *
+ * Robinhood Chain and Solana have no v3 deployment listed here: Robinhood
+ * Chain's only DEX is Uniswap v4 and Solana's concentrated-liquidity venues
+ * are not EVM contracts at all.
+ *
+ * The BSC key is `pancakeswap-v3-lp` rather than `pancakeswap-v3`, which
+ * `DEFAULT_PROTOCOLS` already uses for the Smart Router: same protocol, but a
+ * name shared between the two maps could let a lookup fall through to an
+ * executable contract, and these must never resolve to one.
+ */
+export interface InspectOnlyProtocol {
+  /** Role -> address. None of these is ever a transaction target. */
+  contracts: Record<string, string>;
+  /** Fee tiers the factory reports, in hundredths of a basis point. */
+  feeTiers: number[];
+  note: string;
+}
+
+export const INSPECT_ONLY_PROTOCOLS: Record<ChainId, Record<string, InspectOnlyProtocol>> = {
+  base: {
+    'uniswap-v3': {
+      contracts: {
+        factory: '0x33128a8fc17869897dce68ed026d694621f6fdfd',
+        positionManager: '0x03a520b32c04bf3beef7beb72e919cf822ed34f1',
+        quoter: '0x3d4e44eb1374240ce5f1b871ab261cd16335b76a',
+      },
+      feeTiers: [100, 500, 3000, 10000],
+      note: 'read-only: v3 position management is not implemented in this build',
+    },
+  },
+  bsc: {
+    'pancakeswap-v3-lp': {
+      contracts: {
+        factory: '0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865',
+        positionManager: '0x46a15b0b27311cedf172ab29e4f4766fbe7f4364',
+        quoter: '0xb048bbc1ee6b733fffcfb9e9cef7375518e25997',
+      },
+      feeTiers: [100, 500, 2500, 10000],
+      note: 'read-only: v3 position management is not implemented in this build',
+    },
+  },
+  robinhood: {},
+  solana: {},
+};
+
 export function isChainId(value: unknown): value is ChainId {
   return typeof value === 'string' && (CHAIN_IDS as readonly string[]).includes(value);
 }

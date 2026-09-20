@@ -59,6 +59,17 @@ export interface TradeRecord {
   marketKey: string;
   tokenIn: string;
   tokenOut: string;
+  /**
+   * Decimals as the operator's allowlist states them, not as the chain
+   * registry guesses them. Null on rows written before they were persisted.
+   */
+  tokenInDecimals: number | null;
+  tokenOutDecimals: number | null;
+  /**
+   * The USD prices the decision was made on. Null until the executor writes
+   * them, and on every row written before they were persisted.
+   */
+  quotePrices: { tokenInUsd: string; tokenOutUsd: string; nativeUsd: string } | null;
   amountIn: string;
   expectedOut: string | null;
   minOut: string | null;
@@ -100,9 +111,10 @@ export class TradeStore {
     this.#db
       .prepare(
         'INSERT INTO trades (id, action_id, decision_cycle_id, mode, chain, protocol, kind, side,' +
-          ' market_key, token_in, token_out, amount_in, expected_out, min_out, status, route_json,' +
+          ' market_key, token_in, token_out, token_in_decimals, token_out_decimals, amount_in,' +
+          ' expected_out, min_out, status, route_json,' +
           ' research_id, rationale, proposed_at, updated_at)' +
-          " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?)",
+          " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?)",
       )
       .run(
         id,
@@ -116,6 +128,11 @@ export class TradeStore {
         marketKey(action.chain, action.tokenIn.address, action.tokenOut.address),
         action.tokenIn.address,
         action.tokenOut.address,
+        // The allowlist is the only place that knows the decimals of a token
+        // the runtime does not ship with; a fill booked without them is wrong
+        // by whatever the registry's default happens to differ by.
+        action.tokenIn.decimals,
+        action.tokenOut.decimals,
         action.amountIn,
         action.quote?.expectedAmountOut ?? null,
         action.quote?.minAmountOut ?? null,
@@ -138,6 +155,35 @@ export class TradeStore {
       });
     }
     return this.#transition(tradeId, 'rejected', { rejection_code: decision.code });
+  }
+
+  /**
+   * Persist the prices the decision was made on, before anything is sent.
+   *
+   * A transaction that confirms while the process is down leaves no fill-time
+   * price behind, and a position the wallet really holds must not be missing
+   * from the ledger. These are the next best valuation, and the audit row for
+   * a fill booked from them says which they are.
+   *
+   * Not a transition: the status is untouched, so this is safe at any point
+   * before dispatch.
+   */
+  recordQuotePrices(
+    tradeId: string,
+    prices: { tokenInUsd: string; tokenOutUsd: string; nativeUsd: string },
+  ): void {
+    this.#db
+      .prepare(
+        'UPDATE trades SET quote_price_in_usd = ?, quote_price_out_usd = ?,' +
+          ' quote_native_usd = ?, updated_at = ? WHERE id = ?',
+      )
+      .run(
+        prices.tokenInUsd,
+        prices.tokenOutUsd,
+        prices.nativeUsd,
+        new Date(this.#now()).toISOString(),
+        tradeId,
+      );
   }
 
   markDispatched(tradeId: string): TradeRecord {
@@ -269,6 +315,11 @@ interface TradeRow {
   market_key: string;
   token_in: string;
   token_out: string;
+  token_in_decimals: number | null;
+  token_out_decimals: number | null;
+  quote_price_in_usd: string | null;
+  quote_price_out_usd: string | null;
+  quote_native_usd: string | null;
   amount_in: string;
   expected_out: string | null;
   min_out: string | null;
@@ -301,6 +352,20 @@ function toRecord(row: TradeRow): TradeRecord {
     marketKey: row.market_key,
     tokenIn: row.token_in,
     tokenOut: row.token_out,
+    tokenInDecimals: row.token_in_decimals,
+    tokenOutDecimals: row.token_out_decimals,
+    // All three are written together, so a partial set means a row that
+    // predates the columns rather than a half-priced fill.
+    quotePrices:
+      row.quote_price_in_usd !== null &&
+      row.quote_price_out_usd !== null &&
+      row.quote_native_usd !== null
+        ? {
+            tokenInUsd: row.quote_price_in_usd,
+            tokenOutUsd: row.quote_price_out_usd,
+            nativeUsd: row.quote_native_usd,
+          }
+        : null,
     amountIn: row.amount_in,
     expectedOut: row.expected_out,
     minOut: row.min_out,

@@ -11,7 +11,7 @@ import type { PublicClient } from 'viem';
 import { CHAINS } from '../../chains/registry.js';
 import type { ChainId } from '../../chains/registry.js';
 import type { SignedTransaction, SigningContext } from '../../chains/types.js';
-import type { UnsignedTransaction } from '../../execution/types.js';
+import type { SimulationResult, UnsignedTransaction } from '../../execution/types.js';
 import type { FeeDetail } from '../../risk/types.js';
 import { amountToBigint, bpsOf, floorDiv } from '../../risk/money.js';
 import { AppError, ErrorCode, errorMessage } from '../../util/errors.js';
@@ -599,6 +599,38 @@ export class V2PoolLpAdapter implements LpAdapter {
   }
 
   // --- signing support ---------------------------------------------------------
+
+  /**
+   * Simulate the built transaction with `eth_estimateGas` from the wallet.
+   *
+   * The gas limits above are constants, so up to this point nothing has asked
+   * the chain whether the call would actually go through. Reserves that moved
+   * under the quote, a deadline that has passed, an allowance that is not
+   * there: each of them reverts, and a revert here costs nothing while the
+   * same revert on chain costs the gas and the cooldown. Reported verbatim,
+   * exactly as the swap adapter reports it.
+   */
+  async simulate(tx: UnsignedTransaction): Promise<SimulationResult> {
+    const simulatedAt = Date.now();
+    try {
+      const payload = tx.payload as EvmPayload;
+      const gas = await this.#client.estimateGas({
+        account: payload.from,
+        to: payload.to,
+        data: payload.data,
+        value: BigInt(payload.value),
+      });
+      return { ok: true, amountOut: null, unitsUsed: Number(gas), error: null, simulatedAt };
+    } catch (error) {
+      return {
+        ok: false,
+        amountOut: null,
+        unitsUsed: null,
+        error: errorMessage(error).slice(0, 300),
+        simulatedAt,
+      };
+    }
+  }
 
   async prepareSigning(tx: UnsignedTransaction, from: string): Promise<SigningContext> {
     const payload = tx.payload as EvmPayload;

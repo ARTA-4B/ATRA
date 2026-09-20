@@ -32,7 +32,9 @@ import type { LpPoolState } from './types.js';
  *    a price move since the add shows up as impermanent loss against the
  *    cost basis;
  *  - the fee is the full estimated gas at the current native price, charged
- *    as a realized loss on the action row;
+ *    as a realized loss; every fill records what it realized through
+ *    `LiquidityStore.recordPnl`, which is where the daily-loss check reads
+ *    the LP side of the day from;
  *  - **fee accrual is not simulated.** A paper position reports zero fees
  *    with a note saying so; a claim on paper is refused before it gets here.
  *
@@ -184,22 +186,40 @@ export class PaperLpExecutor {
       nativeToUsdMicros(amount0, pool.token0.decimals, priceToAtto(prices.token0Usd), 'ceil') +
       nativeToUsdMicros(amount1, pool.token1.decimals, priceToAtto(prices.token1Usd), 'ceil');
 
-    // Spend both assets and book the position in one transaction.
-    this.#adjustPaper(action.chain, pool.token0.address, pool.token0.decimals, -amount0);
-    this.#adjustPaper(action.chain, pool.token1.address, pool.token1.decimals, -amount1);
-    this.#store.bookAdd({
-      mode: 'PAPER',
-      chain: action.chain,
-      protocol: action.protocol,
-      poolId: pool.poolId,
-      token0: { address: pool.token0.address, decimals: pool.token0.decimals },
-      token1: { address: pool.token1.address, decimals: pool.token1.decimals },
-      lpTokens: minted.toString(),
-      amount0: amount0.toString(),
-      amount1: amount1.toString(),
-      capitalUsd: microsToUsd(capital),
-      at: filledAt,
-      rebalance: action.kind === 'lp_rebalance',
+    // Spend both assets, book the position and charge the gas in one
+    // transaction: a throw between the two debits would otherwise leave the
+    // first asset spent with no position to show for it.
+    this.#store.transaction(() => {
+      this.#adjustPaper(action.chain, pool.token0.address, pool.token0.decimals, -amount0);
+      this.#adjustPaper(action.chain, pool.token1.address, pool.token1.decimals, -amount1);
+      this.#store.bookAdd({
+        mode: 'PAPER',
+        chain: action.chain,
+        protocol: action.protocol,
+        poolId: pool.poolId,
+        token0: { address: pool.token0.address, decimals: pool.token0.decimals },
+        token1: { address: pool.token1.address, decimals: pool.token1.decimals },
+        lpTokens: minted.toString(),
+        amount0: amount0.toString(),
+        amount1: amount1.toString(),
+        capitalUsd: microsToUsd(capital),
+        at: filledAt,
+        rebalance: action.kind === 'lp_rebalance',
+      });
+      // An add realizes nothing but the gas, which the day has still lost.
+      this.#store.recordPnl({
+        tradeId,
+        mode: 'PAPER',
+        chain: action.chain,
+        protocol: action.protocol,
+        poolId: pool.poolId,
+        action: action.kind === 'lp_rebalance' ? 'REBALANCE' : 'ADD',
+        proceedsUsd: 0n,
+        costReleasedUsd: 0n,
+        feeUsd,
+        at: filledAt,
+        simulated: true,
+      });
     });
 
     this.#trades.markFilled(tradeId, {
@@ -276,18 +296,36 @@ export class PaperLpExecutor {
       nativeToUsdMicros(out0, pool.token0.decimals, priceToAtto(prices.token0Usd), 'floor') +
       nativeToUsdMicros(out1, pool.token1.decimals, priceToAtto(prices.token1Usd), 'floor');
 
-    const booked = this.#store.bookRemove({
-      mode: 'PAPER',
-      chain: action.chain,
-      protocol: action.protocol,
-      poolId: pool.poolId,
-      lpTokens: lpTokens.toString(),
-      at: filledAt,
+    // Burn, credit both assets and realize the result in one transaction, for
+    // the same reason the add is one: a half-written exit is a wrong ledger.
+    const { booked, realized } = this.#store.transaction(() => {
+      const removed = this.#store.bookRemove({
+        mode: 'PAPER',
+        chain: action.chain,
+        protocol: action.protocol,
+        poolId: pool.poolId,
+        lpTokens: lpTokens.toString(),
+        at: filledAt,
+      });
+      this.#adjustPaper(action.chain, pool.token0.address, pool.token0.decimals, out0);
+      this.#adjustPaper(action.chain, pool.token1.address, pool.token1.decimals, out1);
+      return {
+        booked: removed,
+        realized: this.#store.recordPnl({
+          tradeId,
+          mode: 'PAPER',
+          chain: action.chain,
+          protocol: action.protocol,
+          poolId: pool.poolId,
+          action: removed.closed ? 'EXIT' : 'REMOVE',
+          proceedsUsd: proceeds,
+          costReleasedUsd: removed.costReleasedUsd,
+          feeUsd,
+          at: filledAt,
+          simulated: true,
+        }),
+      };
     });
-    this.#adjustPaper(action.chain, pool.token0.address, pool.token0.decimals, out0);
-    this.#adjustPaper(action.chain, pool.token1.address, pool.token1.decimals, out1);
-
-    const realized = proceeds - booked.costReleasedUsd - feeUsd;
 
     this.#trades.markFilled(tradeId, {
       filledOut: out1.toString(),

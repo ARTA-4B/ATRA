@@ -6,6 +6,7 @@ import { StateStore } from '../src/core/state.js';
 import { RiskPolicyStore } from '../src/risk/store.js';
 import { RiskGate } from '../src/risk/gate.js';
 import { LedgerService } from '../src/trading/ledger.js';
+import { LiquidityStore } from '../src/liquidity/store.js';
 import {
   BASE_NATIVE,
   BASE_USDC,
@@ -25,6 +26,7 @@ import {
  */
 
 const TRADE = 'trade-1';
+const LP_POOL = '0xcdac0d6c6c59727a65f871236188350531885c43';
 
 /** fills.trade_id is a foreign key; a fill without a parent trade is an orphan. */
 function insertTrade(db: Db, id: string): void {
@@ -255,6 +257,84 @@ describe('LedgerService', () => {
     expect(ledger.getPosition('PAPER', 'base', BASE_USDC)).toBeUndefined();
   });
 
+  it('counts what an LP exit realized, gas included, in the day', () => {
+    // An LP burn writes no fill: it returns two assets against the cost basis
+    // in lp_positions, not one asset against an average cost. Its loss is the
+    // day's loss all the same, which is what the daily-loss check reads.
+    const store = new LiquidityStore(db, () => NOW);
+    store.bookAdd({
+      mode: 'PAPER',
+      chain: 'base',
+      protocol: 'aerodrome-v2',
+      poolId: LP_POOL,
+      token0: { address: BASE_WETH, decimals: 18 },
+      token1: { address: BASE_USDC, decimals: 6 },
+      lpTokens: '1000000000000000000',
+      amount0: '40000000000000000',
+      amount1: '100000000',
+      capitalUsd: '100',
+      at: NOW,
+    });
+
+    // Half the position out each time, returning 10 USD against a 50 USD
+    // basis and burning 2 USD of gas.
+    const exit = (): bigint => {
+      const burned = store.bookRemove({
+        mode: 'PAPER',
+        chain: 'base',
+        protocol: 'aerodrome-v2',
+        poolId: LP_POOL,
+        lpTokens: '500000000000000000',
+        at: NOW,
+      });
+      expect(burned.costReleasedUsd).toBe(50_000_000n);
+      return store.recordPnl({
+        mode: 'PAPER',
+        chain: 'base',
+        protocol: 'aerodrome-v2',
+        poolId: LP_POOL,
+        action: 'EXIT',
+        proceedsUsd: 10_000_000n,
+        costReleasedUsd: burned.costReleasedUsd,
+        feeUsd: 2_000_000n,
+        at: NOW,
+        simulated: true,
+      });
+    };
+
+    expect(exit()).toBe(-42_000_000n);
+    expect(exit()).toBe(-42_000_000n);
+
+    // 80 USD of impermanent loss and 4 USD of gas, not 0.
+    expect(ledger.realizedPnlTodayUsd('PAPER')).toBe(-84_000_000n);
+    expect(ledger.realizedPnlTodayUsd('LIVE')).toBe(0n);
+
+    // And a swap's own realized P&L lands in the same figure.
+    buy('100000000', '40000000000000000', '2500', '0.25');
+    expect(ledger.realizedPnlTodayUsd('PAPER')).toBe(-84_250_000n);
+    expect(ledger.toRiskLedger('PAPER', () => null).realizedPnlTodayUsd).toBe('-84.250000');
+  });
+
+  it('never writes an LP P&L row that can be edited', () => {
+    const store = new LiquidityStore(db, () => NOW);
+    store.recordPnl({
+      mode: 'PAPER',
+      chain: 'base',
+      protocol: 'aerodrome-v2',
+      poolId: LP_POOL,
+      action: 'ADD',
+      proceedsUsd: 0n,
+      costReleasedUsd: 0n,
+      feeUsd: 650_000n,
+      at: NOW,
+      simulated: true,
+    });
+    expect(ledger.realizedPnlTodayUsd('PAPER')).toBe(-650_000n);
+    expect(() => db.prepare("UPDATE lp_pnl SET realized_pnl_usd = '999'").run()).toThrow(
+      /append-only/,
+    );
+  });
+
   it('never writes a fill row that can be edited', () => {
     const fill = buy('100000000', '40000000000000000', '2500');
     expect(() =>
@@ -356,6 +436,26 @@ describe('RiskGate', () => {
 
     const decision = gate.decide(makeAction(), makeSnapshot(), price);
     expect(decision.code).toBe('DAILY_LOSS_BREACHED');
+  });
+
+  it('feeds an LP loss into the daily-loss check as well', () => {
+    // The same 49.99 as above, realized by an LP exit instead of a swap: it
+    // reaches the cap through the LP ledger, which writes no fill.
+    const store = new LiquidityStore(db, () => NOW);
+    store.recordPnl({
+      mode: 'PAPER',
+      chain: 'base',
+      protocol: 'aerodrome-v2',
+      poolId: LP_POOL,
+      action: 'EXIT',
+      proceedsUsd: 10_000_000n,
+      costReleasedUsd: 57_990_000n,
+      feeUsd: 2_000_000n,
+      at: NOW,
+      simulated: true,
+    });
+
+    expect(gate.decide(makeAction(), makeSnapshot(), price).code).toBe('DAILY_LOSS_BREACHED');
   });
 
   it('writes an audit row for every decision', () => {
