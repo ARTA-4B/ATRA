@@ -303,6 +303,16 @@ class RawCompletionModel:
         return content
 
 
+def _looks_like_json(text: str) -> bool:
+    """Whether `text` could carry the object the scorer is looking for.
+
+    Deliberately crude: the extraction downstream is the real parser, and this
+    only has to tell "the model answered here" from "the server left a stray
+    tag behind".
+    """
+    return "{" in text and "}" in text
+
+
 class EndpointModel:
     """A real model behind an OpenAI-compatible `/v1/chat/completions` endpoint.
 
@@ -396,7 +406,15 @@ class EndpointModel:
         message = (data.get("choices") or [{}])[0].get("message") or {}
         content = message.get("content") or ""
         reconstructed = False
-        if not content.strip() and message.get("tool_calls"):
+        # Fire whenever the server parsed a tool call out of the reply and what
+        # it left behind holds no JSON — not only when content is empty.
+        # llama.cpp moves the call into `tool_calls` and leaves the healed
+        # closing tag, "</tool_call>\n\n", in content. That is not empty after
+        # strip, so the old guard never fired and the scorer read a closing
+        # tag as the model's entire answer: 95 replies, two tokens each,
+        # against 4,210 the server actually generated. The metrics then read
+        # as total collapse when what happened was a relocation.
+        if message.get("tool_calls") and not _looks_like_json(content):
             content = self._from_tool_calls(message["tool_calls"])
             reconstructed = True
 

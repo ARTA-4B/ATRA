@@ -380,6 +380,104 @@ no amount of harness repair closes.
    answer is more training.
 4. Nothing in `config/default.yaml` gets relaxed to make a checkpoint pass.
 
+### The served-artifact evaluation, on the 400-step adapter
+
+Kernel `atra12/atra-4b-eval-gguf-20260921` (notebook sources in
+`model/atra-4b/kaggle/eval-gguf/`). The continuation run had already passed
+`evaluate.py` with exit code 0 — but against the **adapter, through
+transformers**, and its own result recorded `deployment_validated: false`.
+This run asks the other question: does the **q4_k_m GGUF served by
+llama-server** meet the same thresholds?
+
+The notebook does not paste the harness in by hand. `make-notebook.js` reads
+`evaluate.py`, `prompting.py`, `export.py`, `config/default.yaml` and the
+`data` package out of the working tree at generation time, embeds them as
+base64 with their digests beside them, and the kernel asserts every digest
+before it runs. Refreshing the notebook is therefore the same action as
+refreshing the harness.
+
+What the run established, in order:
+
+- carried files matched the working tree exactly (`evaluate.py`
+  `0d0c81b0…`, `config/default.yaml` `b11423b9…`);
+- `export.py` took the **adapter's own** `chat_template.jinja`, not the
+  base-model fallback — the first time that has happened, because `train.py`
+  now saves the template beside the weights;
+- the template survived into the artifact: `tokenizer.chat_template` read back
+  out of the GGUF is `40c21f34…`, byte-identical to the adapter's, and
+  `llama-server`'s `/props` reports the same digest while serving with
+  `--jinja` **and no `--chat-template-file`**;
+- the test split rebuilt in-kernel with
+  `python -m data.build --seed 42 --per-domain 200 --out data/out` reproduced
+  the working tree's 95 examples byte-for-byte (`6f870014…`);
+- prompts arrived at 507–564 tokens, against 91 in the first broken run. The
+  tools reach the model.
+
+Two passes against that one server, same weights, same split, same thresholds:
+
+| pass | endpoint | `replies_losing_content` | exit |
+|---|---|---|---|
+| A | `/v1/chat/completions` with `tools` | **95 / 95** | 3 (CONTAMINATED) |
+| B | `/completion`, prompt rendered by `prompting.render_example` | **0 / 95** | 1 |
+
+Pass A's metrics are not quotable and are not quoted. llama.cpp's tool-call
+parser moves the reply into `message.tool_calls` and leaves `</tool_call>` in
+`content`; `EndpointModel` only rebuilds from `tool_calls` when
+`content.strip()` is empty, and a stray closing tag is not empty, so the
+fallback never fires and the scorer reads two tokens per reply against the
+20–130 the server generated. That guard is the next thing to fix in the
+harness.
+
+Pass B is the measurement:
+
+| metric | score | threshold | verdict |
+|---|---|---|---|
+| structured_output_validity | 0.9895 (94/95) | ≥ 0.98 | pass |
+| tool_selection_accuracy | **0.0000 (0/8)** | ≥ 0.85 | **FAIL** |
+| tool_argument_validity | **0.0000 (0/8)** | ≥ 0.95 | **FAIL** |
+| stale_data_rejection | 1.0000 (14/14) | ≥ 0.90 | pass |
+| hallucinated_price_rate | 0.0132 (75/76) | ≤ 0.02 | pass |
+| no_action_correctness | 1.0000 (19/19) | ≥ 0.85 | pass |
+| unsupported_chain_rejection | 1.0000 (5/5) | ≥ 0.95 | pass |
+| lp_action_validity | 1.0000 (19/19) | ≥ 0.90 | pass |
+
+Six of eight, and the two that fail do so at zero. **The label does not
+move.**
+
+The reason is visible in every single reply. All 95 begin with a literal
+`</tool_call>`, and all 95 contain a `<tool_call>` tag:
+
+```
+</tool_call>
+
+<tool_call>
+
+{"reason": "A movement over time requires candles…", "status": "INSUFFICIENT_DATA"}
+```
+
+The model has learned ATRA's JSON body and has also learned to wrap it in
+Qwen's tool-call tags, opening and closing them in the wrong order. The
+scorer's JSON extraction tolerates the wrapper, which is why the six
+content metrics look healthy; llama.cpp's parser does not, which is why pass A
+lost every reply. And on the `tool_use` domain the wrapper is not cosmetic:
+the model emits `{"reason": …, "status": "INSUFFICIENT_DATA"}` where the target
+is `{"tool": …, "arguments": {…}}`, so tool selection and tool arguments score
+a clean zero on the raw path — while on the chat path the server's parser
+recovered genuine calls (`get_ohlcv` with `chain`, `pool_id`, `timeframe`
+exactly as expected). The decision is in there; the surface form is not.
+
+This is a training-shape problem, not a harness problem: training renders the
+prompt with the Qwen tools block and the target as a bare JSON object, and the
+model is splitting the difference. It is the same class of skew as the three
+before it, one layer further in.
+
+Incidental, and confirmed rather than rediscovered: llama.cpp's CUDA build
+still cannot configure on the Kaggle image — this image carries neither
+`/usr/local/cuda/lib64/stubs/libcuda.so` nor
+`/usr/lib/x86_64-linux-gnu/libcuda.so*`, so `CUDA::cuda_driver` cannot resolve
+and the CPU build is used. At temperature 0 that costs time, not correctness:
+~16 minutes per pass for 95 examples.
+
 ## Fallback: RunPod
 
 Same notebook logic as a shell script. Pick a *Community Cloud* RTX 3090 or
