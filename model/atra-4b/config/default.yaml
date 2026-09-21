@@ -35,17 +35,34 @@ lora:
   gradient_checkpointing: unsloth
 
 training:
+  # 998 optimizer steps: two passes over the 3,985 training examples that
+  # `python -m data.build --seed 42 --per-domain 1000` produces, at an
+  # effective batch of 8. Two epochs over a larger build rather than ten
+  # epochs over the old 800 — the generator is deterministic and unbounded,
+  # and ten passes over the same templates teaches the templates.
   epochs: 2
-  per_device_batch_size: 1
-  gradient_accumulation_steps: 8
+  # Measured on Kaggle's Tesla T4 (atra12/atra-4b-throughput-bench), effective
+  # batch held at 8, and the per-step losses came back identical at every
+  # setting, so this is a pure speed/memory choice:
+  #   batch 1  21.42 s/step   4.79 GiB      batch 4  17.70 s/step   8.87 GiB
+  #   batch 2  18.67 s/step   6.18 GiB      batch 8  17.38 s/step  13.99 GiB
+  # Batch 8 buys 2 % over batch 4 and leaves 1 GiB of a 15 GiB card with the
+  # validation passes still to run inside it. Batch 4 is the last setting that
+  # is both fast and not at the edge: 998 steps in 4 h 55 m.
+  per_device_batch_size: 4
+  gradient_accumulation_steps: 2
+  per_device_eval_batch_size: 4
   learning_rate: 0.0002
   lr_scheduler: cosine
   warmup_ratio: 0.03
   weight_decay: 0.01
   optimizer: paged_adamw_8bit
   max_grad_norm: 1.0
-  logging_steps: 5
-  save_steps: 50
+  logging_steps: 10
+  # Checkpoint and measure validation loss every hundred steps: ten points is
+  # a curve that can distinguish "still learning" from "started memorising",
+  # where two epoch boundaries are two points and cannot.
+  save_steps: 100
   save_total_limit: 2
   # Training on completions only: the loss ignores the prompt, so the model
   # learns to produce answers rather than to predict the evidence it was given.

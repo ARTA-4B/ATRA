@@ -51,6 +51,10 @@ if "LOCAL_RANK" not in os.environ:
 from data.checks import check, dataset_hash, load_jsonl  # noqa: E402
 from data.schema import Example  # noqa: E402
 
+# One renderer, shared with evaluate.py. Two evaluations were lost to train/eval
+# prompt skew; the fix is structural, not a review note.
+from prompting import completion_pair, render_example  # noqa: E402,F401
+
 
 @dataclass
 class Manifest:
@@ -80,6 +84,13 @@ class Manifest:
 
     status: str  # completed | smoke | failed
     notes: str = ""
+    parent_adapter: str | None = None
+    parent_steps: int = 0
+    best_checkpoint: str | None = None
+    planned_steps: int | None = None
+    stopped_by_time_budget: bool = False
+    amp: str = ""
+    effective_batch: int = 0
 
     def write(self, path: Path) -> None:
         path.write_text(json.dumps(self.__dict__, indent=2, sort_keys=True), encoding="utf-8")
@@ -131,39 +142,71 @@ def load_dataset(directory: Path) -> tuple[list[Example], list[Example], dict[st
     return splits["train"], splits["validation"], counts
 
 
-def render_example(example: Example, tokenizer: Any) -> str:
-    """Render one example through the model's own chat template.
+def four_bit_load_kwargs(base_model: str, revision: str | None, compute_dtype: Any) -> dict[str, Any]:
+    """Load 4-bit with *our* compute dtype, not the checkpoint's.
 
-    Using the tokenizer's template rather than a hand-rolled format matters: the
-    special tokens a model was pretrained with are part of its interface, and
-    getting them wrong produces a model that works in evaluation and fails in
-    the runtime.
+    This is the bug that ended runs 3, 4 and 5, and the reason every one of
+    the fixes attempted in between was aimed at the wrong layer.
+
+    `unsloth/Qwen3-4B-Instruct-2507-bnb-4bit` carries its own
+    `quantization_config` in `config.json`, and it says
+    `"bnb_4bit_compute_dtype": "bfloat16"`. transformers **prefers the
+    checkpoint's quantization config over the one you pass** — it warns, in a
+    line that reads like boilerplate:
+
+        You passed `quantization_config` ... but the model you're loading
+        already has a `quantization_config` attribute. The `quantization_config`
+        from the model will be used.
+
+    So every dequantised matmul ran in bfloat16 on a Tesla T4, which has no
+    bfloat16 hardware. Two consequences, and both were misdiagnosed:
+
+    * bfloat16 flowed out of the quantised layers into the LoRA branch, so
+      fp16 AMP's gradient scaler met bfloat16 gradients — the
+      "_amp_foreach_non_finite_check_and_unscale_cuda" not implemented for
+      'BFloat16' error that survived loading the model in float16 (run 4) and
+      casting every trainable parameter to float32 (run 5), because neither
+      touched the quantiser;
+    * emulated bfloat16 is slow, which is most of why a step cost 72 seconds
+      and why raising the batch size from 1 to 8 did not help at all
+      (71.8 -> 75.8 s/step at 4.8 -> 14.0 GiB, measured).
+
+    Mutating the config the model brings with it is the only place the
+    decision can be made, because a `quantization_config` argument is
+    discarded. The quantisation itself is untouched: same nf4, same double
+    quantisation, same weights — only the dtype the dequantised values are
+    computed in.
     """
-    messages = [
-        {"role": message.role, "content": message.content} for message in example.messages
-    ]
+    from transformers import AutoConfig, BitsAndBytesConfig
 
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.parameters,
-            },
-        }
-        for tool in example.tools
-    ]
+    wanted = {
+        "load_in_4bit": True,
+        "bnb_4bit_quant_type": "nf4",
+        "bnb_4bit_use_double_quant": True,
+    }
 
-    try:
-        return tokenizer.apply_chat_template(
-            messages, tools=tools or None, tokenize=False, add_generation_prompt=False
+    model_config = AutoConfig.from_pretrained(base_model, revision=revision)
+    existing = getattr(model_config, "quantization_config", None)
+    if hasattr(existing, "to_dict"):
+        existing = existing.to_dict()
+
+    if isinstance(existing, dict):
+        name = str(compute_dtype).replace("torch.", "")
+        merged = dict(existing)
+        merged.update(wanted)
+        merged["bnb_4bit_compute_dtype"] = name
+        model_config.quantization_config = merged
+        print(
+            f"quantisation   : compute dtype {name} "
+            f"(the checkpoint asked for {existing.get('bnb_4bit_compute_dtype')})"
         )
-    except TypeError:
-        # Older templates do not accept `tools`.
-        return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
+        return {"config": model_config}
+
+    return {
+        "quantization_config": BitsAndBytesConfig(
+            bnb_4bit_compute_dtype=compute_dtype, **wanted
         )
+    }
 
 
 def supports_bf16(torch_module: Any) -> bool:
@@ -188,13 +231,32 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=Path("runs/atra-4b"))
     parser.add_argument("--max-steps", type=int, default=None, help="override for smoke runs")
     parser.add_argument("--dry-run", action="store_true", help="validate and exit")
+    parser.add_argument("--adapter", type=Path, help="continue adapter weights with a new optimizer")
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=float(os.environ.get("ATRA_MAX_SECONDS", "0")) or None,
+        help=(
+            "stop cleanly after this many seconds of training. A hosted session "
+            "has a hard limit; a run that walks into it loses the adapter, the "
+            "manifest and the evaluation with it."
+        ),
+    )
     args = parser.parse_args()
 
     config = load_config(args.config if args.config.exists() else None)
+    parent = {}
+    if args.adapter:
+        parent = json.loads((args.adapter / "manifest.json").read_text(encoding="utf-8"))
+        if parent.get("status") != "completed":
+            raise SystemExit("parent adapter must have a completed training manifest")
 
     base_model = os.environ.get("ATRA_BASE") or resolve(
         config, "model", "base", default="unsloth/Qwen3-4B-Instruct-2507-bnb-4bit"
     )
+    if parent and parent["base_model"] != base_model:
+        raise SystemExit("parent adapter base model does not match this run")
+    revision = parent.get("base_revision") or resolve(config, "model", "revision")
     seq_length = int(os.environ.get("ATRA_SEQ") or resolve(config, "model", "max_seq_length", default=2048))
     seed = int(resolve(config, "run", "seed", default=42))
     device_preference = os.environ.get("ATRA_DEVICE", "auto")
@@ -241,12 +303,14 @@ def main() -> int:
 
     print(f"device         : {device}{f' ({gpu_name})' if gpu_name else ''}")
 
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    tokenizer = AutoTokenizer.from_pretrained(base_model, revision=revision)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     load_in_4bit = bool(resolve(config, "model", "load_in_4bit", default=True)) and use_cuda
-    model_kwargs: dict[str, Any] = {}
+    model_kwargs: dict[str, Any] = {"revision": revision}
+    if use_cuda:
+        model_kwargs["device_map"] = {"": 0}
 
     # One dtype decision, used everywhere. The checkpoint is stored in
     # bfloat16, and without an explicit dtype `from_pretrained` keeps it — so
@@ -267,14 +331,7 @@ def main() -> int:
         model_kwargs["dtype" if "dtype" in parameters else "torch_dtype"] = compute_dtype
 
     if load_in_4bit:
-        from transformers import BitsAndBytesConfig
-
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=compute_dtype,
-        )
+        model_kwargs.update(four_bit_load_kwargs(base_model, revision, compute_dtype))
 
     model = AutoModelForCausalLM.from_pretrained(base_model, **model_kwargs)
     print(f"dtype          : {compute_dtype if use_cuda else 'float32 (cpu)'}")
@@ -297,18 +354,19 @@ def main() -> int:
         bias="none",
         task_type="CAUSAL_LM",
     )
-    model = get_peft_model(model, peft_config)
+    if args.adapter:
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, str(args.adapter), is_trainable=True)
+    else:
+        model = get_peft_model(model, peft_config)
 
     # Every trainable parameter in float32, whatever the base load produced.
     #
-    # fp16 AMP scales the loss and then unscales the gradients, and that
-    # unscale kernel does not exist for bfloat16:
-    #   "_amp_foreach_non_finite_check_and_unscale_cuda" not implemented for 'BFloat16'
-    # (Kaggle, 2026-09-20, twice — the second time with the model loaded in
-    # float16, which proves the bfloat16 came from the adapter side, not the
-    # checkpoint). Float32 adapter weights are the standard QLoRA recipe
-    # anyway: the memory cost is a rounding error against the frozen 4-bit
-    # base, and the optimiser is better conditioned for it.
+    # This is the standard QLoRA recipe rather than a bug fix: the memory cost
+    # is a rounding error against the frozen 4-bit base and the optimiser is
+    # better conditioned for it. It was *also* tried, twice, as a fix for the
+    # bfloat16 gradient-unscale error, and it did not work either time, because
+    # the bfloat16 was coming out of the quantiser — see four_bit_load_kwargs.
     for parameter in model.parameters():
         if parameter.requires_grad and parameter.dtype in (torch.float16, torch.bfloat16):
             parameter.data = parameter.data.to(torch.float32)
@@ -322,9 +380,16 @@ def main() -> int:
     total = sum(p.numel() for p in model.parameters())
     print(f"trainable      : {trainable:,} of {total:,} ({trainable / total:.2%})")
 
-    train_dataset = Dataset.from_dict(
-        {"text": [render_example(example, tokenizer) for example in train_examples]}
-    )
+    completion_only = bool(resolve(config, "training", "train_on_completions_only", default=True))
+    def make_dataset(examples: list[Example]) -> Any:
+        rows = [completion_pair(e, tokenizer) for e in examples]
+        for e, row in zip(examples, rows):
+            length = len(tokenizer(row["prompt"] + row["completion"], add_special_tokens=False)["input_ids"])
+            if length > seq_length:
+                raise ValueError(f"{e.id}: {length} tokens exceeds {seq_length}; refusing to truncate answers")
+        return Dataset.from_list(rows)
+    train_dataset = make_dataset(train_examples)
+    validation_dataset = make_dataset(validation_examples) if validation_examples else None
 
     output_dir = args.output
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -332,16 +397,15 @@ def main() -> int:
     # Accelerate, not the Trainer, owns mixed precision.
     #
     # `SFTConfig(fp16=...)` only asks; if an accelerate default config or an
-    # environment variable says otherwise, autocast runs in that dtype while
-    # the Trainer still builds an fp16 GradScaler — and the scaler then meets
-    # bfloat16 gradients:
-    #   "_amp_foreach_non_finite_check_and_unscale_cuda" not implemented for 'BFloat16'
-    # That error survived loading the model in float16 (run 4) and casting
-    # every trainable parameter to float32 (run 5) on Kaggle, 2026-09-20,
-    # which leaves the autocast dtype as the only remaining source.
+    # environment variable says otherwise, autocast runs in one dtype while the
+    # Trainer builds a scaler for another. Exporting the decision removes the
+    # disagreement, and ATRA_AMP makes it visible in the run log and the
+    # manifest.
     #
-    # ATRA_AMP forces the answer: fp16, bf16, or off (plain float32, no
-    # scaler, no autocast — slower, but it cannot disagree with itself).
+    # This is *not* what caused the bfloat16 unscale error, though it was the
+    # third explanation tried for it. That came from the checkpoint's own
+    # quantisation config; `off` was adopted afterwards as a way to keep
+    # training at all, and cost roughly a factor of the T4's fp16 throughput.
     amp_mode = os.environ.get("ATRA_AMP", "auto").lower()
     if amp_mode == "auto":
         amp_mode = ("bf16" if supports_bf16(torch) else "fp16") if use_cuda else "off"
@@ -377,6 +441,22 @@ def main() -> int:
         max_length=seq_length,
         seed=seed,
         report_to=[],
+        completion_only_loss=completion_only,
+        # Checkpoint and measure on step boundaries, not epoch boundaries. Two
+        # epochs over a larger dataset is two data points, which is not a curve
+        # and cannot distinguish "still learning" from "started memorising";
+        # save_steps gives one every save_steps steps and costs a 66 MB adapter
+        # and a few seconds of validation loss each time.
+        eval_strategy="steps" if validation_dataset is not None else "no",
+        save_strategy="steps",
+        eval_steps=int(resolve(config, "training", "save_steps", default=50)),
+        load_best_model_at_end=validation_dataset is not None,
+        metric_for_best_model="eval_loss" if validation_dataset is not None else None,
+        greater_is_better=False,
+        per_device_eval_batch_size=int(
+            resolve(config, "training", "per_device_eval_batch_size", default=8)
+        ),
+        prediction_loss_only=True,
         bf16=amp_mode == "bf16",
         fp16=amp_mode == "fp16",
         optim=str(resolve(config, "training", "optimizer", default="paged_adamw_8bit"))
@@ -385,7 +465,81 @@ def main() -> int:
         **({"max_steps": args.max_steps} if args.max_steps else {}),
     )
 
-    trainer = SFTTrainer(model=model, args=sft_config, train_dataset=train_dataset)
+    callbacks = []
+    budget = None
+    if args.max_seconds:
+        from transformers.trainer_callback import TrainerCallback
+
+        class TimeBudget(TrainerCallback):
+            """Stop cleanly before a hosted session's hard limit does it for us.
+
+            Kaggle kills a kernel at twelve hours and everything in it goes with
+            the process: the adapter, the manifest, and the evaluation that was
+            supposed to run after the training. A run that has to guess its own
+            speed in advance either trains too little on purpose or gambles the
+            whole session. This makes the trade-off explicit — train until the
+            budget, then stop at a step boundary with a checkpoint saved and the
+            manifest written, and record in the manifest that the budget, not the
+            schedule, ended it.
+            """
+
+            def __init__(self, seconds: float) -> None:
+                self.seconds = seconds
+                self.started = time.time()
+                self.hit = False
+
+            def on_step_end(self, args, state, control, **kwargs):  # noqa: ANN001, ARG002
+                if time.time() - self.started >= self.seconds:
+                    self.hit = True
+                    control.should_training_stop = True
+                    control.should_save = True
+                    print(
+                        f"\ntime budget: {self.seconds:.0f}s reached at step "
+                        f"{state.global_step}; stopping cleanly",
+                        flush=True,
+                    )
+                return control
+
+        budget = TimeBudget(args.max_seconds)
+        callbacks.append(budget)
+        print(f"time budget    : {args.max_seconds:.0f}s")
+
+    trainer = SFTTrainer(model=model, args=sft_config, train_dataset=train_dataset,
+                         eval_dataset=validation_dataset, processing_class=tokenizer,
+                         callbacks=callbacks)
+    # Verify the real TRL collator masks the prompt, not just a config flag.
+    if completion_only:
+        sample = trainer.train_dataset[0]
+        batch = trainer.data_collator([sample])
+        labels = batch["labels"][0].tolist()[:len(sample["input_ids"])]
+        mask = sample["completion_mask"]
+        if not any(mask) or not any(v == 0 for v in mask):
+            raise ValueError("completion mask must contain prompt and answer tokens")
+        if any(label != -100 for label, keep in zip(labels, mask) if not keep):
+            raise ValueError("prompt tokens are not masked from the training loss")
+
+        # And the masked prefix has to *be* the inference prompt, token for
+        # token. TRL tokenises `prompt` and `completion` separately and
+        # concatenates; if that seam moved a token, training would be masked
+        # to one string while evaluation renders another, which is the skew
+        # that cost runs 1 and 2 — invisible in the loss, fatal in the score.
+        prefix_ids = [
+            token for token, keep in zip(sample["input_ids"], mask) if not keep
+        ]
+        decoded = tokenizer.decode(prefix_ids, skip_special_tokens=False)
+        expected = render_example(train_examples[0], tokenizer, prompt_only=True)
+        if decoded != expected:
+            raise ValueError(
+                "the masked prefix is not the inference prompt:\n"
+                f"  trained on : {decoded[-120:]!r}\n"
+                f"  rendered   : {expected[-120:]!r}"
+            )
+        print(
+            f"completion-only loss mask verified; the masked prefix is the "
+            f"inference prompt ({len(prefix_ids)} tokens, "
+            f"{len(sample['input_ids']) - len(prefix_ids)} scored)",
+            flush=True,
+        )
 
     status = "completed"
     final_loss: float | None = None
@@ -437,13 +591,28 @@ def main() -> int:
         torch_version=torch.__version__,
         python_version=platform.python_version(),
         platform=platform.platform(),
-        steps=args.max_steps or trainer.state.global_step,
+        steps=trainer.state.global_step,
         final_loss=final_loss,
         peak_memory_gib=round(peak_memory, 3) if peak_memory else None,
-        status="smoke" if args.max_steps else status,
+        status="smoke" if args.max_steps and status == "completed" else status,
         notes=str(resolve(config, "run", "notes", default="")),
+        parent_adapter=str(args.adapter) if args.adapter else None,
+        parent_steps=int(parent.get("steps", 0)),
+        best_checkpoint=trainer.state.best_model_checkpoint,
+        planned_steps=int(trainer.state.max_steps) if trainer.state.max_steps else None,
+        stopped_by_time_budget=bool(budget and budget.hit),
+        amp=amp_mode,
+        effective_batch=sft_config.per_device_train_batch_size
+        * sft_config.gradient_accumulation_steps,
     )
     manifest.write(output_dir / "manifest.json")
+
+    # The loss curve is the only thing that can tell "not enough steps" from
+    # "the wrong learning rate" after the fact, and it does not survive the
+    # kernel. It costs a few kilobytes to keep.
+    (output_dir / "log-history.json").write_text(
+        json.dumps(trainer.state.log_history, indent=2), encoding="utf-8"
+    )
 
     print(f"\nmanifest: {output_dir / 'manifest.json'}")
     print(f"status  : {manifest.status}")
